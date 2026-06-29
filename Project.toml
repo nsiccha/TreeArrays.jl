@@ -1,0 +1,4 @@
+name = "TreeArrays"
+uuid = "5daaa025-ac78-4e9a-8805-78946e672e43"
+authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
+version = "0.1.0"
