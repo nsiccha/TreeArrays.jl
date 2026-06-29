@@ -7,7 +7,9 @@ import Markdown
 # Read fresh per request so doc edits show up live — no restart needed.
 const REQUIREMENTS_PATH = normpath(joinpath(@__DIR__, "..", "..", "REQUIREMENTS.md"))
 
-# Sidebar nav. The app is root-mounted, so the paths are absolute.
+# Sidebar nav. Paths are root-relative; `nav_sidebar(…; prefix=__prefix__)`
+# prepends the per-request mount prefix so links resolve both locally and
+# under the `/p/TreeArrays/` proxy mount.
 # Full, descriptive labels — never truncated; the user reads these.
 nav_items() = [
     "Overview"                   => "/",
@@ -29,6 +31,12 @@ _stub(title, intro, coming) = h.section(
 )
 
 @htmx struct AppContext
+
+    # Per-request mount prefix from the reverse proxy's `X-Forwarded-Prefix`
+    # header: empty for direct local/LAN access (links emit at `/…`), and
+    # `/p/TreeArrays` under the KB reverse-proxy (links emit at `/p/TreeArrays/…`).
+    # The proxy strips the prefix before forwarding, since routes register at root.
+    __prefix__ = isnothing(__req__) ? "" : HTTP.header(__req__, "X-Forwarded-Prefix", "")
 
     @get index() = h.section(
         h.hgroup(
@@ -79,8 +87,12 @@ _stub(title, intro, coming) = h.section(
          "the build-on-DimensionalData vs standalone verdict"],
     )
 
+    # Prefix-aware sidebar — built as a property so `__prefix__` is in scope;
+    # referenced by `__page__` below (mirrors the Heizung pattern).
+    sidebar = nav_sidebar(nav_items(); prefix=__prefix__)
+
     __page__ = content -> htmx(
-        app_layout(nav_sidebar(nav_items()), content);
+        app_layout(sidebar, content);
         pico_version="2",
     )
 end
