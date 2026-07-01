@@ -12,11 +12,12 @@ name(::TreeDim{N}) where N = N
 name(::Type{<:TreeDim{N}}) where N = N
 meta(X::TreeDim) = getfield(X, :meta)
 sliced(X::TreeDim) = TreeDim(name(X), (;values=nothing))
-# keep-as-provided: a collection value is an axis (length = #coords); a scalar value
-# is a fixed position (length 1). `missing` / `nothing` (unlabelled / aggregated) -> 1.
-_iscoll(v) = v isa Union{Tuple,AbstractArray,AbstractRange}
-Base.length(X::TreeDim) = _iscoll(meta(X).values) ? length(meta(X).values) : 1
-Base.iterate(X::TreeDim, args...) = (v = meta(X).values; iterate(_iscoll(v) ? v : (v,), args...))
+# keep-as-provided: a collection value is a real axis (iterate its coords); a scalar,
+# `missing` (unlabelled) or `nothing` (aggregated) value is a single fixed position.
+_coords(v::Union{Tuple,AbstractArray,AbstractRange}) = v
+_coords(v) = (v,)
+Base.length(X::TreeDim) = length(_coords(meta(X).values))
+Base.iterate(X::TreeDim, args...) = iterate(_coords(meta(X).values), args...)
 struct TreeData{P,M<:NamedTuple}
     parent::P
     meta::M
@@ -107,10 +108,14 @@ end
 # an *axis* dim backs real structure (array axis / NT keys / ragged nesting): its value
 # is `missing` (unlabelled) or a collection. A scalar value = a fixed-position singleton;
 # `nothing` = an aggregated ("sliced") ghost. Neither backs an axis.
-_isaxis(d::TreeDim) = (v = meta(d).values; ismissing(v) || _iscoll(v))
+_isaxis(d::TreeDim) = _isaxis(meta(d).values)
+_isaxis(::Union{Tuple,AbstractArray,AbstractRange}) = true   # array / NT / ragged axis
+_isaxis(::Missing) = true                                    # unlabelled, but still an axis
+_isaxis(_) = false                                           # scalar (fixed) or nothing (sliced)
 _isouter(d::TreeDim) = get(meta(d), :outer, false)
 _outerdim(X::TreeData) = only(d for d in meta(X).dims if _isouter(d))
-_dimnames(dims) = dims isa Symbol ? (dims,) : Tuple(dims)
+_dimnames(d::Symbol) = (d,)
+_dimnames(dims) = Tuple(dims)
 _aschild(v::TreeData, inner) = v                 # already a TreeData -> knows its own dims
 _aschild(v, inner) = TreeData(v, inner...)       # raw field -> wrap with the inner axes
 
@@ -145,7 +150,8 @@ function Base.mapslices(f, X::TreeNamedTuple; dims)
     inner  = Tuple(d for d in meta(X).dims if _isaxis(d) && !_isouter(d))
     ghosts = Tuple(d for d in meta(X).dims if !_isaxis(d) && !_isouter(d))
     newfields = map(v -> mapslices(f, _aschild(v, inner); dims), parent(X))
-    sample = first(v for v in newfields if v isa TreeData)
+    any(!ismissing, newfields) || return missing        # no child carried the dim -> sentinel
+    sample = first(v for v in newfields if !ismissing(v))
     have   = map(name, meta(sample).dims)
     extra  = Tuple(g for g in ghosts if !(name(g) in have))
     TreeData(newfields, (;dims = (meta(sample).dims..., extra..., rec)))
@@ -157,28 +163,33 @@ function Base.mapslices(f, X::TreeRaggedArray; dims)
     TreeData(map(el -> mapslices(f, el; dims), parent(X)), meta(X))
 end
 
-# assemble f-outputs (an array over the kept axes, or a single value) into one TreeData
-function _assemble(outs, keptdims, trailing)
-    proto = outs isa AbstractArray ? first(outs) : outs
-    if proto isa TreeNamedTuple                              # record output -> structure of arrays
-        rec = _outerdim(proto)
-        ks  = keys(parent(proto))
-        arrs = NamedTuple{ks}(map(k -> outs isa AbstractArray ? map(o -> parent(o)[k], outs) : parent(outs)[k], ks))
-        return TreeData(arrs, (;dims = (keptdims..., trailing..., rec)))
-    elseif proto isa TreeData                                # new named axis (e.g. quantile levels)
-        fdims   = meta(proto).dims
-        stacked = outs isa AbstractArray ? _stack_last(outs) : parent(outs)
-        return TreeData(stacked, (;dims = (keptdims..., fdims..., trailing...)))
-    else                                                     # scalar output
-        return TreeData(outs, (;dims = (keptdims..., trailing...)))
-    end
-end
+# assemble the f-outputs into one TreeData, dispatching on the output shape. `outs` is a
+# single output (reduce-all) or an array of outputs over the kept axes; `_over` bridges both.
+_assemble(outs, keptdims, trailing) = _assemble(_proto(outs), outs, keptdims, trailing)
+_proto(outs::AbstractArray) = first(outs)
+_proto(out) = out
+_over(g, outs::AbstractArray) = map(g, outs)   # preserve the kept-axes shape
+_over(g, out) = g(out)                          # reduce-all: a single output
 
-function _stack_last(outs)
-    vs = map(o -> o isa TreeData ? parent(o) : o, outs)
-    n  = length(first(vs))
-    A  = Array{eltype(first(vs))}(undef, size(outs)..., n)
-    for I in CartesianIndices(outs)
+# record output -> structure of arrays: each field becomes its own array over the kept axes
+function _assemble(proto::TreeNamedTuple, outs, keptdims, trailing)
+    ks = keys(parent(proto))
+    arrs = map(k -> _over(o -> parent(o)[k], outs), ks)
+    TreeData(NamedTuple{ks}(arrs), (;dims = (keptdims..., trailing..., _outerdim(proto))))
+end
+# new named axis (e.g. quantile levels) -> stack the output parents along that axis
+_assemble(proto::TreeData, outs, keptdims, trailing) =
+    TreeData(_stacklast(_over(parent, outs)), (;dims = (keptdims..., meta(proto).dims..., trailing...)))
+# scalar output -> a dense array of the scalars (`outs` already holds them)
+_assemble(::Any, outs, keptdims, trailing) =
+    TreeData(outs, (;dims = (keptdims..., trailing...)))
+
+# stack equal-length vectors along a new trailing axis; a lone axis-vector passes through
+_stacklast(v::AbstractVector{<:Number}) = v
+function _stacklast(vs::AbstractArray)
+    n = length(first(vs))
+    A = Array{eltype(first(vs))}(undef, size(vs)..., n)
+    for I in CartesianIndices(vs)
         A[I, :] .= vs[I]
     end
     A
