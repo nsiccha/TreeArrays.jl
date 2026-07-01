@@ -208,7 +208,7 @@ end
 
 # ===================== reducers =====================
 Statistics.mean(X::TreeData; dims=nothing) = isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims)
-Base.sum(X::TreeData; dims) = mapslices(sum, X; dims)
+Base.sum(X::TreeData; dims=nothing) = isnothing(dims) ? sum(parent(X)) : mapslices(sum, X; dims)
 
 # quantile delegates to mapslices; the output levels land on a *named, specifiable* axis
 # (`into=`) so population- and posterior-quantiles can coexist. One shared sort buffer.
