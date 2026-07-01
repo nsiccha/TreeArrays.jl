@@ -28,11 +28,13 @@ meta(X::TreeData) = getfield(X, :meta)
 TreeData(dims::Symbol...) = (x, vals...)->TreeData(x, map(TreeDim, dims, vals)...)
 TreeData(x, dims...; kwargs...) = TreeData(x, map(TreeDim, dims)..., map(TreeDim, keys(kwargs), values(kwargs))...)
 TreeData(x, dims::TreeDim...) = TreeData(x, (;dims))
-# a TreeNamedTuple keeps its record axis in the type as a SEPARATE `outer_dim`: being the
-# record axis is a property of the container (which axis enumerates the fields), not of a dim.
-TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = TreeData(
-    X, (;dims, outer_dim = TreeDim(name, keys(X)))
-)
+# a TreeNamedTuple keeps its record axis in the type as a SEPARATE `outer_dim` (which axis
+# enumerates the fields is a property of the container, not of a dim) *and* lists it in
+# `dims` like any other axis, so it's not lost when forwarded (e.g. by `TreeData(X::TreeData, dims...)`).
+TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = begin
+    rec = TreeDim(name, keys(X))
+    TreeData(X, (;dims = (dims..., rec), outer_dim = rec))
+end
 TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), meta(X).dims..., dims...)
 TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
@@ -126,89 +128,96 @@ _aschild(v, inner) = TreeData(v, inner...)       # raw field -> wrap with the in
 # Reduce the named `dims`: apply `f` to each leftover-index slice, keep everything.
 # `f` returns a TreeData (or a scalar). Reduced dims stay but become `sliced` (aggregated).
 # A requested dim that is absent from a leaf -> `missing` (fixed sentinel).
-Base.mapslices(f, X::TreeData; dims) = error("mapslices: unhandled shape $(typeof(X))")
 
-function Base.mapslices(f, X::TreeArray; dims)
-    want    = _dimnames(dims)
-    alldims = meta(X).dims
+# Shared "found the axis" bookkeeping for TreeArray/TreeRaggedArray: which parent-array
+# positions are being reduced (redaxes) vs kept (keepaxes), and the ghost dims left behind
+# for the reduced ones (trailing). Returns `nothing` when `want` doesn't hit a real axis
+# here -> the caller decides what that means (a true leaf -> sentinel/idempotent re-slice;
+# an intermediate node -> recurse deeper into each element).
+function _reduceouter(f, X, want)
+    alldims = Main.dims(X)
     names   = map(name, alldims)
     n_ax    = ndims(parent(X))
     redaxes = Tuple(i for i in 1:n_ax if names[i] in want)
-    if isempty(redaxes)
-        any(nm -> nm in names, want) || return missing               # dim absent here -> sentinel
-        return TreeData(parent(X), (;dims = map(d -> name(d) in want ? sliced(d) : d, alldims)))
-    end
+    isempty(redaxes) && return nothing
     keepaxes = Tuple(i for i in 1:n_ax if !(names[i] in want))
     keptdims = Tuple(alldims[i] for i in keepaxes)
     keptset  = Set(keepaxes)
     trailing = Tuple(name(d) in want ? sliced(d) : d for (i, d) in enumerate(alldims) if !(i in keptset))
-    outs = isempty(keepaxes) ? f(parent(X)) : map(f, eachslice(parent(X); dims=keepaxes))
+    outs = isempty(keepaxes) ? _leafreduce(f, parent(X)) : map(sl -> _leafreduce(f, sl), eachslice(parent(X); dims=keepaxes))
     _assemble(outs, keptdims, trailing)
+end
+
+# The gather-reduction: reduce an OUTER axis of a nested result by pushing it down to the
+# leaves (pure index arithmetic on `sl`, a gathered slice along that axis -- nothing
+# materialized) and recursing. Record -> recurse per field. Inner-axis (TreeData) leaf ->
+# recurse per position, building a NEW nested array (never flattened/stacked -- a chained
+# reduction stays a tree of arrays all the way down). Plain array leaf -> apply the kernel
+# directly; this base case is also what a dense TreeArray reduction needs, so `_reduceouter`
+# routes both shapes through `_leafreduce` uniformly.
+_leafreduce(f, sl::AbstractArray{<:TreeNamedTuple}) = begin
+    proto = first(sl)
+    ks = keys(parent(proto))
+    fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl)), ks)
+    TreeData(NamedTuple{ks}(fields), (;dims = Main.dims(proto), outer_dim = outerdim(proto)))
+end
+_leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
+    proto = first(sl)
+    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), eachindex(parent(proto)))
+    TreeData(vals, meta(proto))
+end
+_leafreduce(f, sl::AbstractArray) = f(sl)
+
+function Base.mapslices(f, X::TreeArray; dims)
+    want = _dimnames(dims)
+    r = _reduceouter(f, X, want)
+    isnothing(r) || return r
+    alldims = Main.dims(X)
+    any(nm -> nm in map(name, alldims), want) || return missing   # dim absent here -> sentinel
+    TreeData(parent(X), (;dims = map(d -> name(d) in want ? sliced(d) : d, alldims)))
 end
 
 function Base.mapslices(f, X::TreeNamedTuple; dims)
     want = _dimnames(dims)
     rec  = outerdim(X)
-    name(rec) in want && error("reducing the record dim $(name(rec)) is not supported")
-    inner  = Tuple(d for d in meta(X).dims if _isaxis(d))       # outer no longer lives in dims
-    ghosts = Tuple(d for d in meta(X).dims if !_isaxis(d))
+    inner  = Tuple(d for d in Main.dims(X) if _isaxis(d) && name(d) != name(rec))   # rec enumerates the fields, not an inner axis
+    ghosts = Tuple(d for d in Main.dims(X) if !_isaxis(d))
     newfields = map(v -> mapslices(f, _aschild(v, inner); dims), parent(X))
     any(!ismissing, newfields) || return missing        # no child carried the dim -> sentinel
     sample = first(v for v in newfields if !ismissing(v))
-    have   = map(name, meta(sample).dims)
+    have   = map(name, Main.dims(sample))
     extra  = Tuple(g for g in ghosts if !(name(g) in have))
-    TreeData(newfields, (;dims = (meta(sample).dims..., extra...), outer_dim = rec))
+    TreeData(newfields, (;dims = (Main.dims(sample)..., extra...), outer_dim = rec))
 end
 
 function Base.mapslices(f, X::TreeRaggedArray; dims)
     want = _dimnames(dims)
-    any(name(d) in want for d in meta(X).dims) && error("reducing a ragged outer axis is not supported")
+    r = _reduceouter(f, X, want)
+    isnothing(r) || return r
     TreeData(map(el -> mapslices(f, el; dims), parent(X)), meta(X))
 end
 
-# assemble the f-outputs into one TreeData, dispatching on the output shape. `outs` is a
-# single output (reduce-all) or an array of outputs over the kept axes; `_over` bridges both.
-_assemble(outs, keptdims, trailing) = _assemble(_proto(outs), outs, keptdims, trailing)
-_proto(outs::AbstractArray) = first(outs)
-_proto(out) = out
-_over(g, outs::AbstractArray) = map(g, outs)   # preserve the kept-axes shape
-_over(g, out) = g(out)                          # reduce-all: a single output
-
-# record output -> structure of arrays: each field becomes its own array over the kept axes
-function _assemble(proto::TreeNamedTuple, outs, keptdims, trailing)
-    ks = keys(parent(proto))
-    arrs = map(k -> _over(o -> parent(o)[k], outs), ks)
-    TreeData(NamedTuple{ks}(arrs), (;dims = (keptdims..., trailing...), outer_dim = outerdim(proto)))
-end
-# new named axis (e.g. quantile levels) -> stack the output parents along that axis
-_assemble(proto::TreeData, outs, keptdims, trailing) =
-    TreeData(_stacklast(outs), (;dims = (keptdims..., dims(proto)..., trailing...)))
-# scalar output -> a dense array of the scalars (`outs` already holds them)
-_assemble(::Any, outs, keptdims, trailing) =
-    TreeData(outs, (;dims = (keptdims..., trailing...)))
-
-# stack the output parents along a new trailing axis, extracting parent inline (no temp
-# array of parents); a lone reduce-all output passes its parent vector through as the axis.
-_stacklast(out::TreeData) = parent(out)
-function _stacklast(outs::AbstractArray)
-    v1 = parent(first(outs))
-    A  = Array{eltype(v1)}(undef, size(outs)..., length(v1))
-    for I in CartesianIndices(outs)
-        A[I, :] .= parent(outs[I])
-    end
-    A
-end
+# wrap `outs` (the raw per-slice kernel outputs -- already TreeData/record/scalar pieces,
+# never stacked/pivoted) as one TreeData over the kept + reduced-as-ghost dims.
+_assemble(outs, keptdims, trailing) = TreeData(outs, (;dims = (keptdims..., trailing...)))
 
 # ===================== reducers =====================
 Statistics.mean(X::TreeData; dims=nothing) = isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims)
 Base.sum(X::TreeData; dims) = mapslices(sum, X; dims)
+
+# eltype of a tree's leaves, recursing through record/ragged nesting (a TreeNamedTuple's
+# own `eltype(parent(X))` is wrong -- its parent is a NamedTuple of heterogeneous fields).
+_eltype(X::TreeArray)       = eltype(parent(X))
+_eltype(X::TreeNamedTuple)  = _eltype(first(parent(X)))
+_eltype(X::TreeRaggedArray) = _eltype(first(parent(X)))
+_eltype(x)                  = eltype(x)
 
 # quantile delegates to mapslices; the output levels land on a *named, specifiable* axis
 # (`into=`) so population- and posterior-quantiles can coexist. One shared sort buffer.
 function Statistics.quantile(X::TreeData, p; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
     levels   = collect(p)
     leveldim = TreeDim(into, Tuple(levels))   # constant across slices -> build once
-    scratch  = Float64[]
+    scratch  = _eltype(X)[]
     mapslices(X; dims) do slice
         length(scratch) == length(slice) || resize!(scratch, length(slice))
         copyto!(scratch, slice)
@@ -220,7 +229,7 @@ end
 # SCALAR (no new axis, same scalar-output path `mean` exercises through mapslices);
 # the requested level lands as a fixed-coordinate `into` dim (a scalar TreeDim value).
 function Statistics.quantile(X::TreeData, p::Number; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
-    scratch = Float64[]
+    scratch = _eltype(X)[]
     result = mapslices(X; dims) do slice
         length(scratch) == length(slice) || resize!(scratch, length(slice))
         copyto!(scratch, slice)
