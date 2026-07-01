@@ -212,13 +212,6 @@ _assemble(outs, keptdims, trailing) = TreeData(outs, (;dims = (keptdims..., trai
 Statistics.mean(X::TreeData; dims=nothing) = isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims)
 Base.sum(X::TreeData; dims) = mapslices(sum, X; dims)
 
-# eltype of a tree's leaves, recursing through record/ragged nesting (a TreeNamedTuple's
-# own `eltype(parent(X))` is wrong -- its parent is a NamedTuple of heterogeneous fields).
-_eltype(X::TreeArray)       = eltype(parent(X))
-_eltype(X::TreeNamedTuple)  = _eltype(first(parent(X)))
-_eltype(X::TreeRaggedArray) = _eltype(first(parent(X)))
-_eltype(x)                  = eltype(x)
-
 # quantile delegates to mapslices; the output levels land on a *named, specifiable* axis
 # (`into=`) so population- and posterior-quantiles can coexist. One shared sort buffer.
 function Statistics.quantile(X::TreeData, p; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
