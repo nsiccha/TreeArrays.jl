@@ -48,6 +48,22 @@ _eltype(X::TreeNamedTuple)  = _eltype(first(parent(X)))
 _eltype(X::TreeRaggedArray) = _eltype(first(parent(X)))
 _eltype(x)                  = eltype(x)
 
+# ===================== TreeArray (array-backed) array interface =====================
+# TreeData is deliberately not an AbstractArray (TreeNamedTuple / TreeRaggedArray aren't
+# arrays either); only the array-backed TreeArray alias gets the basic array interface,
+# delegating straight through to the backing array. TreeRaggedArray{P<:AbstractArray{<:TreeData}}
+# is a strict subconstraint of TreeArray{P<:AbstractArray}, so these methods also apply to
+# ragged values at the OUTER level (size/length -> outer count, getindex/iterate -> sub-trees) --
+# intentional, sensible outer-level semantics, not a gap.
+Base.size(X::TreeArray, args...) = size(parent(X), args...)
+Base.length(X::TreeArray) = length(parent(X))
+Base.ndims(X::TreeArray) = ndims(parent(X))
+Base.eltype(T::Type{<:TreeArray}) = eltype(fieldtype(T, :parent))
+Base.axes(X::TreeArray, args...) = axes(parent(X), args...)
+Base.getindex(X::TreeArray, i...) = getindex(parent(X), i...)
+Base.iterate(X::TreeArray, args...) = iterate(parent(X), args...)
+Base.collect(X::TreeArray) = collect(parent(X))
+
 
 function Base.show(io::IO, T::Type{<:TreeDim})
     if get(io, :compact, false)
@@ -367,6 +383,23 @@ begin
     # (not a length-1 vector).
     median_draws = quantile(input_draws, 0.5; dims=:draw, into=:median)
     display(median_draws)
+end
+
+# ===================== PROBE: sum(X) default + TreeArray array interface =====================
+begin
+    X = TreeData(randn(4,3), :draw, :param)
+    P = parent(X)
+    @assert sum(X) == sum(P)                # was: UndefKeywordError: dims
+    @assert size(X) == size(P)              # was: MethodError
+    @assert length(X) == length(P)          # was: MethodError
+    @assert ndims(X) == ndims(P)            # was: MethodError
+    @assert eltype(X) == eltype(P)          # was: Any
+    @assert X[1] == P[1]                    # was: MethodError (no getindex)
+    @assert collect(X) == collect(P)        # was: MethodError (no length/iterate)
+    println("PROBE sum(X) = ", sum(X))
+    println("PROBE size(X) = ", size(X), ", length(X) = ", length(X), ", ndims(X) = ", ndims(X), ", eltype(X) = ", eltype(X))
+    println("PROBE X[1] = ", X[1])
+    println("PROBE collect(X) == parent(X): ", collect(X) == P)
 end
 # begin
 
