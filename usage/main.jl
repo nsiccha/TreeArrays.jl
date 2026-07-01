@@ -43,6 +43,13 @@ TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
 dims(X::TreeData) = meta(X).dims                 # the tree's (inner) axes
 outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axis
 
+# leaf numeric eltype: recurse through NamedTuple / ragged nesting down to the backing array.
+# TreeNamedTuple uses the FIRST field's type -- fine for quantile's homogeneous numeric records.
+_eltype(X::TreeArray)       = eltype(parent(X))
+_eltype(X::TreeNamedTuple)  = _eltype(first(parent(X)))
+_eltype(X::TreeRaggedArray) = _eltype(first(parent(X)))
+_eltype(x)                  = eltype(x)
+
 
 function Base.show(io::IO, T::Type{<:TreeDim})
     if get(io, :compact, false)
