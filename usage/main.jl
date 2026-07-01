@@ -216,6 +216,19 @@ function Statistics.quantile(X::TreeData, p; dims, into = Symbol(only(_dimnames(
     end
 end
 
+# scalar p (e.g. quantile(X, 0.5; dims=:draw)) mirrors Base: each slice reduces to a
+# SCALAR (no new axis, same scalar-output path `mean` exercises through mapslices);
+# the requested level lands as a fixed-coordinate `into` dim (a scalar TreeDim value).
+function Statistics.quantile(X::TreeData, p::Number; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
+    scratch = Float64[]
+    result = mapslices(X; dims) do slice
+        length(scratch) == length(slice) || resize!(scratch, length(slice))
+        copyto!(scratch, slice)
+        quantile!(scratch, p)
+    end
+    TreeData(result, TreeDim(into, p))
+end
+
 # ===================== dimension-aware kernels =====================
 # Annotate a per-slice kernel with its dim-signature `reduces => into`. Two forms:
 #   defining:  @kernel (:time => :stat) function f(L) ... end   -- define the plain array
@@ -341,6 +354,12 @@ begin
     end
 
     display(stats_percentiles)
+
+    # demo: scalar-p quantile mirrors Base — `into` becomes a fixed SCALAR
+    # coordinate (not a length-1 axis), and each slice holds one scalar value
+    # (not a length-1 vector).
+    median_draws = quantile(input_draws, 0.5; dims=:draw, into=:median)
+    display(median_draws)
 end
 # begin
 
