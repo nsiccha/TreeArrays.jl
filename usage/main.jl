@@ -28,15 +28,18 @@ meta(X::TreeData) = getfield(X, :meta)
 TreeData(dims::Symbol...) = (x, vals...)->TreeData(x, map(TreeDim, dims, vals)...)
 TreeData(x, dims...; kwargs...) = TreeData(x, map(TreeDim, dims)..., map(TreeDim, keys(kwargs), values(kwargs))...)
 TreeData(x, dims::TreeDim...) = TreeData(x, (;dims))
+# a TreeNamedTuple keeps its record axis in the type as a SEPARATE `outer_dim`: being the
+# record axis is a property of the container (which axis enumerates the fields), not of a dim.
 TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = TreeData(
-    X, dims..., TreeDim(name, (;
-        values=keys(X), outer=true,
-    ))
+    X, (;dims, outer_dim = TreeDim(name, keys(X)))
 )
 TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), meta(X).dims..., dims...)
 TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
+# convenience accessors (avoid spelling out `meta(...).field` everywhere)
+dims(X::TreeData) = meta(X).dims                 # the tree's (inner) axes
+outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axis
 
 
 function Base.show(io::IO, T::Type{<:TreeDim})
@@ -60,9 +63,10 @@ print_type(io::IO, ::Type{<:TreeNamedTuple}) = print(io, "TreeNamedTuple")
 print_type(io::IO, ::Type{<:TreeRaggedArray}) = print(io, "TreeRaggedArray")
 print_type(io::IO, ::Type{<:TreeArray}) = print(io, "TreeArray")
 print_dims(io::IO, T::Type{<:TreeData}) = begin
-    print(io, "(")
-    join(io, fieldtypes(fieldtype(fieldtype(T, :meta), :dims)), ", ")
-    print(io, ")")
+    M = fieldtype(T, :meta)
+    ds = fieldtypes(fieldtype(M, :dims))
+    ds = :outer_dim in fieldnames(M) ? (ds..., fieldtype(M, :outer_dim)) : ds
+    print(io, "("); join(io, ds, ", "); print(io, ")")
 end
 Base.show(io::IO, ::MIME"text/plain", x::TreeData) = show(io, x)
 
@@ -79,9 +83,10 @@ print_tree(io::IO, X::TreeData) = begin
 end
 print_dims(io::IO, X::TreeData) = begin
     print(io, "----------------\n")
-    for dim in meta(X).dims
+    for dim in dims(X)
         print(io, dim, "\n")
     end
+    haskey(meta(X), :outer_dim) && print(io, outerdim(X), "\n")
     print(io, "----------------")
 end
 print_values(io::IO, X::TreeData) = if get(io, :compact, false)
@@ -112,8 +117,6 @@ _isaxis(d::TreeDim) = _isaxis(meta(d).values)
 _isaxis(::Union{Tuple,AbstractArray,AbstractRange}) = true   # array / NT / ragged axis
 _isaxis(::Missing) = true                                    # unlabelled, but still an axis
 _isaxis(_) = false                                           # scalar (fixed) or nothing (sliced)
-_isouter(d::TreeDim) = get(meta(d), :outer, false)
-_outerdim(X::TreeData) = only(d for d in meta(X).dims if _isouter(d))
 _dimnames(d::Symbol) = (d,)
 _dimnames(dims) = Tuple(dims)
 _aschild(v::TreeData, inner) = v                 # already a TreeData -> knows its own dims
@@ -145,16 +148,16 @@ end
 
 function Base.mapslices(f, X::TreeNamedTuple; dims)
     want = _dimnames(dims)
-    rec  = _outerdim(X)
+    rec  = outerdim(X)
     name(rec) in want && error("reducing the record dim $(name(rec)) is not supported")
-    inner  = Tuple(d for d in meta(X).dims if _isaxis(d) && !_isouter(d))
-    ghosts = Tuple(d for d in meta(X).dims if !_isaxis(d) && !_isouter(d))
+    inner  = Tuple(d for d in meta(X).dims if _isaxis(d))       # outer no longer lives in dims
+    ghosts = Tuple(d for d in meta(X).dims if !_isaxis(d))
     newfields = map(v -> mapslices(f, _aschild(v, inner); dims), parent(X))
     any(!ismissing, newfields) || return missing        # no child carried the dim -> sentinel
     sample = first(v for v in newfields if !ismissing(v))
     have   = map(name, meta(sample).dims)
     extra  = Tuple(g for g in ghosts if !(name(g) in have))
-    TreeData(newfields, (;dims = (meta(sample).dims..., extra..., rec)))
+    TreeData(newfields, (;dims = (meta(sample).dims..., extra...), outer_dim = rec))
 end
 
 function Base.mapslices(f, X::TreeRaggedArray; dims)
@@ -175,11 +178,11 @@ _over(g, out) = g(out)                          # reduce-all: a single output
 function _assemble(proto::TreeNamedTuple, outs, keptdims, trailing)
     ks = keys(parent(proto))
     arrs = map(k -> _over(o -> parent(o)[k], outs), ks)
-    TreeData(NamedTuple{ks}(arrs), (;dims = (keptdims..., trailing..., _outerdim(proto))))
+    TreeData(NamedTuple{ks}(arrs), (;dims = (keptdims..., trailing...), outer_dim = outerdim(proto)))
 end
 # new named axis (e.g. quantile levels) -> stack the output parents along that axis
 _assemble(proto::TreeData, outs, keptdims, trailing) =
-    TreeData(_stacklast(_over(parent, outs)), (;dims = (keptdims..., meta(proto).dims..., trailing...)))
+    TreeData(_stacklast(_over(parent, outs)), (;dims = (keptdims..., dims(proto)..., trailing...)))
 # scalar output -> a dense array of the scalars (`outs` already holds them)
 _assemble(::Any, outs, keptdims, trailing) =
     TreeData(outs, (;dims = (keptdims..., trailing...)))
@@ -202,14 +205,33 @@ Base.sum(X::TreeData; dims) = mapslices(sum, X; dims)
 # quantile delegates to mapslices; the output levels land on a *named, specifiable* axis
 # (`into=`) so population- and posterior-quantiles can coexist. One shared sort buffer.
 function Statistics.quantile(X::TreeData, p; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
-    levels  = collect(p)
-    scratch = Float64[]
+    levels   = collect(p)
+    leveldim = TreeDim(into, Tuple(levels))   # constant across slices -> build once
+    scratch  = Float64[]
     mapslices(X; dims) do slice
-        n = length(slice)
-        length(scratch) == n || resize!(scratch, n)
+        length(scratch) == length(slice) || resize!(scratch, length(slice))
         copyto!(scratch, slice)
-        TreeData(quantile!(scratch, levels), TreeDim(into, Tuple(levels)))
+        TreeData(quantile!(scratch, levels), leveldim)
     end
+end
+
+# ===================== dimension-aware kernels =====================
+# Annotate a per-slice kernel with its dim-signature `reduces => into`. Two forms:
+#   defining:  @kernel (:time => :stat) function f(L) ... end   -- define the plain array
+#              kernel AND a TreeData method that threads it through mapslices.
+#   post hoc:  @kernel (:time => :stat) f                        -- just add the TreeData
+#              method to an already-defined f (e.g. a fixed-signature function you reuse).
+# The output structure is inferred from the kernel's return type (the _assemble dispatch);
+# the annotation only supplies the consumed dim + the record name. Parameterized reducers
+# (mean/sum reduce->scalar, quantile reduce->axis, dim/into chosen per-call) DON'T fit this
+# fixed-signature shape -- they stay as mapslices-delegating methods with dims=/into=.
+macro kernel(spec, fdef)
+    reduces = spec.args[2]                                   # consumed dim, e.g. :time
+    into    = spec.args[3]                                   # produced record axis, e.g. :stat
+    name    = fdef isa Symbol ? fdef : fdef.args[1].args[1]  # bare name (post hoc) or a def
+    treemethod = :($name(X::TreeData) = mapslices(s -> TreeData($into => $name(s)), X; dims=$reduces))
+    # a def -> also emit the plain array kernel; a bare name -> just wrap an existing function.
+    esc(fdef isa Symbol ? treemethod : Expr(:block, fdef, treemethod))
 end
 
 unsetdim(X) = X
@@ -238,11 +260,14 @@ begin
         randn(n_draws, n_subjects, n_dense),
         :draw, :subject, :time=>range(0, 1, n_dense)
     )
-    compute_stats(Ls) = mapslices(Ls; dims=:time) do L
+    # compute_stats: a dimension-aware kernel. Written once as pure math on a time-slice,
+    # annotated `:time => :stat` -> also gets a TreeData method that reduces :time into a
+    # :stat record. `compute_stats(::AbstractArray)` and `compute_stats(::TreeData)` both work.
+    @kernel (:time => :stat) function compute_stats(L)
         trough, peak = extrema(L)
         baseline = L[1]
         dtrough, dpeak = extrema(L .- baseline)
-        TreeData(:stat => (;trough, peak, baseline, dtrough, dpeak))
+        (;trough, peak, baseline, dtrough, dpeak)
     end
 
 
