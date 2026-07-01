@@ -22,7 +22,7 @@ end
 Base.parent(X::TreeData) = getfield(X, :parent)
 meta(X::TreeData) = getfield(X, :meta)
 TreeData(dims::Symbol...) = (x, vals...)->TreeData(x, map(TreeDim, dims, vals)...)
-TreeData(x, dims...; kwargs...) = TreeData(x, map(TreeDim, dims)..., map(TreeDim, keys(kwargs))...)
+TreeData(x, dims...; kwargs...) = TreeData(x, map(TreeDim, dims)..., map(TreeDim, keys(kwargs), values(kwargs))...)
 TreeData(x, dims::TreeDim...) = TreeData(x, (;dims))
 TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = TreeData(
     X, dims..., TreeDim(name, (;
