@@ -151,10 +151,10 @@ begin
     # # Should actually be doing some stuff to the X matrix - not doing it here for now
     # setschedule(X::TreeData, schedule) = setdim(X, dims.schedule=>schedule)
     dense_loc(args...) = TreeArray(
-        randn(n_draws, n_subject, n_dense),
+        randn(n_draws, n_subjects, n_dense),
         :draw, :subject, :time=>range(0, 1, n_dense)
     )
-    compute_stats(Ls) = mapslices(Ls; dims=time) do L
+    compute_stats(Ls) = mapslices(Ls; dims=:time) do L
         trough, peak = extrema(L)
         baseline = L[1]
         dtrough, dpeak = extrema(L .- baseline)
@@ -196,6 +196,8 @@ begin
     n_dense = 100
     sweep_schedules = TreeDim(:schedule, ("some schedule", ))
     sweep_doses = TreeDim(:dose, (20, 200))
+    population_quantiles = (0.05, 0.5, 0.95)   # placeholder levels: summarize across subjects
+    posterior_quantiles = (0.05, 0.5, 0.95)    # placeholder levels: summarize across draws
 
     n_params = (;
         baseline=6+n_subjects,
@@ -220,9 +222,9 @@ begin
         quantile(
             quantile(
                 compute_stats(dense_loc(input_draws, args...)), 
-                population_quantiles; dims=subject
+                population_quantiles; dims=:subject
             ), 
-            posterior_quantiles; dims=draw
+            posterior_quantiles; dims=:draw
         )
     end
 
