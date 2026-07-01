@@ -12,8 +12,11 @@ name(::TreeDim{N}) where N = N
 name(::Type{<:TreeDim{N}}) where N = N
 meta(X::TreeDim) = getfield(X, :meta)
 sliced(X::TreeDim) = TreeDim(name(X), (;values=nothing))
-Base.length(X::TreeDim) = length(meta(X).values) 
-Base.iterate(X::TreeDim, args...) = iterate(meta(X).values, args...)
+# keep-as-provided: a collection value is an axis (length = #coords); a scalar value
+# is a fixed position (length 1). `missing` / `nothing` (unlabelled / aggregated) -> 1.
+_iscoll(v) = v isa Union{Tuple,AbstractArray,AbstractRange}
+Base.length(X::TreeDim) = _iscoll(meta(X).values) ? length(meta(X).values) : 1
+Base.iterate(X::TreeDim, args...) = (v = meta(X).values; iterate(_iscoll(v) ? v : (v,), args...))
 struct TreeData{P,M<:NamedTuple}
     parent::P
     meta::M
@@ -26,7 +29,7 @@ TreeData(x, dims...; kwargs...) = TreeData(x, map(TreeDim, dims)..., map(TreeDim
 TreeData(x, dims::TreeDim...) = TreeData(x, (;dims))
 TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = TreeData(
     X, dims..., TreeDim(name, (;
-        values=keys(X),
+        values=keys(X), outer=true,
     ))
 )
 TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), meta(X).dims..., dims...)
@@ -73,7 +76,7 @@ print_tree(io::IO, X::TreeData) = begin
     print_dims(io, X)
     print_values(io, X)
 end
-print_dims(io::IO, X::TreeData) = begin 
+print_dims(io::IO, X::TreeData) = begin
     print(io, "----------------\n")
     for dim in meta(X).dims
         print(io, dim, "\n")
@@ -100,37 +103,107 @@ Base.show(io::IO, D::TreeDim) = begin
     print(IOContext(io, :compact => true), meta(D).values)
 end
 
-Base.mapslices(f, X::TreeData; dims) = error()
-Base.mapslices(f, X::TreeArray; dims) = begin 
-    dims = isa(dims, Symbol) ? (dims,) : dims
-    if dims == map(name, meta(X).dims)
-        TreeData(f(X), (;dims=map(sliced, meta(X).dims)))
-    else
-        @warn "Skipping $(dims=>map(name, meta(X).dims))"
+# ===================== dim helpers =====================
+# an *axis* dim backs real structure (array axis / NT keys / ragged nesting): its value
+# is `missing` (unlabelled) or a collection. A scalar value = a fixed-position singleton;
+# `nothing` = an aggregated ("sliced") ghost. Neither backs an axis.
+_isaxis(d::TreeDim) = (v = meta(d).values; ismissing(v) || _iscoll(v))
+_isouter(d::TreeDim) = get(meta(d), :outer, false)
+_outerdim(X::TreeData) = only(d for d in meta(X).dims if _isouter(d))
+_dimnames(dims) = dims isa Symbol ? (dims,) : Tuple(dims)
+_aschild(v::TreeData, inner) = v                 # already a TreeData -> knows its own dims
+_aschild(v, inner) = TreeData(v, inner...)       # raw field -> wrap with the inner axes
+
+# ===================== mapslices =====================
+# Reduce the named `dims`: apply `f` to each leftover-index slice, keep everything.
+# `f` returns a TreeData (or a scalar). Reduced dims stay but become `sliced` (aggregated).
+# A requested dim that is absent from a leaf -> `missing` (fixed sentinel).
+Base.mapslices(f, X::TreeData; dims) = error("mapslices: unhandled shape $(typeof(X))")
+
+function Base.mapslices(f, X::TreeArray; dims)
+    want    = _dimnames(dims)
+    alldims = meta(X).dims
+    names   = map(name, alldims)
+    n_ax    = ndims(parent(X))
+    redaxes = Tuple(i for i in 1:n_ax if names[i] in want)
+    if isempty(redaxes)
+        any(nm -> nm in names, want) || return missing               # dim absent here -> sentinel
+        return TreeData(parent(X), (;dims = map(d -> name(d) in want ? sliced(d) : d, alldims)))
     end
-end
-Base.mapslices(f, X::TreeRaggedArray; dims) = begin 
-    dims = isa(dims, Symbol) ? (dims,) : dims
-    for dim in meta(X).dims
-        @assert name(dim) ∉ dims
-    end
-    TreeData(map(x->mapslices(f, TreeData(x, Base.front(meta(X).dims)...); dims), parent(X)), meta(X))
-end
-Base.mapslices(f, X::TreeNamedTuple; dims) = begin
-    dims = isa(dims, Symbol) ? (dims,) : dims
-    for dim in meta(X).dims
-        @assert name(dim) ∉ dims
-    end
-    TreeData(map(x->mapslices(f, TreeData(x, Base.front(meta(X).dims)...); dims), parent(X)), meta(X))
+    keepaxes = Tuple(i for i in 1:n_ax if !(names[i] in want))
+    keptdims = Tuple(alldims[i] for i in keepaxes)
+    keptset  = Set(keepaxes)
+    trailing = Tuple(name(d) in want ? sliced(d) : d for (i, d) in enumerate(alldims) if !(i in keptset))
+    outs = isempty(keepaxes) ? f(parent(X)) : map(f, eachslice(parent(X); dims=keepaxes))
+    _assemble(outs, keptdims, trailing)
 end
 
-Statistics.mean(X::TreeData) = mean(parent(X))
+function Base.mapslices(f, X::TreeNamedTuple; dims)
+    want = _dimnames(dims)
+    rec  = _outerdim(X)
+    name(rec) in want && error("reducing the record dim $(name(rec)) is not supported")
+    inner  = Tuple(d for d in meta(X).dims if _isaxis(d) && !_isouter(d))
+    ghosts = Tuple(d for d in meta(X).dims if !_isaxis(d) && !_isouter(d))
+    newfields = map(v -> mapslices(f, _aschild(v, inner); dims), parent(X))
+    sample = first(v for v in newfields if v isa TreeData)
+    have   = map(name, meta(sample).dims)
+    extra  = Tuple(g for g in ghosts if !(name(g) in have))
+    TreeData(newfields, (;dims = (meta(sample).dims..., extra..., rec)))
+end
+
+function Base.mapslices(f, X::TreeRaggedArray; dims)
+    want = _dimnames(dims)
+    any(name(d) in want for d in meta(X).dims) && error("reducing a ragged outer axis is not supported")
+    TreeData(map(el -> mapslices(f, el; dims), parent(X)), meta(X))
+end
+
+# assemble f-outputs (an array over the kept axes, or a single value) into one TreeData
+function _assemble(outs, keptdims, trailing)
+    proto = outs isa AbstractArray ? first(outs) : outs
+    if proto isa TreeNamedTuple                              # record output -> structure of arrays
+        rec = _outerdim(proto)
+        ks  = keys(parent(proto))
+        arrs = NamedTuple{ks}(map(k -> outs isa AbstractArray ? map(o -> parent(o)[k], outs) : parent(outs)[k], ks))
+        return TreeData(arrs, (;dims = (keptdims..., trailing..., rec)))
+    elseif proto isa TreeData                                # new named axis (e.g. quantile levels)
+        fdims   = meta(proto).dims
+        stacked = outs isa AbstractArray ? _stack_last(outs) : parent(outs)
+        return TreeData(stacked, (;dims = (keptdims..., fdims..., trailing...)))
+    else                                                     # scalar output
+        return TreeData(outs, (;dims = (keptdims..., trailing...)))
+    end
+end
+
+function _stack_last(outs)
+    vs = map(o -> o isa TreeData ? parent(o) : o, outs)
+    n  = length(first(vs))
+    A  = Array{eltype(first(vs))}(undef, size(outs)..., n)
+    for I in CartesianIndices(outs)
+        A[I, :] .= vs[I]
+    end
+    A
+end
+
+# ===================== reducers =====================
+Statistics.mean(X::TreeData; dims=nothing) = isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims)
+Base.sum(X::TreeData; dims) = mapslices(sum, X; dims)
+
+# quantile delegates to mapslices; the output levels land on a *named, specifiable* axis
+# (`into=`) so population- and posterior-quantiles can coexist. One shared sort buffer.
+function Statistics.quantile(X::TreeData, p; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
+    levels  = collect(p)
+    scratch = Float64[]
+    mapslices(X; dims) do slice
+        n = length(slice)
+        length(scratch) == n || resize!(scratch, n)
+        copyto!(scratch, slice)
+        TreeData(quantile!(scratch, levels), TreeDim(into, Tuple(levels)))
+    end
+end
 
 unsetdim(X) = X
 setdim(X::TreeData; kwargs...) = X#TreeData(unsetdim(parent(X); kwargs...), (;dims=setdim(meta(X).dims; kwargs...)))
 setdim(dims::Tuple; kwargs...) = error()#values(merge(), (;kwargs...))
-# Statistics.mean(X::TreeData; kwargs...) = mapslices(mean, X; kwargs...)
-# Statistics.quantile(X::TreeData, p; kwargs...) = mapslices(Base.Fix2(quantile, p), X; kwargs...)
 
 Base.cat(X::TreeData...) = TreeData(X)
 Base.stack(f, iter::TreeDim) = map(f, iter)#
@@ -141,7 +214,7 @@ Base.map(f, iter::Base.Iterators.ProductIterator{<:Tuple{<:TreeDim, Vararg{<:Tre
 )
 
 
-begin 
+begin
     # # Should actually be doing some stuff to the X matrix - not doing it here for now
     # zero_re(X::TreeData) = setdim(X; random_effect=:zero)
     # # Should actually be doing some stuff to the X matrix - not doing it here for now, but maybe this will be the first change
@@ -150,7 +223,7 @@ begin
     # noplacebo(X::TreeData) = setdim(X, dims.placebo.off)
     # # Should actually be doing some stuff to the X matrix - not doing it here for now
     # setschedule(X::TreeData, schedule) = setdim(X, dims.schedule=>schedule)
-    dense_loc(args...) = TreeArray(
+    dense_loc(args...) = TreeData(
         randn(n_draws, n_subjects, n_dense),
         :draw, :subject, :time=>range(0, 1, n_dense)
     )
@@ -158,7 +231,7 @@ begin
         trough, peak = extrema(L)
         baseline = L[1]
         dtrough, dpeak = extrema(L .- baseline)
-        (;trough, peak, baseline, dtrough, dpeak)
+        TreeData(:stat => (;trough, peak, baseline, dtrough, dpeak))
     end
 
 
@@ -182,15 +255,17 @@ begin
     # )
     input_data = TreeData(
         :data=>(;
-            healthy, diseased, male, female, weight, age, 
+            healthy, diseased, male, female, weight, age,
             dose=map(TreeData(:time), dose_amounts, dose_times),
-            measurement=map(TreeData(:time), measurement_values, measurement_times)  
+            measurement=map(TreeData(:time), measurement_values, measurement_times)
         ),
         :subject=>1:n_subjects
     )
     display(input_data)
-    # # view(input_data; data=:healthy)
-    # display(mapslices(mean, input_data; dims=:time))
+
+    # reduce over :time through the heterogeneous, ragged tree: fields lacking a
+    # :time axis come back `missing`; the ragged dose/measurement series are reduced.
+    display(mapslices(mean, input_data; dims=:time))
 
     n_draws = 1000
     n_dense = 100
@@ -221,13 +296,14 @@ begin
     )) do args...
         quantile(
             quantile(
-                compute_stats(dense_loc(input_draws, args...)), 
-                population_quantiles; dims=:subject
-            ), 
-            posterior_quantiles; dims=:draw
+                compute_stats(dense_loc(input_draws, args...)),
+                population_quantiles; dims=:subject, into=:population
+            ),
+            posterior_quantiles; dims=:draw, into=:posterior
         )
     end
 
+    display(stats_percentiles)
 end
 # begin
 
@@ -284,10 +360,10 @@ end
 #     S = TreeData(
 #         randn(n_draws, n_cols),
 #         (;dims=(
-#             dims.draw, 
-#             dims.param, 
-#             dims.random_effect.in_sample, 
-#             dims.placebo.on, 
+#             dims.draw,
+#             dims.param,
+#             dims.random_effect.in_sample,
+#             dims.placebo.on,
 #             dims.space.sampler
 #         ))
 #     )
@@ -301,8 +377,8 @@ end
 
 
 
-#     P = setschedule(setre(S, :population), "something") 
-#     Ls = stack(Iterators.product(doses, placebos)) do dose, placebo 
+#     P = setschedule(setre(S, :population), "something")
+#     Ls = stack(Iterators.product(doses, placebos)) do dose, placebo
 #         loc(setplacebo(setdose(P, dose), placebo))
 #     end
 
@@ -318,4 +394,3 @@ end
 
 
 # end
-
