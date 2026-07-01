@@ -182,18 +182,19 @@ function _assemble(proto::TreeNamedTuple, outs, keptdims, trailing)
 end
 # new named axis (e.g. quantile levels) -> stack the output parents along that axis
 _assemble(proto::TreeData, outs, keptdims, trailing) =
-    TreeData(_stacklast(_over(parent, outs)), (;dims = (keptdims..., dims(proto)..., trailing...)))
+    TreeData(_stacklast(outs), (;dims = (keptdims..., dims(proto)..., trailing...)))
 # scalar output -> a dense array of the scalars (`outs` already holds them)
 _assemble(::Any, outs, keptdims, trailing) =
     TreeData(outs, (;dims = (keptdims..., trailing...)))
 
-# stack equal-length vectors along a new trailing axis; a lone axis-vector passes through
-_stacklast(v::AbstractVector{<:Number}) = v
-function _stacklast(vs::AbstractArray)
-    n = length(first(vs))
-    A = Array{eltype(first(vs))}(undef, size(vs)..., n)
-    for I in CartesianIndices(vs)
-        A[I, :] .= vs[I]
+# stack the output parents along a new trailing axis, extracting parent inline (no temp
+# array of parents); a lone reduce-all output passes its parent vector through as the axis.
+_stacklast(out::TreeData) = parent(out)
+function _stacklast(outs::AbstractArray)
+    v1 = parent(first(outs))
+    A  = Array{eltype(v1)}(undef, size(outs)..., length(v1))
+    for I in CartesianIndices(outs)
+        A[I, :] .= parent(outs[I])
     end
     A
 end
