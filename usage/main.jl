@@ -41,6 +41,13 @@ TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
 dims(X::TreeData) = meta(X).dims                 # the tree's (inner) axes
 outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axis
 
+# leaf numeric eltype: recurse through NamedTuple / ragged nesting down to the backing array.
+# TreeNamedTuple uses the FIRST field's type -- fine for quantile's homogeneous numeric records.
+_eltype(X::TreeArray)       = eltype(parent(X))
+_eltype(X::TreeNamedTuple)  = _eltype(first(parent(X)))
+_eltype(X::TreeRaggedArray) = _eltype(first(parent(X)))
+_eltype(x)                  = eltype(x)
+
 
 function Base.show(io::IO, T::Type{<:TreeDim})
     if get(io, :compact, false)
@@ -208,7 +215,7 @@ Base.sum(X::TreeData; dims) = mapslices(sum, X; dims)
 function Statistics.quantile(X::TreeData, p; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
     levels   = collect(p)
     leveldim = TreeDim(into, Tuple(levels))   # constant across slices -> build once
-    scratch  = Float64[]
+    scratch  = _eltype(X)[]
     mapslices(X; dims) do slice
         length(scratch) == length(slice) || resize!(scratch, length(slice))
         copyto!(scratch, slice)
@@ -220,7 +227,7 @@ end
 # SCALAR (no new axis, same scalar-output path `mean` exercises through mapslices);
 # the requested level lands as a fixed-coordinate `into` dim (a scalar TreeDim value).
 function Statistics.quantile(X::TreeData, p::Number; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
-    scratch = Float64[]
+    scratch = _eltype(X)[]
     result = mapslices(X; dims) do slice
         length(scratch) == length(slice) || resize!(scratch, length(slice))
         copyto!(scratch, slice)
