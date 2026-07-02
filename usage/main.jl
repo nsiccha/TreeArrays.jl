@@ -407,21 +407,8 @@ end
 # ===================== PROBE: setdim stubs throw instead of silently no-oping =====================
 begin
     X = TreeData(randn(4,3), :draw, :param)
-    threw = false
-    try
-        setdim(X; foo=:bar)
-    catch
-        threw = true
-    end
-    @assert threw                           # was: silently returned X unchanged
-
-    threw = false
-    try
-        setdim((:draw, :param); foo=:bar)
-    catch
-        threw = true
-    end
-    @assert threw                           # was: bare error() with no message
+    @assert (try; setdim(X; foo=:bar); false; catch; true; end)                # was: silently returned X unchanged
+    @assert (try; setdim((:draw, :param); foo=:bar); false; catch; true; end)  # was: bare error() with no message
 end
 # begin
 
