@@ -15,13 +15,22 @@
 # trailing semantics exactly: an axis dim named in `want` sets `found`; an axis dim not in
 # `want` is kept; everything else (ghost dims, and axis dims being reduced) lands in
 # `trailing`, sliced iff in `want`.
+# shared staging-time (not @generated itself) iteration idiom for the `@generated` dims-
+# tuple partitioners below: (position, element-type) pairs over a Tuple TYPE's parameters.
+# A single combined N-way-bucket-with-transform combinator was considered (per review) and
+# rejected -- `_splitdims`'s 4-way/`sliced()`-transform/`foundany`-flag shape, `_splitrecord`'s
+# 3-way (a dim can be excluded from BOTH buckets), and `_exclude`'s plain 1-way filter don't
+# share enough to justify passing a staged classifier-function through the @generated
+# boundary; this loop-shape extraction is the honest amount of dedup without contorting any
+# of the three into a worse shared abstraction.
+_dimtypes(alldims::Type{<:Tuple}) = ((i, alldims.parameters[i]) for i in 1:length(alldims.parameters))
+
 @generated function _splitdims(alldims::Tuple, ::Val{nax}, ::Val{want}) where {nax,want}
     keepidx = Int[]
     kept    = Expr[]
     trail   = Expr[]
     foundany = false
-    for i in 1:length(alldims.parameters)
-        d      = alldims.parameters[i]
+    for (i, d) in _dimtypes(alldims)
         isax   = i <= nax
         inwant = name(d) in want
         if isax && inwant
@@ -104,16 +113,49 @@ function _mapslices(f, X::TreeArray, valwant::Val{want}) where want
     TreeData(parent(X), (;dims = map(d -> name(d) in want ? sliced(d) : d, alldims)))
 end
 
-function Base.mapslices(f, X::TreeNamedTuple; dims)
-    want = _dimnames(dims)
+# Partition a TreeNamedTuple's dims into (inner, ghosts) at compile time: `rec` (the field-
+# enumerating axis) is excluded from BOTH -- it's handled separately via `outer_dim`, not
+# passed down to children nor carried as a ghost. Same proven shape/reasoning as `_splitdims`
+# (a mixed axis/non-axis partition over a heterogeneous tuple) -- `@generated`.
+@generated function _splitrecord(alldims::Tuple, ::Val{recname}) where recname
+    inner  = Expr[]
+    ghosts = Expr[]
+    for (i, d) in _dimtypes(alldims)
+        if _isaxis(d)
+            name(d) == recname || push!(inner, :(alldims[$i]))
+        else
+            push!(ghosts, :(alldims[$i]))
+        end
+    end
+    :(($(inner...),), ($(ghosts...),))
+end
+
+# Drop any ghost already covered by `have` (the sample field's own dims) -- same shape as
+# `_splitrecord`/`_splitdims`, `@generated`.
+@generated function _exclude(ghosts::Tuple, ::Val{have}) where have
+    keep = Expr[]
+    for (i, d) in _dimtypes(ghosts)
+        name(d) in have || push!(keep, :(ghosts[$i]))
+    end
+    :(($(keep...),))
+end
+
+# Find the first non-missing field. Missing-ness is decidable from the TYPE alone (`Missing`
+# vs not) -- ordinary multiple dispatch, not a `Val`/`@generated` problem (dev #4.5: dispatch
+# instead of a value-level if/elseif).
+@inline _firstsample() = missing
+@inline _firstsample(v::Missing, rest...) = _firstsample(rest...)
+@inline _firstsample(v, rest...) = v
+
+Base.@constprop :aggressive Base.mapslices(f, X::TreeNamedTuple; dims) = _mapslices(f, X, Val(_dimnames(dims)))
+function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}) where want
     rec  = outerdim(X)
-    inner  = Tuple(d for d in TreeArrays.dims(X) if _isaxis(d) && name(d) != name(rec))   # rec enumerates the fields, not an inner axis
-    ghosts = Tuple(d for d in TreeArrays.dims(X) if !_isaxis(d))
-    newfields = map(v -> mapslices(f, _aschild(v, inner); dims), parent(X))
+    inner, ghosts = _splitrecord(TreeArrays.dims(X), Val(name(rec)))   # rec enumerates the fields, not an inner axis
+    newfields = map(v -> mapslices(f, _aschild(v, inner); dims=want), parent(X))
     any(!ismissing, newfields) || return missing        # no child carried the dim -> sentinel
-    sample = first(v for v in newfields if !ismissing(v))
+    sample = _firstsample(newfields...)
     have   = map(name, TreeArrays.dims(sample))
-    extra  = Tuple(g for g in ghosts if !(name(g) in have))
+    extra  = _exclude(ghosts, Val(have))
     TreeData(newfields, (;dims = (TreeArrays.dims(sample)..., extra...), outer_dim = rec))
 end
 
