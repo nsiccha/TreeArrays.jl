@@ -274,8 +274,8 @@ macro kernel(spec, fdef)
 end
 
 unsetdim(X) = X
-setdim(X::TreeData; kwargs...) = X#TreeData(unsetdim(parent(X); kwargs...), (;dims=setdim(meta(X).dims; kwargs...)))
-setdim(dims::Tuple; kwargs...) = error()#values(merge(), (;kwargs...))
+setdim(X::TreeData; kwargs...) = error("setdim not implemented")#TreeData(unsetdim(parent(X); kwargs...), (;dims=setdim(meta(X).dims; kwargs...)))
+setdim(dims::Tuple; kwargs...) = error("setdim not implemented")#values(merge(), (;kwargs...))
 
 Base.cat(X::TreeData...) = TreeData(X)
 Base.stack(f, iter::TreeDim) = map(f, iter)#
@@ -402,6 +402,13 @@ begin
     println("PROBE size(X) = ", size(X), ", length(X) = ", length(X), ", ndims(X) = ", ndims(X), ", eltype(X) = ", eltype(X))
     println("PROBE X[1] = ", X[1])
     println("PROBE collect(X) == parent(X): ", collect(X) == P)
+end
+
+# ===================== PROBE: setdim stubs throw instead of silently no-oping =====================
+begin
+    X = TreeData(randn(4,3), :draw, :param)
+    @assert (try; setdim(X; foo=:bar); false; catch; true; end)                # was: silently returned X unchanged
+    @assert (try; setdim((:draw, :param); foo=:bar); false; catch; true; end)  # was: bare error() with no message
 end
 # begin
 
