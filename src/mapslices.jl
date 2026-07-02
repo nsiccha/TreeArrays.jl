@@ -3,23 +3,59 @@
 # `f` returns a TreeData (or a scalar). Reduced dims stay but become `sliced` (aggregated).
 # A requested dim that is absent from a leaf -> `missing` (fixed sentinel).
 
+# Type-stable partition of `alldims` against the (type-level) reduce-dim set `want`, given
+# the axis/ghost boundary `nax` (= ndims(parent(X))). Plain recursive tuple-peeling proved
+# NOT to fold here once the axis/ghost boundary is actually crossed (verified empirically --
+# 3+ element mixed axis/ghost tuples widen to a Union under Julia's inference; a uniform
+# all-axis tuple folds fine by coincidence, which is why #1's original all-axis smoke test
+# passed before this was checked against a ghost-bearing input like a chained reduction's
+# result). `@generated` sidesteps recursion-depth inference limits entirely -- this is a
+# SECOND genuine `@generated` spot beyond `_eachslice`, discovered empirically, not reflexive
+# (flagged to the supervisor). Mirrors the original redaxes/keepaxes/keptdims/keptset/
+# trailing semantics exactly: an axis dim named in `want` sets `found`; an axis dim not in
+# `want` is kept; everything else (ghost dims, and axis dims being reduced) lands in
+# `trailing`, sliced iff in `want`.
+@generated function _splitdims(alldims::Tuple, ::Val{nax}, ::Val{want}) where {nax,want}
+    keepidx = Int[]
+    kept    = Expr[]
+    trail   = Expr[]
+    foundany = false
+    for i in 1:length(alldims.parameters)
+        d      = alldims.parameters[i]
+        isax   = i <= nax
+        inwant = name(d) in want
+        if isax && inwant
+            push!(trail, :(sliced(alldims[$i])))
+            foundany = true
+        elseif isax
+            push!(keepidx, i)
+            push!(kept, :(alldims[$i]))
+        elseif inwant
+            push!(trail, :(sliced(alldims[$i])))
+        else
+            push!(trail, :(alldims[$i]))
+        end
+    end
+    :(($(Tuple(keepidx)), ($(kept...),), ($(trail...),), $foundany))
+end
+
+# The one genuinely runtime-dims spot: eachslice(A; dims) needs the axis VALUES (not just
+# their count) baked into a type parameter for `Slices`'s type to stay concrete. The Val
+# lift (`ks` becomes `where`-bound) is enough for Base's own eachslice to see a literal.
+@inline _eachslice(A::AbstractArray, ::Val{ks}) where ks = eachslice(A; dims=ks)
+
 # Shared "found the axis" bookkeeping for TreeArray/TreeRaggedArray: which parent-array
-# positions are being reduced (redaxes) vs kept (keepaxes), and the ghost dims left behind
-# for the reduced ones (trailing). Returns `nothing` when `want` doesn't hit a real axis
-# here -> the caller decides what that means (a true leaf -> sentinel/idempotent re-slice;
-# an intermediate node -> recurse deeper into each element).
-function _reduceouter(f, X, want)
+# positions are being reduced vs kept, and the ghost dims left behind for the reduced ones.
+# Returns `nothing` when `want` doesn't hit a real axis here -> the caller decides what that
+# means (a true leaf -> sentinel/idempotent re-slice; an intermediate node -> recurse deeper
+# into each element).
+function _reduceouter(f, X, valwant::Val{want}) where want
     alldims = TreeArrays.dims(X)
-    names   = map(name, alldims)
     n_ax    = ndims(parent(X))
-    @assert all(_isaxis, alldims[1:n_ax]) "_reduceouter assumes the first $n_ax dims of $(typeof(X)) are exactly the parent array's axes, positionally, in order; got a non-axis dim at position $(findfirst(!_isaxis, alldims[1:n_ax])) (dims = $(names))"
-    redaxes = Tuple(i for i in 1:n_ax if names[i] in want)
-    isempty(redaxes) && return nothing
-    keepaxes = Tuple(i for i in 1:n_ax if !(names[i] in want))
-    keptdims = Tuple(alldims[i] for i in keepaxes)
-    keptset  = Set(keepaxes)
-    trailing = Tuple(name(d) in want ? sliced(d) : d for (i, d) in enumerate(alldims) if !(i in keptset))
-    outs = isempty(keepaxes) ? _leafreduce(f, parent(X)) : map(sl -> _leafreduce(f, sl), eachslice(parent(X); dims=keepaxes))
+    @assert all(_isaxis, alldims[1:n_ax]) "_reduceouter assumes the first $n_ax dims of $(typeof(X)) are exactly the parent array's axes, positionally, in order; got a non-axis dim at position $(findfirst(!_isaxis, alldims[1:n_ax])) (dims = $(map(name, alldims)))"
+    keepaxes, keptdims, trailing, foundany = _splitdims(alldims, Val(n_ax), valwant)
+    foundany || return nothing
+    outs = isempty(keepaxes) ? _leafreduce(f, parent(X)) : map(sl -> _leafreduce(f, sl), _eachslice(parent(X), Val(keepaxes)))
     _assemble(outs, keptdims, trailing)
 end
 
@@ -59,9 +95,9 @@ _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
 end
 _leafreduce(f, sl::AbstractArray) = f(sl)
 
-function Base.mapslices(f, X::TreeArray; dims)
-    want = _dimnames(dims)
-    r = _reduceouter(f, X, want)
+Base.@constprop :aggressive Base.mapslices(f, X::TreeArray; dims) = _mapslices(f, X, Val(_dimnames(dims)))
+function _mapslices(f, X::TreeArray, valwant::Val{want}) where want
+    r = _reduceouter(f, X, valwant)
     isnothing(r) || return r
     alldims = TreeArrays.dims(X)
     any(nm -> nm in map(name, alldims), want) || return missing   # dim absent here -> sentinel
@@ -81,11 +117,11 @@ function Base.mapslices(f, X::TreeNamedTuple; dims)
     TreeData(newfields, (;dims = (TreeArrays.dims(sample)..., extra...), outer_dim = rec))
 end
 
-function Base.mapslices(f, X::TreeRaggedArray; dims)
-    want = _dimnames(dims)
-    r = _reduceouter(f, X, want)
+Base.@constprop :aggressive Base.mapslices(f, X::TreeRaggedArray; dims) = _mapslices(f, X, Val(_dimnames(dims)))
+function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}) where want
+    r = _reduceouter(f, X, valwant)
     isnothing(r) || return r
-    TreeData(map(el -> mapslices(f, el; dims), parent(X)), meta(X))
+    TreeData(map(el -> mapslices(f, el; dims=want), parent(X)), meta(X))
 end
 
 # wrap `outs` (the raw per-slice kernel outputs -- already TreeData/record/scalar pieces,
