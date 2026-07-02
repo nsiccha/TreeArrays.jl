@@ -40,6 +40,10 @@ TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
 # convenience accessors (avoid spelling out `meta(...).field` everywhere)
+# `dims` collides with the `dims=` kwarg used throughout mapslices/quantile,
+# so inside those method bodies it must be qualified as `Main.dims(...)`
+# (correct only while this script lives in `Main`) -- once this code moves
+# into the TreeArrays module, requalify those call sites as `TreeArrays.dims`.
 dims(X::TreeData) = meta(X).dims                 # the tree's (inner) axes
 outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axis
 
