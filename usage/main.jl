@@ -40,6 +40,10 @@ TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
 # convenience accessors (avoid spelling out `meta(...).field` everywhere)
+# `dims` collides with the `dims=` kwarg used throughout mapslices/quantile,
+# so inside those method bodies it must be qualified as `Main.dims(...)`
+# (correct only while this script lives in `Main`) -- once this code moves
+# into the TreeArrays module, requalify those call sites as `TreeArrays.dims`.
 dims(X::TreeData) = meta(X).dims                 # the tree's (inner) axes
 outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axis
 
@@ -161,6 +165,7 @@ function _reduceouter(f, X, want)
     alldims = Main.dims(X)
     names   = map(name, alldims)
     n_ax    = ndims(parent(X))
+    @assert all(_isaxis, alldims[1:n_ax]) "_reduceouter assumes the first $n_ax dims of $(typeof(X)) are exactly the parent array's axes, positionally, in order; got a non-axis dim at position $(findfirst(!_isaxis, alldims[1:n_ax])) (dims = $(names))"
     redaxes = Tuple(i for i in 1:n_ax if names[i] in want)
     isempty(redaxes) && return nothing
     keepaxes = Tuple(i for i in 1:n_ax if !(names[i] in want))
@@ -186,7 +191,7 @@ _leafreduce(f, sl::AbstractArray{<:TreeNamedTuple}) = begin
 end
 _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
     proto = first(sl)
-    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), eachindex(parent(proto)))
+    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), CartesianIndices(parent(proto)))
     TreeData(vals, meta(proto))
 end
 _leafreduce(f, sl::AbstractArray) = f(sl)
@@ -402,6 +407,49 @@ begin
     println("PROBE size(X) = ", size(X), ", length(X) = ", length(X), ", ndims(X) = ", ndims(X), ", eltype(X) = ", eltype(X))
     println("PROBE X[1] = ", X[1])
     println("PROBE collect(X) == parent(X): ", collect(X) == P)
+end
+
+# ===================== PROBE: _reduceouter positional-axis assertion (jz9bkv) =====================
+# _reduceouter assumes the first ndims(parent(X)) entries of `dims` are exactly the
+# parent array's axes, positionally, in order (_assemble upholds this by construction,
+# but nothing enforces it on a hand-built TreeData). A non-axis dim (here a scalar,
+# `:extra`) placed BEFORE the real axes shifts the positional lookup and silently
+# reduces the wrong parent axis -- confirmed below before landing the @assert:
+#   reducing :draw on a well-formed (draw, param) TreeData sums over rows -> [10, 26, 42]
+#   reducing :draw on the misordered (extra, draw, param) TreeData instead summed over
+#   columns -> [15, 18, 21, 24] (wrong axis, wrong shape, silently wrong).
+# Now that _reduceouter asserts the invariant, the misordered construction throws.
+begin
+    Pgood = reshape(1.0:12.0, 4, 3)
+    Xgood = TreeData(Pgood, :draw, :param)
+    Xbad  = TreeData(Pgood, TreeDim(:extra, 99), TreeDim(:draw), TreeDim(:param))
+    good  = mapslices(sum, Xgood; dims=:draw)
+    @assert parent(good) == [10.0, 26.0, 42.0]   # sane baseline: reduces rows, not columns
+    threw = try
+        mapslices(sum, Xbad; dims=:draw)
+        false
+    catch e
+        e isa AssertionError || rethrow()
+        true
+    end
+    @assert threw "expected AssertionError: non-axis dim before a real array axis must fail loudly, not mis-map"
+    println("PROBE _reduceouter positional-axis assertion fired for misordered dims")
+end
+
+# ===================== PROBE: _leafreduce preserves multidim leaf shape (1cn9zad) =====================
+# _leafreduce(f, sl::AbstractArray{<:TreeData}) built `vals` via
+# map(i -> ..., eachindex(parent(proto))) -- eachindex is linear, so a multidim leaf's
+# `vals` came back as a flat Vector while the reused `meta(proto)` still described the
+# original multidim shape (confirmed below before the fix: meta claimed (:time, :chan)
+# while parent(inner) was a flat length-6 Vector{Float64}). Fixed by iterating
+# CartesianIndices(parent(proto)) instead of eachindex, which preserves the leaf's shape.
+begin
+    leaves = [TreeData(randn(2, 3), :time, :chan) for _ in 1:5]
+    Xouter = TreeData(leaves, :subject)          # TreeRaggedArray: outer :subject axis
+    result = mapslices(mean, Xouter; dims=:subject)
+    inner  = parent(result)                      # the gathered per-leaf-cell TreeData
+    @assert size(parent(inner)) == (2, 3) "leaf shape flattened: got $(size(parent(inner)))"
+    println("PROBE _leafreduce preserves multidim leaf shape: ", size(parent(inner)))
 end
 
 # ===================== PROBE: setdim stubs throw instead of silently no-oping =====================
