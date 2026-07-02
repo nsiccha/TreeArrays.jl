@@ -165,6 +165,7 @@ function _reduceouter(f, X, want)
     alldims = Main.dims(X)
     names   = map(name, alldims)
     n_ax    = ndims(parent(X))
+    @assert all(_isaxis, alldims[1:n_ax]) "_reduceouter assumes the first $n_ax dims of $(typeof(X)) are exactly the parent array's axes, positionally, in order; got a non-axis dim at position $(findfirst(!_isaxis, alldims[1:n_ax])) (dims = $(names))"
     redaxes = Tuple(i for i in 1:n_ax if names[i] in want)
     isempty(redaxes) && return nothing
     keepaxes = Tuple(i for i in 1:n_ax if !(names[i] in want))
@@ -406,6 +407,33 @@ begin
     println("PROBE size(X) = ", size(X), ", length(X) = ", length(X), ", ndims(X) = ", ndims(X), ", eltype(X) = ", eltype(X))
     println("PROBE X[1] = ", X[1])
     println("PROBE collect(X) == parent(X): ", collect(X) == P)
+end
+
+# ===================== PROBE: _reduceouter positional-axis assertion (jz9bkv) =====================
+# _reduceouter assumes the first ndims(parent(X)) entries of `dims` are exactly the
+# parent array's axes, positionally, in order (_assemble upholds this by construction,
+# but nothing enforces it on a hand-built TreeData). A non-axis dim (here a scalar,
+# `:extra`) placed BEFORE the real axes shifts the positional lookup and silently
+# reduces the wrong parent axis -- confirmed below before landing the @assert:
+#   reducing :draw on a well-formed (draw, param) TreeData sums over rows -> [10, 26, 42]
+#   reducing :draw on the misordered (extra, draw, param) TreeData instead summed over
+#   columns -> [15, 18, 21, 24] (wrong axis, wrong shape, silently wrong).
+# Now that _reduceouter asserts the invariant, the misordered construction throws.
+begin
+    Pgood = reshape(1.0:12.0, 4, 3)
+    Xgood = TreeData(Pgood, :draw, :param)
+    Xbad  = TreeData(Pgood, TreeDim(:extra, 99), TreeDim(:draw), TreeDim(:param))
+    good  = mapslices(sum, Xgood; dims=:draw)
+    @assert parent(good) == [10.0, 26.0, 42.0]   # sane baseline: reduces rows, not columns
+    threw = try
+        mapslices(sum, Xbad; dims=:draw)
+        false
+    catch e
+        e isa AssertionError || rethrow()
+        true
+    end
+    @assert threw "expected AssertionError: non-axis dim before a real array axis must fail loudly, not mis-map"
+    println("PROBE _reduceouter positional-axis assertion fired for misordered dims")
 end
 # begin
 
