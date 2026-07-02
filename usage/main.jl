@@ -35,7 +35,7 @@ TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = begin
     rec = TreeDim(name, keys(X))
     TreeData(X, (;dims = (dims..., rec), outer_dim = rec))
 end
-TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), meta(X).dims..., dims...)
+TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), merge(meta(X), (;dims=(meta(X).dims..., dims...))))
 TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
@@ -279,8 +279,8 @@ macro kernel(spec, fdef)
 end
 
 unsetdim(X) = X
-setdim(X::TreeData; kwargs...) = X#TreeData(unsetdim(parent(X); kwargs...), (;dims=setdim(meta(X).dims; kwargs...)))
-setdim(dims::Tuple; kwargs...) = error()#values(merge(), (;kwargs...))
+setdim(X::TreeData; kwargs...) = error("setdim not implemented")#TreeData(unsetdim(parent(X); kwargs...), (;dims=setdim(meta(X).dims; kwargs...)))
+setdim(dims::Tuple; kwargs...) = error("setdim not implemented")#values(merge(), (;kwargs...))
 
 Base.cat(X::TreeData...) = TreeData(X)
 Base.stack(f, iter::TreeDim) = map(f, iter)#
@@ -450,6 +450,24 @@ begin
     inner  = parent(result)                      # the gathered per-leaf-cell TreeData
     @assert size(parent(inner)) == (2, 3) "leaf shape flattened: got $(size(parent(inner)))"
     println("PROBE _leafreduce preserves multidim leaf shape: ", size(parent(inner)))
+end
+
+# ===================== PROBE: setdim stubs throw instead of silently no-oping =====================
+begin
+    X = TreeData(randn(4,3), :draw, :param)
+    @assert (try; setdim(X; foo=:bar); false; catch; true; end)                # was: silently returned X unchanged
+    @assert (try; setdim((:draw, :param); foo=:bar); false; catch; true; end)  # was: bare error() with no message
+end
+# begin
+
+# ===================== PROBE: outer_dim survives TreeData-forwarding =====================
+begin
+    Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
+    Y = TreeData(Xnt, TreeDim(:extra, nothing))
+    @assert outerdim(Y) === outerdim(Xnt)                    # was: no `outer_dim` field in meta(Y)
+    Z = mapslices(mean, Y; dims=:draw)                       # was: errors calling outerdim(Y) inside mapslices (~line 205)
+    println("PROBE outerdim(Y) = ", outerdim(Y))
+    println("PROBE mapslices(mean, Y; dims=:draw) ran without error")
 end
 # begin
 
