@@ -68,11 +68,23 @@ exists to answer it empirically.
    in the type → compile-time axis resolution + type stability. Value-lookups,
    ragged offsets, factor labels live in fields. High-cardinality levels stay in
    fields (avoid type bloat).
+6. **Shape-faithful — keep as provided, never coerce.** An operation preserves
+   the *container and shape* of its inputs: scalar → scalar, vector → vector,
+   tuple → tuple along an axis (`14bbwbt` / `xxmv6c`). `TreeArray` **never
+   coerces to an internal "array-backed" assumption** — a leaf may be
+   non-array-backed (a tuple or scalar parent) and the machinery accommodates
+   it. This is the root of *no eager restructuring* (§1) and the missing-sentinel
+   rule (§7): TreeArrays moves and labels data, it does not silently reshape or
+   re-type it.
 
 ## 4. Core abstractions / types
 
-- **`TreeArray(parent, meta)`** — flat backing `parent::AbstractArray` + `meta`
-  describing axes / factors / fixed-coordinates.
+- **`TreeArray(parent, meta)`** — flat backing `parent` + `meta` describing axes
+  / factors / fixed-coordinates. `parent` is **usually** an `AbstractArray`, but
+  a leaf may be **non-array-backed** — a tuple or scalar (e.g. a `quantile` leaf
+  mirroring a tuple `p`, `xxmv6c`). The `TreeArray{P<:AbstractArray}` /
+  `TreeNamedTuple` / `TreeRaggedArray` aliases classify *array-backed* nodes **for
+  dispatch**; they do not constrain what a valid leaf is (§3.6).
 - **Dim types** — one per dimension (`Draw`, `Param`, `Time`, `Dose`, `Subject`,
   `RandomEffect`, `Placebo`, `Space`, `QoI`, …); small categorical dims carry
   their levels in the type.
@@ -106,7 +118,7 @@ X[random_effect.zero]
 
 # Reductions over named dims — eager kernels; reducing a ragged axis re-densifies
 mean(X; dims=:subject)
-quantile(X, p; dims=:draw)
+quantile(X, TreeDim(name, p); dims=:draw)   # outcome dim = TreeDim(name, levels): scalar p → fixed coord, collection → axis
 
 # mapslices — the workhorse; SAME code on rectangular AND ragged inputs
 compute_stats(X) = mapslices(X; dims=:time) do L
@@ -128,7 +140,10 @@ materialize(X)   # escape hatch: pin a reused block
 
 - **`mapslices` lowering:** `mapslices(f; dims=D)` ≡ `map(f, eachslice(...; over
   complement of D))` — views (no copy) + function barrier (specialize on `f`,
-  concrete eltype) + collect a NamedTuple-returning `f` into a `StructArray`.
+  concrete eltype). **How a NamedTuple-returning `f`'s results are collected — a
+  pivoted `StructArray` (SoA) vs a kept-as-provided nested structure — is OPEN
+  (§8, `gy3mf8`)**; the shape-faithful principle (§3.6) leans against a silent
+  pivot.
 - **`stack` vs `ragged_stack` — two functions for type stability.** Dense-vs-
   ragged is a *runtime* property of block lengths; one polymorphic `stack` would
   return `Union{Dense,Ragged}`. `stack` asserts congruent blocks (errors → points
@@ -170,6 +185,15 @@ dense is a property of the *assembled* time axis, not of `loc`.
   contiguous per-group view either way.
 - **Residuals** = obs block `.-` ragged-pred block, eager, on the **shared**
   ragged structure (pred carries an extra dense `draw` axis to broadcast over).
+- **Reductions preserve the level container faithfully.** `quantile(X,
+  TreeDim(name, p); dims)` — the leaf mirrors `p`'s container: scalar `p` →
+  scalar leaf + fixed coordinate; vector `p` → vector leaf + axis; **tuple `p` →
+  tuple leaf + axis** (`xxmv6c`). The tree machinery handles the non-array-backed
+  leaf; no coercion to a vector.
+- **Absent reduce-dim → `missing`, never a valid-looking value** (`16fwcnx`). A
+  reduction whose requested dim isn't present returns the `missing` sentinel —
+  never a coerced or plausible-but-wrong value. A dedicated `Sentinel` type may
+  replace the bare `missing` later (`13lob71`).
 
 ## 8. Open questions / decisions
 
@@ -181,6 +205,10 @@ dense is a property of the *assembled* time axis, not of `loc`.
    where is the cutoff to fields?
 4. **`stack` ergonomics** — infer the new axis name/levels purely from inputs'
    fixed coords, or also accept an explicit dim?
+5. **`mapslices` result layout** (`gy3mf8`) — collect a NamedTuple-returning `f`
+   into a pivoted `StructArray` (SoA), or keep the per-slice results as a nested
+   / as-provided structure? The shape-faithful principle (§3.6) leans against the
+   pivot; unresolved.
 
 ## Appendix — cleanups already spotted in `usage/main.jl`
 
