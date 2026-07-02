@@ -35,7 +35,7 @@ TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = begin
     rec = TreeDim(name, keys(X))
     TreeData(X, (;dims = (dims..., rec), outer_dim = rec))
 end
-TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), meta(X).dims..., dims...)
+TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), merge(meta(X), (;dims=(meta(X).dims..., dims...))))
 TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
@@ -409,6 +409,17 @@ begin
     X = TreeData(randn(4,3), :draw, :param)
     @assert (try; setdim(X; foo=:bar); false; catch; true; end)                # was: silently returned X unchanged
     @assert (try; setdim((:draw, :param); foo=:bar); false; catch; true; end)  # was: bare error() with no message
+end
+# begin
+
+# ===================== PROBE: outer_dim survives TreeData-forwarding =====================
+begin
+    Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
+    Y = TreeData(Xnt, TreeDim(:extra, nothing))
+    @assert outerdim(Y) === outerdim(Xnt)                    # was: no `outer_dim` field in meta(Y)
+    Z = mapslices(mean, Y; dims=:draw)                       # was: errors calling outerdim(Y) inside mapslices (~line 205)
+    println("PROBE outerdim(Y) = ", outerdim(Y))
+    println("PROBE mapslices(mean, Y; dims=:draw) ran without error")
 end
 # begin
 
