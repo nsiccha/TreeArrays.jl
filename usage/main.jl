@@ -39,6 +39,7 @@ TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), merge(meta(X), (;d
 TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
+TreeTuple{P<:Tuple,M<:NamedTuple} = TreeData{P,M}
 # convenience accessors (avoid spelling out `meta(...).field` everywhere)
 # `dims` collides with the `dims=` kwarg used throughout mapslices/quantile,
 # so inside those method bodies it must be qualified as `Main.dims(...)`
@@ -50,6 +51,7 @@ outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axi
 # leaf numeric eltype: recurse through NamedTuple / ragged nesting down to the backing array.
 # TreeNamedTuple uses the FIRST field's type -- fine for quantile's homogeneous numeric records.
 _eltype(X::TreeArray)       = eltype(parent(X))
+_eltype(X::TreeTuple)       = eltype(parent(X))
 _eltype(X::TreeNamedTuple)  = _eltype(first(parent(X)))
 _eltype(X::TreeRaggedArray) = _eltype(first(parent(X)))
 _eltype(x)                  = eltype(x)
@@ -178,20 +180,36 @@ end
 
 # The gather-reduction: reduce an OUTER axis of a nested result by pushing it down to the
 # leaves (pure index arithmetic on `sl`, a gathered slice along that axis -- nothing
-# materialized) and recursing. Record -> recurse per field. Inner-axis (TreeData) leaf ->
-# recurse per position, building a NEW nested array (never flattened/stacked -- a chained
-# reduction stays a tree of arrays all the way down). Plain array leaf -> apply the kernel
-# directly; this base case is also what a dense TreeArray reduction needs, so `_reduceouter`
-# routes both shapes through `_leafreduce` uniformly.
-_leafreduce(f, sl::AbstractArray{<:TreeNamedTuple}) = begin
+# materialized) and recursing. Record (NamedTuple- or Tuple-keyed) -> recurse per key.
+# Array-backed leaf -> recurse per position, building a NEW nested array (never
+# flattened/stacked -- a chained reduction stays a tree of arrays all the way down).
+# Scalar-backed leaf -> no inner positions to preserve; the outer reduction replaces the
+# leaf outright (mirrors the plain-array base case below). Plain array leaf -> apply the
+# kernel directly; this base case is also what a dense TreeArray reduction needs, so
+# `_reduceouter` routes all shapes through `_leafreduce` uniformly.
+
+# TreeNamedTuple (named fields) and TreeTuple (positional fields) are both "keyed, axis-
+# bearing" records and walk the identical gather-by-key / recurse / reassemble shape; only
+# how keys are read and how the container is rebuilt differs -- shared driver below, two
+# tiny per-container dispatch points instead of a bespoke tuple-only branch.
+_reassemble(::NamedTuple{ks}, fields) where ks = NamedTuple{ks}(fields)
+_reassemble(::Tuple, fields)                   = Tuple(fields)
+_leafmeta(proto::TreeNamedTuple) = (;dims = Main.dims(proto), outer_dim = outerdim(proto))
+# a TreeTuple leaf never carries an `outer_dim` (positional fields have no naming axis to
+# record); if a future path builds a TreeTuple WITH one, this drops it silently -- widen
+# this method (not a bespoke special case) if that ever becomes real.
+_leafmeta(proto::TreeTuple)      = (;dims = Main.dims(proto))
+_leafreduce(f, sl::AbstractArray{<:Union{TreeNamedTuple,TreeTuple}}) = begin
     proto = first(sl)
     ks = keys(parent(proto))
     fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl)), ks)
-    TreeData(NamedTuple{ks}(fields), (;dims = Main.dims(proto), outer_dim = outerdim(proto)))
+    TreeData(_reassemble(parent(proto), fields), _leafmeta(proto))
 end
 _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
     proto = first(sl)
-    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), CartesianIndices(parent(proto)))
+    p = parent(proto)
+    p isa AbstractArray || return _leafreduce(f, map(parent, sl))  # scalar leaf: reduce directly, no positions
+    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), CartesianIndices(p))
     TreeData(vals, meta(proto))
 end
 _leafreduce(f, sl::AbstractArray) = f(sl)
@@ -235,20 +253,17 @@ Base.sum(X::TreeData; dims=nothing) = isnothing(dims) ? sum(parent(X)) : mapslic
 
 # quantile delegates to mapslices; pdim bundles the output axis name + values,
 # kept EXACTLY as given (Tuple stays Tuple, Vector stays Vector, Number stays
-# Number) -- the axis label is a display/coordinate concern (TreeDim's
-# keep-as-provided rule gives scalar p a fixed coordinate, collection p an
-# axis). The per-slice leaf, however, must stay array-backed for the tree
-# machinery (_leafreduce's CartesianIndices, exercised by chained quantile
-# calls), so ONLY the value fed to quantile! is array-ified (scalar
-# untouched). One shared sort buffer.
+# Number) -- fed RAW to quantile!, which mirrors the same container back into
+# the leaf (decision xxmv6c option 2). The tree machinery (_leafreduce) handles
+# the resulting Tuple- and scalar-parent leaves directly, including when a
+# quantile leaf feeds a CHAINED quantile call. One shared sort buffer.
 function Statistics.quantile(X::TreeData, pdim::TreeDim; dims)
     p      = meta(pdim).values
-    levels = p isa Number ? p : collect(p)
     scratch = _eltype(X)[]
     mapslices(X; dims) do slice
         length(scratch) == length(slice) || resize!(scratch, length(slice))
         copyto!(scratch, slice)
-        TreeData(quantile!(scratch, levels), pdim)
+        TreeData(quantile!(scratch, p), pdim)
     end
 end
 
@@ -465,16 +480,17 @@ end
 # begin
 
 # ===================== PROBE: quantile(X, pdim::TreeDim) leaf shape mirrors pdim's values =====================
-# The unified quantile no longer special-cases scalar p (was two methods, one of
-# which unconditionally `collect`-ed p, always producing a collection leaf).
-# pdim's values are kept EXACTLY as given (Tuple stays Tuple, Vector stays Vector,
-# Number stays Number) for axis labelling; only the per-slice COMPUTED value is
-# array-backed when non-scalar, because the shared tree machinery (_leafreduce's
-# CartesianIndices, exercised when a quantile leaf feeds a CHAINED quantile call)
-# requires an array-backed leaf. Before this fix, a Tuple pdim produced a
-# Tuple-parent leaf and the chained case below threw:
+# The unified quantile no longer coerces p at all -- Base's quantile!(scratch, p)
+# preserves p's container as-is (scalar -> scalar leaf, Vector -> Vector leaf, Tuple ->
+# Tuple leaf), matching decision xxmv6c (option 2): a leaf's data mirrors p's container.
+# The tree machinery (_leafreduce) was extended to gather-reduce non-array-backed leaves
+# (Tuple- and scalar-parent) directly, via a path SHARED with TreeNamedTuple (both are
+# keyed, axis-bearing records) rather than array-ifying the leaf. Before this fix, a
+# Tuple pdim was `collect`-ed to force an array-backed leaf so chained quantile wouldn't
+# hit _leafreduce's CartesianIndices; now the Tuple leaf survives the chain unchanged:
 #   MethodError: no method matching CartesianIndices(::Tuple{Float64, Float64, Float64})
-# -- confirmed live before landing this probe.
+# -- confirmed live before landing this probe. A scalar-parent leaf hits the identical
+# CartesianIndices(::Number) MethodError when chained -- also fixed, also probed here.
 begin
     Xq = TreeData(reshape(1.0:12.0, 4, 3), :draw, :param)
 
@@ -485,16 +501,21 @@ begin
 
     vector_result = quantile(Xq, TreeDim(:pct, [0.25, 0.5, 0.75]); dims=:draw)
     vector_leaf = parent(vector_result)[1]
-    @assert parent(vector_leaf) isa AbstractVector "expected an array-backed leaf for a Vector p, got $(typeof(parent(vector_leaf)))"
+    @assert parent(vector_leaf) isa AbstractVector "expected a Vector leaf for a Vector p, got $(typeof(parent(vector_leaf)))"
     @assert _isaxis(dims(vector_leaf)[1])        # real axis
 
     tuple_result = quantile(Xq, TreeDim(:tup, (0.25, 0.5, 0.75)); dims=:draw)
     tuple_leaf = parent(tuple_result)[1]
     @assert meta(dims(tuple_leaf)[1]).values isa Tuple   # axis label: Tuple stays Tuple
-    @assert parent(tuple_leaf) isa AbstractVector "expected an array-backed leaf even for a Tuple p, got $(typeof(parent(tuple_leaf)))"
+    @assert parent(tuple_leaf) isa Tuple "expected a Tuple leaf for a Tuple p, got $(typeof(parent(tuple_leaf)))"
 
     chained = quantile(tuple_result, TreeDim(:tup2, (0.1, 0.9)); dims=:param)  # was: MethodError CartesianIndices(::Tuple)
-    println("PROBE quantile(pdim) leaf shape mirrors p: scalar -> scalar leaf, collection -> axis, Tuple pdim stays array-backed even when chained")
+    @assert parent(parent(chained)) isa Tuple "expected the chained result to stay a Tuple leaf, got $(typeof(parent(parent(chained))))"
+
+    chained_scalar = quantile(scalar_result, TreeDim(:median2, 0.5); dims=:param)  # was: MethodError CartesianIndices(::Number)
+    @assert parent(parent(chained_scalar)) isa Number "expected the chained scalar result to stay a scalar leaf"
+
+    println("PROBE quantile(pdim) leaf shape mirrors p: scalar -> scalar leaf, Vector -> Vector leaf, Tuple -> Tuple leaf -- all survive chaining")
 end
 # begin
 
