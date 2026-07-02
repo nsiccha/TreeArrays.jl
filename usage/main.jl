@@ -40,7 +40,7 @@ TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
 # convenience accessors (avoid spelling out `meta(...).field` everywhere)
-treedims(X::TreeData) = meta(X).dims             # the tree's (inner) axes
+dims(X::TreeData) = meta(X).dims                 # the tree's (inner) axes
 outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axis
 
 # leaf numeric eltype: recurse through NamedTuple / ragged nesting down to the backing array.
@@ -108,7 +108,7 @@ print_tree(io::IO, X::TreeData) = begin
 end
 print_dims(io::IO, X::TreeData) = begin
     print(io, "----------------\n")
-    for dim in treedims(X)
+    for dim in dims(X)
         print(io, dim, "\n")
     end
     haskey(meta(X), :outer_dim) && print(io, outerdim(X), "\n")
@@ -158,7 +158,7 @@ _aschild(v, inner) = TreeData(v, inner...)       # raw field -> wrap with the in
 # here -> the caller decides what that means (a true leaf -> sentinel/idempotent re-slice;
 # an intermediate node -> recurse deeper into each element).
 function _reduceouter(f, X, want)
-    alldims = treedims(X)
+    alldims = Main.dims(X)
     names   = map(name, alldims)
     n_ax    = ndims(parent(X))
     redaxes = Tuple(i for i in 1:n_ax if names[i] in want)
@@ -182,7 +182,7 @@ _leafreduce(f, sl::AbstractArray{<:TreeNamedTuple}) = begin
     proto = first(sl)
     ks = keys(parent(proto))
     fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl)), ks)
-    TreeData(NamedTuple{ks}(fields), (;dims = treedims(proto), outer_dim = outerdim(proto)))
+    TreeData(NamedTuple{ks}(fields), (;dims = Main.dims(proto), outer_dim = outerdim(proto)))
 end
 _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
     proto = first(sl)
@@ -195,7 +195,7 @@ function Base.mapslices(f, X::TreeArray; dims)
     want = _dimnames(dims)
     r = _reduceouter(f, X, want)
     isnothing(r) || return r
-    alldims = treedims(X)
+    alldims = Main.dims(X)
     any(nm -> nm in map(name, alldims), want) || return missing   # dim absent here -> sentinel
     TreeData(parent(X), (;dims = map(d -> name(d) in want ? sliced(d) : d, alldims)))
 end
@@ -203,14 +203,14 @@ end
 function Base.mapslices(f, X::TreeNamedTuple; dims)
     want = _dimnames(dims)
     rec  = outerdim(X)
-    inner  = Tuple(d for d in treedims(X) if _isaxis(d) && name(d) != name(rec))   # rec enumerates the fields, not an inner axis
-    ghosts = Tuple(d for d in treedims(X) if !_isaxis(d))
+    inner  = Tuple(d for d in Main.dims(X) if _isaxis(d) && name(d) != name(rec))   # rec enumerates the fields, not an inner axis
+    ghosts = Tuple(d for d in Main.dims(X) if !_isaxis(d))
     newfields = map(v -> mapslices(f, _aschild(v, inner); dims), parent(X))
     any(!ismissing, newfields) || return missing        # no child carried the dim -> sentinel
     sample = first(v for v in newfields if !ismissing(v))
-    have   = map(name, treedims(sample))
+    have   = map(name, Main.dims(sample))
     extra  = Tuple(g for g in ghosts if !(name(g) in have))
-    TreeData(newfields, (;dims = (treedims(sample)..., extra...), outer_dim = rec))
+    TreeData(newfields, (;dims = (Main.dims(sample)..., extra...), outer_dim = rec))
 end
 
 function Base.mapslices(f, X::TreeRaggedArray; dims)
