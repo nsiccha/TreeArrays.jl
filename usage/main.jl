@@ -191,7 +191,7 @@ _leafreduce(f, sl::AbstractArray{<:TreeNamedTuple}) = begin
 end
 _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
     proto = first(sl)
-    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), eachindex(parent(proto)))
+    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), CartesianIndices(parent(proto)))
     TreeData(vals, meta(proto))
 end
 _leafreduce(f, sl::AbstractArray) = f(sl)
@@ -434,6 +434,22 @@ begin
     end
     @assert threw "expected AssertionError: non-axis dim before a real array axis must fail loudly, not mis-map"
     println("PROBE _reduceouter positional-axis assertion fired for misordered dims")
+end
+
+# ===================== PROBE: _leafreduce preserves multidim leaf shape (1cn9zad) =====================
+# _leafreduce(f, sl::AbstractArray{<:TreeData}) built `vals` via
+# map(i -> ..., eachindex(parent(proto))) -- eachindex is linear, so a multidim leaf's
+# `vals` came back as a flat Vector while the reused `meta(proto)` still described the
+# original multidim shape (confirmed below before the fix: meta claimed (:time, :chan)
+# while parent(inner) was a flat length-6 Vector{Float64}). Fixed by iterating
+# CartesianIndices(parent(proto)) instead of eachindex, which preserves the leaf's shape.
+begin
+    leaves = [TreeData(randn(2, 3), :time, :chan) for _ in 1:5]
+    Xouter = TreeData(leaves, :subject)          # TreeRaggedArray: outer :subject axis
+    result = mapslices(mean, Xouter; dims=:subject)
+    inner  = parent(result)                      # the gathered per-leaf-cell TreeData
+    @assert size(parent(inner)) == (2, 3) "leaf shape flattened: got $(size(parent(inner)))"
+    println("PROBE _leafreduce preserves multidim leaf shape: ", size(parent(inner)))
 end
 # begin
 
