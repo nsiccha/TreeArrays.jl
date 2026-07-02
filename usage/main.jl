@@ -233,30 +233,23 @@ _assemble(outs, keptdims, trailing) = TreeData(outs, (;dims = (keptdims..., trai
 Statistics.mean(X::TreeData; dims=nothing) = isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims)
 Base.sum(X::TreeData; dims=nothing) = isnothing(dims) ? sum(parent(X)) : mapslices(sum, X; dims)
 
-# quantile delegates to mapslices; the output levels land on a *named, specifiable* axis
-# (`into=`) so population- and posterior-quantiles can coexist. One shared sort buffer.
-function Statistics.quantile(X::TreeData, p; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
-    levels   = collect(p)
-    leveldim = TreeDim(into, Tuple(levels))   # constant across slices -> build once
-    scratch  = _eltype(X)[]
+# quantile delegates to mapslices; pdim bundles the output axis name + values,
+# kept EXACTLY as given (Tuple stays Tuple, Vector stays Vector, Number stays
+# Number) -- the axis label is a display/coordinate concern (TreeDim's
+# keep-as-provided rule gives scalar p a fixed coordinate, collection p an
+# axis). The per-slice leaf, however, must stay array-backed for the tree
+# machinery (_leafreduce's CartesianIndices, exercised by chained quantile
+# calls), so ONLY the value fed to quantile! is array-ified (scalar
+# untouched). One shared sort buffer.
+function Statistics.quantile(X::TreeData, pdim::TreeDim; dims)
+    p      = meta(pdim).values
+    levels = p isa Number ? p : collect(p)
+    scratch = _eltype(X)[]
     mapslices(X; dims) do slice
         length(scratch) == length(slice) || resize!(scratch, length(slice))
         copyto!(scratch, slice)
-        TreeData(quantile!(scratch, levels), leveldim)
+        TreeData(quantile!(scratch, levels), pdim)
     end
-end
-
-# scalar p (e.g. quantile(X, 0.5; dims=:draw)) mirrors Base: each slice reduces to a
-# SCALAR (no new axis, same scalar-output path `mean` exercises through mapslices);
-# the requested level lands as a fixed-coordinate `into` dim (a scalar TreeDim value).
-function Statistics.quantile(X::TreeData, p::Number; dims, into = Symbol(only(_dimnames(dims)), :_quantile))
-    scratch = _eltype(X)[]
-    result = mapslices(X; dims) do slice
-        length(scratch) == length(slice) || resize!(scratch, length(slice))
-        copyto!(scratch, slice)
-        quantile!(scratch, p)
-    end
-    TreeData(result, TreeDim(into, p))
 end
 
 # ===================== dimension-aware kernels =====================
@@ -377,18 +370,18 @@ begin
         quantile(
             quantile(
                 compute_stats(dense_loc(input_draws, args...)),
-                population_quantiles; dims=:subject, into=:population
+                TreeDim(:population, population_quantiles); dims=:subject
             ),
-            posterior_quantiles; dims=:draw, into=:posterior
+            TreeDim(:posterior, posterior_quantiles); dims=:draw
         )
     end
 
     display(stats_percentiles)
 
-    # demo: scalar-p quantile mirrors Base — `into` becomes a fixed SCALAR
-    # coordinate (not a length-1 axis), and each slice holds one scalar value
-    # (not a length-1 vector).
-    median_draws = quantile(input_draws, 0.5; dims=:draw, into=:median)
+    # demo: scalar-p quantile mirrors Base — the pdim's fixed SCALAR value
+    # becomes a fixed coordinate (not a length-1 axis), and each slice holds
+    # one scalar value (not a length-1 vector).
+    median_draws = quantile(input_draws, TreeDim(:median, 0.5); dims=:draw)
     display(median_draws)
 end
 
@@ -468,6 +461,40 @@ begin
     Z = mapslices(mean, Y; dims=:draw)                       # was: errors calling outerdim(Y) inside mapslices (~line 205)
     println("PROBE outerdim(Y) = ", outerdim(Y))
     println("PROBE mapslices(mean, Y; dims=:draw) ran without error")
+end
+# begin
+
+# ===================== PROBE: quantile(X, pdim::TreeDim) leaf shape mirrors pdim's values =====================
+# The unified quantile no longer special-cases scalar p (was two methods, one of
+# which unconditionally `collect`-ed p, always producing a collection leaf).
+# pdim's values are kept EXACTLY as given (Tuple stays Tuple, Vector stays Vector,
+# Number stays Number) for axis labelling; only the per-slice COMPUTED value is
+# array-backed when non-scalar, because the shared tree machinery (_leafreduce's
+# CartesianIndices, exercised when a quantile leaf feeds a CHAINED quantile call)
+# requires an array-backed leaf. Before this fix, a Tuple pdim produced a
+# Tuple-parent leaf and the chained case below threw:
+#   MethodError: no method matching CartesianIndices(::Tuple{Float64, Float64, Float64})
+# -- confirmed live before landing this probe.
+begin
+    Xq = TreeData(reshape(1.0:12.0, 4, 3), :draw, :param)
+
+    scalar_result = quantile(Xq, TreeDim(:median, 0.5); dims=:draw)
+    scalar_leaf = parent(scalar_result)[1]
+    @assert parent(scalar_leaf) isa Number "expected a scalar leaf for scalar p, got $(typeof(parent(scalar_leaf)))"
+    @assert !_isaxis(dims(scalar_leaf)[1])       # fixed coordinate, not an axis
+
+    vector_result = quantile(Xq, TreeDim(:pct, [0.25, 0.5, 0.75]); dims=:draw)
+    vector_leaf = parent(vector_result)[1]
+    @assert parent(vector_leaf) isa AbstractVector "expected an array-backed leaf for a Vector p, got $(typeof(parent(vector_leaf)))"
+    @assert _isaxis(dims(vector_leaf)[1])        # real axis
+
+    tuple_result = quantile(Xq, TreeDim(:tup, (0.25, 0.5, 0.75)); dims=:draw)
+    tuple_leaf = parent(tuple_result)[1]
+    @assert meta(dims(tuple_leaf)[1]).values isa Tuple   # axis label: Tuple stays Tuple
+    @assert parent(tuple_leaf) isa AbstractVector "expected an array-backed leaf even for a Tuple p, got $(typeof(parent(tuple_leaf)))"
+
+    chained = quantile(tuple_result, TreeDim(:tup2, (0.1, 0.9)); dims=:param)  # was: MethodError CartesianIndices(::Tuple)
+    println("PROBE quantile(pdim) leaf shape mirrors p: scalar -> scalar leaf, collection -> axis, Tuple pdim stays array-backed even when chained")
 end
 # begin
 
