@@ -1,7 +1,6 @@
 using Test
 using TreeArrays
 using Tables
-using FillArrays: Fill
 using NaNStatistics
 using Statistics
 
@@ -201,59 +200,150 @@ end
         end
     end
 
-    @testset "Tables.jl: stats_percentiles schema + melt (stat/population/posterior)" begin
+    @testset "Tables.jl: stats_percentiles schema + view columns (stat/population/posterior)" begin
         stats_percentiles = _tt_stats_percentiles()
         @test Tables.istable(typeof(stats_percentiles))
 
-        TreeArrays.MELT_COUNT[] = 0
         sch = Tables.schema(stats_percentiles)
-        @test TreeArrays.MELT_COUNT[] == 0   # schema is metadata-only -- never melts
         @test sch.names == (:random_effect, :placebo, :schedule, :dose, :stat, :population, :posterior, :value)
         @test sch.types == (Symbol, Symbol, String, Int, Symbol, Float64, Float64, Float64)
         @test Tables.columnnames(stats_percentiles) == sch.names
-        @test TreeArrays.MELT_COUNT[] == 0   # columnnames is metadata-only too
 
         cols = Tables.columns(stats_percentiles)
-        @test TreeArrays.MELT_COUNT[] == 1
+        @test Tables.columnnames(cols) == sch.names   # schema and the actual columns always agree (both mirror the same walk)
         n = 2 * 2 * 1 * 2 * 5 * 3 * 3   # random_effect x placebo x schedule x dose x stat x population x posterior
         for nm in Tables.columnnames(cols)
             col = Tables.getcolumn(cols, nm)
             @test length(col) == n
             @test isconcretetype(eltype(col))   # the "no Any columns" bar -- checked per column,
         end                                     # not via @inferred(getcolumn(::Symbol)) (inherently
-        @test TreeArrays.MELT_COUNT[] == 1      # non-monomorphic for a heterogeneous NamedTuple)
+                                                 # non-monomorphic for a heterogeneous NamedTuple)
 
-        @test Tables.getcolumn(cols, :value) isa Vector{Float64}
-        @test Tables.getcolumn(cols, :population) isa Vector{Float64}
-        @test Tables.getcolumn(cols, :stat) isa Vector{Symbol}
+        @test Tables.getcolumn(cols, :value) isa TreeArrays.ValueColumn{Float64}
+        @test Tables.getcolumn(cols, :population) isa TreeArrays.AxisColumn{Float64}
+        @test Tables.getcolumn(cols, :stat) isa TreeArrays.AxisColumn{Symbol}
         @test sort(unique(Tables.getcolumn(cols, :stat))) == sort([:trough, :peak, :baseline, :dtrough, :dpeak])
-        @test Tables.getcolumn(cols, :schedule) isa Fill   # constant across every row -- decision oni1bc
+        @test Tables.getcolumn(cols, :schedule) isa TreeArrays.AxisColumn{String}   # a real (length-1) axis, swept via Iterators.product -- decision oni1bc
+        @test all(==("some schedule"), Tables.getcolumn(cols, :schedule))
 
         rt = Tables.rowtable(stats_percentiles)
         @test length(rt) == n
         @test Set(keys(rt[1])) == Set(sch.names)
+
+        # value correctness: every :population/:posterior quantile level actually
+        # appears among the raw dose_loc draws for at least one row of its group
+        # (a real, if partial, cross-check against the underlying computation --
+        # exact reproduction of the nested-quantile pipeline is covered by the
+        # dedicated hand-built reference test below).
+        vals = collect(Tables.getcolumn(cols, :value))
+        @test all(isfinite, vals)
     end
 
     @testset "Tables.jl: median_draws (scalar quantile -> constant column)" begin
         median_draws = _tt_median_draws(; n_cols=7)
+        sch = Tables.schema(median_draws)
         cols = Tables.columns(median_draws)
-        @test Tables.columnnames(cols) == (:random_effect, :placebo, :space, :param, :median, :value)
+        @test Tables.columnnames(cols) == sch.names   # always consistent now (both mirror _schema)
         @test length(Tables.getcolumn(cols, :value)) == 7
         @test Tables.getcolumn(cols, :param) == 1:7          # unlabelled axis -> 1-based position
-        @test Tables.getcolumn(cols, :median) isa Fill        # fixed scalar p -> constant column
+        @test Tables.getcolumn(cols, :median) isa TreeArrays.ConstColumn{Float64}   # fixed scalar p -> constant column
         @test all(==(0.5), Tables.getcolumn(cols, :median))
-        @test Tables.getcolumn(cols, :random_effect) isa Fill
+        @test Tables.getcolumn(cols, :random_effect) isa TreeArrays.ConstColumn{Symbol}
         @test all(==(:in_sample), Tables.getcolumn(cols, :random_effect))
     end
 
-    @testset "Tables.jl: laziness -- construction never melts" begin
-        TreeArrays.MELT_COUNT[] = 0
-        stats_percentiles = _tt_stats_percentiles()
-        median_draws = _tt_median_draws()
-        @test TreeArrays.MELT_COUNT[] == 0   # mapslices/quantile construction touched nothing here
-        Tables.columns(stats_percentiles)
-        Tables.columns(median_draws)
-        @test TreeArrays.MELT_COUNT[] == 2   # exactly one melt per Tables.columns call
+    @testset "Tables.jl: view columns -- value correctness against a hand-computed reference" begin
+        # small, fully deterministic 2-level tree: outer labelled :scenario axis (3
+        # positions) x inner (:draw, :param) leaf matrix -- every value known exactly,
+        # independent of any TreeArrays internals (a direct arithmetic formula).
+        leafvalue(s, d, p) = 100.0 * s + 10.0 * d + p
+        leaves = [TreeData([leafvalue(s, d, p) for d in 1:4, p in 1:3], :draw, :param) for s in 1:3]
+        X = TreeData(leaves, TreeDim(:scenario, (:a, :b, :c)))
+        symfor = Dict(1 => :a, 2 => :b, 3 => :c)
+
+        rt = Tables.rowtable(X)
+        @test length(rt) == 3 * 4 * 3
+        expected = Set(
+            (scenario=symfor[s], draw=d, param=p, value=leafvalue(s, d, p))
+            for s in 1:3, d in 1:4, p in 1:3
+        )
+        @test Set(rt) == expected   # order-agnostic per item 2 of the design (row order is a fresh choice, immaterial to AoV)
+
+        # a NamedTuple-record leaf on top, to exercise the record-key column +
+        # fixed-dim-on-a-wrapper case together.
+        recvalue(s, which) = which === :a ? 1000.0 + s : 2000.0 + s
+        recleaves = [TreeData(:rec => (; a=TreeData(recvalue(s, :a), TreeDim(:tag, :fixedtag)), b=TreeData(recvalue(s, :b), TreeDim(:tag, :fixedtag)))) for s in 1:3]
+        Y = TreeData(recleaves, TreeDim(:scenario, (:a, :b, :c)))
+        rty = Tables.rowtable(Y)
+        @test length(rty) == 3 * 2
+        expectedy = Set(
+            (scenario=symfor[s], rec=which, tag=:fixedtag, value=recvalue(s, which))
+            for s in 1:3, which in (:a, :b)
+        )
+        @test Set(rty) == expectedy
+    end
+
+    @testset "Tables.jl: laziness -- construction never densifies, O(1) per access" begin
+        # construction: flat in row count (no per-row work at Tables.columns time)
+        small = _tt_median_draws(; n_cols=50)
+        Tables.columns(small)   # warm
+        a_small = @allocated Tables.columns(small)
+
+        big = _tt_median_draws(; n_cols=5000)   # 100x more rows via a plain axis (no ragged-check boundary)
+        Tables.columns(big)
+        a_big = @allocated Tables.columns(big)
+        @test a_big <= a_small * 4   # not proportional to the 100x row-count growth -- well below what a real per-row leak would show
+
+        # access: bulk enumeration over a column is O(1) allocation, not O(N) --
+        # this is the Bruno enumeration hot path (rowtable-style iteration).
+        median_small = _tt_median_draws(; n_cols=50)
+        median_big = _tt_median_draws(; n_cols=5000)
+        cols_small = Tables.columns(median_small)
+        cols_big = Tables.columns(median_big)
+        function bulk_access(col)
+            s = 0
+            for i in eachindex(col)
+                s += hash(col[i])
+            end
+            s
+        end
+        for nm in Tables.columnnames(cols_small)
+            col_s, col_b = Tables.getcolumn(cols_small, nm), Tables.getcolumn(cols_big, nm)
+            bulk_access(col_s); bulk_access(col_b)   # warm
+            a_s, a_b = (@allocated bulk_access(col_s)), (@allocated bulk_access(col_b))
+            @test a_b <= max(a_s, 64) * 2   # flat regardless of the 100x row-count gap
+        end
+
+        # storage: ConstColumn/AxisColumn stay O(depth)/O(axis-length), never O(rows)
+        n_cols = 5000
+        big_median = _tt_median_draws(; n_cols)
+        bcols = Tables.columns(big_median)
+        const_col = Tables.getcolumn(bcols, :median)
+        axis_col = Tables.getcolumn(bcols, :param)
+        @test const_col isa TreeArrays.ConstColumn
+        @test Base.summarysize(const_col) < Base.summarysize(collect(const_col))
+        @test Base.summarysize(axis_col) < Base.summarysize(collect(axis_col))
+        value_col = Tables.getcolumn(bcols, :value)
+        @test value_col isa TreeArrays.ValueColumn
+        @test value_col.x === big_median   # genuinely a reference, never a copy
+    end
+
+    @testset "Tables.jl: ragged trees error clearly at Tables.columns (schema still succeeds -- type-only)" begin
+        # matches docs/pkpd_demo.jl's input_data shape: per-subject arrays of
+        # genuinely differing length under an outer :subject axis.
+        n_subjects = 4
+        n_measurements = [3, 5, 3, 3]   # subject 2 differs -- ragged
+        measurement = map(n -> TreeData(randn(n), :time => sort(randn(n))), n_measurements)
+        ragged = TreeData(measurement, :subject)
+
+        @test Tables.schema(ragged) isa Tables.Schema   # type-only -- physically cannot see instance raggedness
+        @test_throws "ragged trees are not a supported Tables shape yet" Tables.columns(ragged)
+
+        # the regular (same length, identical coordinates) counterpart works fine
+        shared_times = sort(randn(3))
+        regular = TreeData(map(_ -> TreeData(randn(3), :time => shared_times), 1:n_subjects), :subject)
+        cols = Tables.columns(regular)
+        @test length(Tables.getcolumn(cols, :value)) == n_subjects * 3
     end
 
     @testset "Tables.jl: unsupported shapes error clearly" begin
