@@ -1,0 +1,8 @@
+[deps]
+Chairmarks = "0ca39b1e-fe0b-4e98-acfc-b1656634c4de"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+FlexiChains = "4a37a8b9-6e57-4b92-8664-298d46e639f7"
+NaNStatistics = "b946abbf-3ea7-4610-9019-9858bfdeaf2d"
+Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+TreeArrays = "5daaa025-ac78-4e9a-8805-78946e672e43"
