@@ -168,4 +168,13 @@ end
 
 # wrap `outs` (the raw per-slice kernel outputs -- already TreeData/record/scalar pieces,
 # never stacked/pivoted) as one TreeData over the kept + reduced-as-ghost dims.
-_assemble(outs, keptdims, trailing) = TreeData(outs, (;dims = (keptdims..., trailing...)))
+# When ALL of a node's axes were reduced (`keepaxes` empty), `outs` is a SINGLE child TreeData,
+# not an array. Wrapping it in a fresh TreeData would build a `TreeData{<:TreeData}` node with no
+# use -- an artifact a chained reduction (reduce :subject THEN :draw) then chokes on (`_eltype`
+# and `mapslices` have no method for it; Bruno 2026-07-06). Instead MERGE the reduced-as-ghost
+# dims straight into the child via the appending constructor (`TreeData(::TreeData, dims...)`,
+# types.jl), so the ghosts trail the child's own axes and no wrapper level is created. `keptdims`
+# is empty in this branch by construction (a single child <=> `keepaxes` empty), so only
+# `trailing` carries dims to merge.
+_assemble(outs, keptdims, trailing)           = TreeData(outs, (;dims = (keptdims..., trailing...)))
+_assemble(outs::TreeData, keptdims, trailing) = TreeData(outs, keptdims..., trailing...)

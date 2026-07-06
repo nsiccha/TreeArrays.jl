@@ -122,11 +122,16 @@ end
         @test TreeArrays.meta(dims(tuple_leaf)[1]).values isa Tuple   # axis label: Tuple stays Tuple
         @test parent(tuple_leaf) isa Tuple
 
+        # Reducing the sole remaining axis (:param) used to WRAP the leaf in an extra
+        # TreeData{<:TreeData} level (a use-less artifact). `_assemble` now merges the reduced-as-
+        # ghost dims into the leaf instead, so the Tuple/scalar sits one level shallower --
+        # parent(chained), not parent(parent(·)). Nothing is lost: the ghosts still ride the leaf
+        # (dims == (:tup, :param, :draw)); it just isn't nested behind a wrapper anymore.
         chained = quantile(tuple_result, TreeDim(:tup2, (0.1, 0.9)); dims=:param)  # was: MethodError CartesianIndices(::Tuple)
-        @test parent(parent(chained)) isa Tuple
+        @test parent(chained) isa Tuple
 
         chained_scalar = quantile(scalar_result, TreeDim(:median2, 0.5); dims=:param)  # was: MethodError CartesianIndices(::Number)
-        @test parent(parent(chained_scalar)) isa Number
+        @test parent(chained_scalar) isa Number
     end
 
     # quantile(X, p::NamedTuple; dims) -- the Tables wide-emit's producer side
