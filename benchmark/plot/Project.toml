@@ -1,0 +1,11 @@
+[deps]
+AlgebraOfGraphics = "cbdf2221-f076-402e-a563-3d30da359d67"
+AlgebraOfVega = "a2420894-485a-4f42-a4fc-c4323ec6fb2b"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Chairmarks = "0ca39b1e-fe0b-4e98-acfc-b1656634c4de"
+DynamicObjects = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
+HTMX = "27f3e1ef-6ef8-44dc-9e9a-2fb23ed44e83"
+HTMXObjects = "b12ef442-5798-4353-80f3-9562b03a0cb6"
+Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+TreeArrays = "5daaa025-ac78-4e9a-8805-78946e672e43"
+Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
