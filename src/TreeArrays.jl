@@ -11,8 +11,10 @@ include("reducers.jl")
 include("kernel.jl")
 include("setdim.jl")
 include("tables.jl")
+include("treetable.jl")
 
 export TreeDim, TreeData, TreeArray, TreeNamedTuple, TreeRaggedArray, TreeTuple
+export TreeTable
 export dims, outerdim
 export mapslices, mean, sum, quantile, quantile!
 export @kernel
