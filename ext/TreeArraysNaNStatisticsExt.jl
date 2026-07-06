@@ -56,6 +56,28 @@ function _nanquantile(X::TreeData, p::NamedTuple, ::Type{T}; dims) where T
     end
 end
 
+# name<->prob spec `:band => (median=0.5, ...)` (mirrors Statistics.quantile's Pair method,
+# decision e18kfn/A'): NaN-compacted, emitted as a Symbol-labeled band AXIS (keys=names) computed
+# from the probs (values) -- the reduce-to-a-named-axis path for `TreeTable(wide=:band)`.
+function NaNStatistics.nanquantile(X::TreeData, (nm, spec)::Pair{Symbol, <:NamedTuple}; dims)
+    _nanquantile(X, nm, spec, promote_type(float(_eltype(X)), Float64); dims)
+end
+
+function _nanquantile(X::TreeData, nm::Symbol, spec::NamedTuple, ::Type{T}; dims) where T
+    pdim    = TreeDim(nm, keys(spec))
+    probs   = values(spec)
+    scratch = _eltype(X)[]
+    TreeArrays.mapslices(X; dims) do slice
+        length(scratch) == length(slice) || resize!(scratch, length(slice))
+        copyto!(scratch, slice)
+        n = _compactnan!(scratch)
+        resize!(scratch, n)
+        result = n == 0 ? _nanlike(probs, T) : quantile!(scratch, probs)
+        resize!(scratch, length(slice))
+        TreeData(result, pdim)
+    end
+end
+
 # in-place stable partition: move non-NaN values to the front of `v`, return
 # their count. `isnan` is generic on `Real` (always false for non-floats), so
 # this is a safe no-op walk for integer-eltype data.

@@ -171,6 +171,32 @@ end
         end
     end
 
+    # quantile(X, :band => spec; dims) -- decision e18kfn / option A': a name<->prob spec reduces
+    # to a band AXIS labeled by the NAMES (keys, Symbols) and computed from the PROBS (values).
+    # Distinct from the p::NamedTuple record above -- orientation stays a VIEW choice (long here;
+    # TreeTable(wide=:band) will pivot it), nothing baked wide at reduction time. No dim-model
+    # change: `meta.values` already carries the levels, so an ordinary Symbol-Tuple axis suffices.
+    @testset "quantile(X, :band => spec; dims) -> Symbol-labeled band axis (A')" begin
+        Xq = TreeData(reshape(1.0:12.0, 4, 3), :draw, :param)
+        spec = (median=0.5, q025=0.025, q975=0.975)
+
+        r = quantile(Xq, :band => spec; dims=:draw)
+        leaf = first(parent(r))
+        bandaxis = TreeArrays.dims(leaf)[1]
+        @test TreeArrays.name(bandaxis) === :band
+        @test TreeArrays.meta(bandaxis).values == keys(spec)              # axis labels = the NAMES
+        @test TreeArrays._isaxis(bandaxis)                               # an ordinary axis
+        @test parent(leaf) == Statistics.quantile(1.0:4.0, values(spec))  # computed from the PROBS
+        for j in 1:3
+            @test parent(parent(r)[j]) == Statistics.quantile(Float64.(4j-3:4j), values(spec))
+        end
+
+        # the existing LONG melt handles it for free: one :band column of the level names.
+        cols = Tables.columns(r)
+        @test Set(Tables.columnnames(cols)) == Set((:param, :band, :value))
+        @test Set(Tables.getcolumn(cols, :band)) == Set(keys(spec))
+    end
+
     # NaN-aware quantile lives in a package extension (todo b1am3w), not a
     # `skipnan` kwarg on Statistics.quantile (user override of 1qbk7u4) --
     # Statistics.quantile itself is untouched and keeps throwing on NaN.
@@ -266,6 +292,19 @@ end
                 @test all(isnan, values(leaf))
                 @test leaf isa NamedTuple{keys(p),NTuple{3,Float64}}
             end
+        end
+
+        @testset ":band => spec -> Symbol-labeled band axis (A'; mirrors quantile Pair method)" begin
+            spec = (median=0.5, q025=0.25, q975=0.75)
+            r = nanquantile(Xq, :band => spec; dims=:draw)
+            leaf = first(parent(r))
+            @test TreeArrays.meta(TreeArrays.dims(leaf)[1]).values == keys(spec)  # axis labels = NAMES
+            @test parent(leaf) == parent(first(parent(quantile(Xq, :band => spec; dims=:draw))))  # no-NaN match
+
+            P = Array(reshape(1.0:12.0, 4, 3)); P[:, 1] .= NaN
+            Xn2 = TreeData(P, :draw, :param)
+            leafn = first(parent(nanquantile(Xn2, :band => spec; dims=:draw)))
+            @test all(isnan, parent(leafn))   # all-NaN slice -> NaN at every level, never throws
         end
     end
 

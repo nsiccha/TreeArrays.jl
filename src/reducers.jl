@@ -32,3 +32,21 @@ function Statistics.quantile(X::TreeData, p::NamedTuple; dims)
         TreeData(:quantile => NamedTuple{keys(p)}(quantile!(scratch, values(p))))
     end
 end
+
+# A name<->prob spec `:band => (median=0.5, q025=0.025, ...)` reduces to a band AXIS labeled by the
+# NAMES (keys, as Symbols) and computed from the PROBS (values). The result is an ordinary
+# Symbol-Tuple axis leaf -- no dim-model change, `meta.values` already carries the levels -- so
+# `TreeTable(wide=:band)` spreads the levels into columns while `wide=()` keeps them as one long
+# `:band` column: orientation stays a VIEW choice (decision e18kfn / option A'), unlike the
+# `p::NamedTuple` record method above which bakes WIDE at reduction time. Same one-pass shared-
+# scratch quantile! as the TreeDim form; the probs are consumed here, not retained on the axis.
+function Statistics.quantile(X::TreeData, (nm, spec)::Pair{Symbol, <:NamedTuple}; dims)
+    pdim    = TreeDim(nm, keys(spec))
+    probs   = values(spec)
+    scratch = _eltype(X)[]
+    mapslices(X; dims) do slice
+        length(scratch) == length(slice) || resize!(scratch, length(slice))
+        copyto!(scratch, slice)
+        TreeData(quantile!(scratch, probs), pdim)
+    end
+end
