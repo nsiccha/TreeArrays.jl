@@ -148,12 +148,22 @@ end
             @test parent(leaf_j) == NamedTuple{keys(p)}(Statistics.quantile(Float64.(4j-3:4j), values(p)))
         end
 
-        # existing (long-mode, pre-Delta-A) Tables machinery still handles the shape:
-        # field-key axis column + shared :value column, unchanged.
+        # wide-emit Tables machinery (Delta A): the record fans out to one
+        # column per quantile level, name-prefixed by nothing (bare field
+        # name, since each is a terminal :value) -- no field-key column.
         cols = Tables.columns(r)
-        @test Tables.columnnames(cols) == (:param, :quantile, :value)
-        @test length(Tables.getcolumn(cols, :value)) == 3 * 3
-        @test Set(Tables.getcolumn(cols, :quantile)) == Set(keys(p))
+        @test Set(Tables.columnnames(cols)) == Set((:param, keys(p)...))
+        for k in keys(p)
+            @test length(Tables.getcolumn(cols, k)) == 3
+            @test isconcretetype(eltype(Tables.getcolumn(cols, k)))
+        end
+        rt = Tables.rowtable(r)
+        @test length(rt) == 3
+        for row in rt
+            j = row.param
+            expected = NamedTuple{keys(p)}(Statistics.quantile(Float64.(4j-3:4j), values(p)))
+            @test all(k -> row[k] == expected[k], keys(p))
+        end
     end
 
     # NaN-aware quantile lives in a package extension (todo b1am3w), not a
@@ -258,14 +268,19 @@ end
         stats_percentiles = _tt_stats_percentiles()
         @test Tables.istable(typeof(stats_percentiles))
 
+        # wide-emit (decision 1kpyu7n): the `:stat` record (trough/peak/
+        # baseline/dtrough/dpeak) fans out to one column per field -- no
+        # field-key column, no row-dim of its own. All 5 fields share the
+        # SAME population/posterior axes (validated by `_fieldsig`), so
+        # those are de-duplicated to ONE column pair, not 5.
+        stat_fields = (:trough, :peak, :baseline, :dtrough, :dpeak)
         sch = Tables.schema(stats_percentiles)
-        @test sch.names == (:random_effect, :placebo, :schedule, :dose, :stat, :population, :posterior, :value)
-        @test sch.types == (Symbol, Symbol, String, Int, Symbol, Float64, Float64, Float64)
+        @test Set(sch.names) == Set((:random_effect, :placebo, :schedule, :dose, :population, :posterior, stat_fields...))
         @test Tables.columnnames(stats_percentiles) == sch.names
 
         cols = Tables.columns(stats_percentiles)
         @test Tables.columnnames(cols) == sch.names   # schema and the actual columns always agree (both mirror the same walk)
-        n = 2 * 2 * 1 * 2 * 5 * 3 * 3   # random_effect x placebo x schedule x dose x stat x population x posterior
+        n = 2 * 2 * 1 * 2 * 3 * 3   # random_effect x placebo x schedule x dose x population x posterior (stat contributes no row-dim)
         for nm in Tables.columnnames(cols)
             col = Tables.getcolumn(cols, nm)
             @test length(col) == n
@@ -273,10 +288,10 @@ end
         end                                     # not via @inferred(getcolumn(::Symbol)) (inherently
                                                  # non-monomorphic for a heterogeneous NamedTuple)
 
-        @test Tables.getcolumn(cols, :value) isa TreeArrays.ValueColumn{Float64}
+        for f in stat_fields
+            @test Tables.getcolumn(cols, f) isa TreeArrays.ValueColumn{Float64}
+        end
         @test Tables.getcolumn(cols, :population) isa TreeArrays.AxisColumn{Float64}
-        @test Tables.getcolumn(cols, :stat) isa TreeArrays.AxisColumn{Symbol}
-        @test sort(unique(Tables.getcolumn(cols, :stat))) == sort([:trough, :peak, :baseline, :dtrough, :dpeak])
         @test Tables.getcolumn(cols, :schedule) isa TreeArrays.AxisColumn{String}   # a real (length-1) axis, swept via Iterators.product -- decision oni1bc
         @test all(==("some schedule"), Tables.getcolumn(cols, :schedule))
 
@@ -284,13 +299,13 @@ end
         @test length(rt) == n
         @test Set(keys(rt[1])) == Set(sch.names)
 
-        # value correctness: every :population/:posterior quantile level actually
-        # appears among the raw dose_loc draws for at least one row of its group
-        # (a real, if partial, cross-check against the underlying computation --
-        # exact reproduction of the nested-quantile pipeline is covered by the
+        # value correctness: every stat field's value is finite (a real, if
+        # partial, cross-check against the underlying computation -- exact
+        # reproduction of the nested-quantile pipeline is covered by the
         # dedicated hand-built reference test below).
-        vals = collect(Tables.getcolumn(cols, :value))
-        @test all(isfinite, vals)
+        for f in stat_fields
+            @test all(isfinite, collect(Tables.getcolumn(cols, f)))
+        end
     end
 
     @testset "Tables.jl: median_draws (scalar quantile -> constant column)" begin
@@ -323,16 +338,19 @@ end
         )
         @test Set(rt) == expected   # order-agnostic per item 2 of the design (row order is a fresh choice, immaterial to AoV)
 
-        # a NamedTuple-record leaf on top, to exercise the record-key column +
-        # fixed-dim-on-a-wrapper case together.
+        # a NamedTuple-record leaf on top (wide-emit -- decision 1kpyu7n): no
+        # record-key column, no row-dim of its own -- fields `a`/`b` fan out
+        # to their own terminal columns, but SHARE their common fixed :tag
+        # dim as ONE column (both fields agree on it, validated by
+        # `_fieldsig` -- scope-fork 2), not a duplicated a_tag/b_tag pair.
         recvalue(s, which) = which === :a ? 1000.0 + s : 2000.0 + s
         recleaves = [TreeData(:rec => (; a=TreeData(recvalue(s, :a), TreeDim(:tag, :fixedtag)), b=TreeData(recvalue(s, :b), TreeDim(:tag, :fixedtag)))) for s in 1:3]
         Y = TreeData(recleaves, TreeDim(:scenario, (:a, :b, :c)))
         rty = Tables.rowtable(Y)
-        @test length(rty) == 3 * 2
+        @test length(rty) == 3
         expectedy = Set(
-            (scenario=symfor[s], rec=which, tag=:fixedtag, value=recvalue(s, which))
-            for s in 1:3, which in (:a, :b)
+            (scenario=symfor[s], tag=:fixedtag, a=recvalue(s, :a), b=recvalue(s, :b))
+            for s in 1:3
         )
         @test Set(rty) == expectedy
     end
@@ -380,6 +398,38 @@ end
         value_col = Tables.getcolumn(bcols, :value)
         @test value_col isa TreeArrays.ValueColumn
         @test value_col.x === big_median   # genuinely a reference, never a copy
+    end
+
+    @testset "Tables.jl: acceptance gate -- @allocated flat, homogeneous AND heterogeneous records" begin
+        # the hard acceptance gate (decision 1vbt15w / user: "I just hope
+        # there's no actually allocated vector anywhere"): Tables.columns
+        # assembles lazy view columns only, for BOTH a homogeneous-type
+        # record and a heterogeneous-type one (different fields, different
+        # concrete eltypes, sharing a fixed dim) -- allocation must stay
+        # flat as the outer row-count scales, not grow proportionally.
+        _tt_hetero_record(; n_cols) =
+            TreeData([TreeData(:rec => (; a=TreeData(1.0 * j, TreeDim(:tag, :x)), b=TreeData(j, TreeDim(:tag, :x)))) for j in 1:n_cols], :param)
+
+        homog_small = _tt_median_draws(; n_cols=50)
+        homog_big = _tt_median_draws(; n_cols=5000)
+        Tables.columns(homog_small); Tables.columns(homog_big)   # warm
+        a_homog_small = @allocated Tables.columns(homog_small)
+        a_homog_big = @allocated Tables.columns(homog_big)
+        @test a_homog_big <= a_homog_small * 4
+
+        hetero_small = _tt_hetero_record(; n_cols=50)
+        hetero_big = _tt_hetero_record(; n_cols=5000)
+        Tables.columns(hetero_small); Tables.columns(hetero_big)   # warm
+        a_hetero_small = @allocated Tables.columns(hetero_small)
+        a_hetero_big = @allocated Tables.columns(hetero_big)
+        @test a_hetero_big <= a_hetero_small * 4
+
+        hcols = Tables.columns(hetero_big)
+        @test Tables.getcolumn(hcols, :a) isa TreeArrays.ValueColumn{Float64}   # each heterogeneous field: its own
+        @test Tables.getcolumn(hcols, :b) isa TreeArrays.ValueColumn{Int}       # concretely-typed view, no Union/box
+        @test Tables.getcolumn(hcols, :tag) isa TreeArrays.ConstColumn{Symbol}  # shared fixed dim, de-duplicated
+
+        @info "Delta A acceptance gate: Tables.columns(X) @allocated (50 vs 5000 cols)" a_homog_small a_homog_big a_hetero_small a_hetero_big
     end
 
     @testset "Tables.jl: ragged trees error clearly at Tables.columns (schema still succeeds -- type-only)" begin
@@ -443,8 +493,25 @@ end
     end
 
     @testset "Tables.jl: unsupported shapes error clearly" begin
-        heterogeneous = TreeData(:rec => (;a=TreeData(randn(3), :t), b=5.0))
-        @test_throws "heterogeneous records" Tables.schema(heterogeneous)
+        # differing ROWDIMS across fields (here: `a` carries a real :t axis,
+        # `b` is a bare scalar) is scope-fork-3 -- a confirmed non-goal, same
+        # footing as any other ragged shape. `Tables.schema` is type-only and
+        # can't see rowdims (an instance-only fact), so it still succeeds;
+        # `Tables.columns` is where this is actually caught.
+        rowdims_mismatch = TreeData(:rec => (;a=TreeData(randn(3), :t), b=5.0))
+        @test Tables.schema(rowdims_mismatch) isa Tables.Schema
+        @test_throws "inconsistent shape" Tables.columns(rowdims_mismatch)
+
+        # genuine field-TYPE heterogeneity (decision 1vbt15w, relax) -- SAME
+        # rowdims (both fields are scalar, fixed-dim-only leaves), different
+        # VALUE types (Float64 vs Int) -- fully supported: schema and
+        # columns agree, each field gets its own concretely-typed column.
+        type_hetero = TreeData(:rec => (;a=TreeData(1.0, TreeDim(:tag, :x)), b=TreeData(2, TreeDim(:tag, :x))))
+        sch = Tables.schema(type_hetero)
+        cols = Tables.columns(type_hetero)
+        @test Tables.columnnames(cols) == sch.names
+        @test Tables.getcolumn(cols, :a) isa TreeArrays.ValueColumn{Float64}
+        @test Tables.getcolumn(cols, :b) isa TreeArrays.ValueColumn{Int}
 
         rawarray = TreeData(:rec => (;a=TreeData(randn(3), :t), b=[1, 2, 3]))
         @test_throws "carries no dim labels" Tables.schema(rawarray)
