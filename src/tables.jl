@@ -116,7 +116,7 @@ _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:AbstractArray} = ((:val
 # quantile whose levels container was a Tuple, not a Vector -- decision
 # xxmv6c) is the Tuple-backed analogue of TreeRaggedArray: recurse per
 # position, same as the array-of-TreeData case above.
-_childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:Tuple{Vararg{<:TreeData}}} = _schema(eltype(P))
+_childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:Tuple{Vararg{TreeData}}} = _schema(eltype(P))
 _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:Tuple} = ((:value,), (eltype(P),))
 _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:NamedTuple} = _wideschema(P)
 _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:TreeData} = _schema(P)   # bookkeeping wrapper -> recurse straight through
@@ -198,7 +198,7 @@ end
 
 _wideschemachild(::Type{Prep}, ftypes) where Prep<:AbstractArray{<:TreeData} =
     _wideschema_dispatch(eltype(Prep), NamedTuple{keys(ftypes)}(map(FT -> eltype(_parentof(FT)), values(ftypes))))
-_wideschemachild(::Type{Prep}, ftypes) where Prep<:Tuple{Vararg{<:TreeData}} =
+_wideschemachild(::Type{Prep}, ftypes) where Prep<:Tuple{Vararg{TreeData}} =
     _wideschema_dispatch(eltype(Prep), NamedTuple{keys(ftypes)}(map(FT -> eltype(_parentof(FT)), values(ftypes))))
 _wideschemachild(::Type{Prep}, ftypes) where Prep<:AbstractArray =
     _schematerminalfanout(ftypes, FT -> eltype(_parentof(FT)))
@@ -330,7 +330,7 @@ function _valueat_node(p::AbstractArray{<:TreeData}, idx::Tuple, fieldpath::Tupl
     v = _naxval(typeof(p))
     _valueat(p[CartesianIndex(_taken(idx, v))], _dropn(idx, v), fieldpath)
 end
-function _valueat_node(p::Tuple{Vararg{<:TreeData}}, idx::Tuple, fieldpath::Tuple)
+function _valueat_node(p::Tuple{Vararg{TreeData}}, idx::Tuple, fieldpath::Tuple)
     _valueat(p[idx[1]], _dropn(idx, Val(1)), fieldpath)
 end
 _valueat_node(p::AbstractArray, idx::Tuple, fieldpath::Tuple) = p[CartesianIndex(_taken(idx, _naxval(typeof(p))))]
@@ -414,7 +414,7 @@ function _rowdims_node(p::AbstractArray{<:TreeData})
     _checksiblingcoords(p, _coordsig)
     (size(p)..., first(reps)...)
 end
-function _rowdims_node(p::Tuple{Vararg{<:TreeData}})
+function _rowdims_node(p::Tuple{Vararg{TreeData}})
     reps = map(_rowdims, p)
     _allequal(reps) ||
         error("TreeArrays Tables adapter: sibling TreeData elements (among $(length(p))) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
@@ -449,6 +449,23 @@ _fielddims(v) = ()
 #      instead of flat (violates the "no allocated vector anywhere" gate).
 #      Splicing (`...`) flattens every level into ONE flat tuple of pairs,
 #      so two siblings' signatures compare elementwise regardless of depth.
+#
+#      Boundary contract (decision 4b3vcd): array/tuple TreeData SIBLINGS are
+#      only checked on their AXIS coordinates here -- they are ASSUMED to
+#      agree on FIXED-dim values too (a `ConstColumn` is built once, from the
+#      representative sibling's value, and never cross-checked against the
+#      others). A sibling that genuinely diverges on a fixed value is not
+#      detected and silently reports the representative's value for every
+#      row. This is a deliberate, permanent boundary, not a gap pending an
+#      extension: the natural way to express a value that legitimately
+#      varies per sibling is an AXIS coordinate, not a per-element fixed
+#      dim: extending this check to fixed dims would need a per-element (not
+#      per-structure) walk, reintroducing the O(rows) allocation documented
+#      above. Contrast with record FIELDS (`_fieldsig` below), where the
+#      element count is field-count-bounded (small, fixed) rather than
+#      row-count-bounded, so the fuller name+kind+value check is affordable
+#      there and fully closes the analogous gap for record fields (4b3vcd's
+#      alpha case; this comment documents its beta case, left open).
 _coordsig(X::TreeData) = _coordsig_node(X, parent(X))
 _coordsig(x) = ()   # a non-TreeData record-field value (plain scalar) -- no coords to collect
 
@@ -460,7 +477,7 @@ _coordsig_node(X::TreeData, p::TreeData) = _coordsig(p)   # bookkeeping wrapper 
 _coordsig_node(X::TreeData, p) = ()                        # scalar leaf terminal (incl. NamedTuple -- not reachable here, only `_fieldsig` walks records)
 
 _coordsig_child(p::AbstractArray{<:TreeData}) = _coordsig(first(p))   # ONE representative path down
-_coordsig_child(p::Tuple{Vararg{<:TreeData}}) = _coordsig(first(p))
+_coordsig_child(p::Tuple{Vararg{TreeData}}) = _coordsig(first(p))
 _coordsig_child(p::AbstractArray) = ()   # plain array leaf -- no deeper TreeData child
 _coordsig_child(p::Tuple) = ()
 
@@ -482,7 +499,7 @@ _fieldsig(x) = ()   # a non-TreeData record-field value (plain scalar) -- no coo
 _fieldsig_own(X::TreeData) = map(d -> name(d) => (_dimkind(d), meta(d).values), TreeArrays.dims(X))
 
 _fieldsig_child(p::AbstractArray{<:TreeData}) = _fieldsig(first(p))   # ONE representative path down
-_fieldsig_child(p::Tuple{Vararg{<:TreeData}}) = _fieldsig(first(p))
+_fieldsig_child(p::Tuple{Vararg{TreeData}}) = _fieldsig(first(p))
 _fieldsig_child(p::AbstractArray) = ()   # plain array leaf -- no deeper TreeData child
 _fieldsig_child(p::Tuple) = ()
 _fieldsig_child(p::NamedTuple) = _fieldsig(first(values(p)))
@@ -600,7 +617,7 @@ end
 
 _buildwidechild(root::TreeData, fields::NamedTuple, p::AbstractArray{<:TreeData}, rowdims, offset, n, fieldpath) =
     _buildwide(root, map(v -> first(parent(v)), fields), rowdims, offset, n, fieldpath)
-_buildwidechild(root::TreeData, fields::NamedTuple, p::Tuple{Vararg{<:TreeData}}, rowdims, offset, n, fieldpath) =
+_buildwidechild(root::TreeData, fields::NamedTuple, p::Tuple{Vararg{TreeData}}, rowdims, offset, n, fieldpath) =
     _buildwide(root, map(v -> first(parent(v)), fields), rowdims, offset, n, fieldpath)
 _buildwidechild(root::TreeData, fields::NamedTuple, p::AbstractArray, rowdims, offset, n, fieldpath) =
     _buildterminalfanout(root, fields, v -> eltype(parent(v)), rowdims, offset, n, fieldpath)
@@ -642,7 +659,7 @@ function _buildchild(root::TreeData, p::AbstractArray{<:TreeData}, rowdims, offs
     c = first(p)
     _buildnode(root, c, parent(c), rowdims, offset, n, fieldpath)
 end
-function _buildchild(root::TreeData, p::Tuple{Vararg{<:TreeData}}, rowdims, offset, n, fieldpath)
+function _buildchild(root::TreeData, p::Tuple{Vararg{TreeData}}, rowdims, offset, n, fieldpath)
     c = first(p)
     _buildnode(root, c, parent(c), rowdims, offset, n, fieldpath)
 end
