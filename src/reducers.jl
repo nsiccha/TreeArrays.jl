@@ -17,3 +17,18 @@ function Statistics.quantile(X::TreeData, pdim::TreeDim; dims)
         TreeData(quantile!(scratch, p), pdim)
     end
 end
+
+# a NamedTuple `p` packs the SAME one-pass quantile! computation into a WIDE
+# record leaf (fields named by `keys(p)`, one value per `values(p)` level)
+# instead of a band-axis leaf -- the producer side for the Tables bridge's
+# wide-emit. `:quantile` is the record axis's own name -- cosmetic/`show`-only
+# post-wide-emit (the field-key column it would have produced in long mode is
+# exactly what the wide Tables melt drops).
+function Statistics.quantile(X::TreeData, p::NamedTuple; dims)
+    scratch = _eltype(X)[]
+    mapslices(X; dims) do slice
+        length(scratch) == length(slice) || resize!(scratch, length(slice))
+        copyto!(scratch, slice)
+        TreeData(:quantile => NamedTuple{keys(p)}(quantile!(scratch, values(p))))
+    end
+end

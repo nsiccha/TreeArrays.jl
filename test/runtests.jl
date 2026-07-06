@@ -129,6 +129,33 @@ end
         @test parent(parent(chained_scalar)) isa Number
     end
 
+    # quantile(X, p::NamedTuple; dims) -- the Tables wide-emit's producer side
+    # (Delta B): same one-pass quantile! as the TreeDim form, packed into a
+    # TreeNamedTuple record leaf (fields named by keys(p)) instead of a band axis.
+    @testset "quantile(X, p::NamedTuple; dims) -> TreeNamedTuple record leaf" begin
+        Xq = TreeData(reshape(1.0:12.0, 4, 3), :draw, :param)
+        p = (q025=0.25, median=0.5, q975=0.75)
+
+        r = quantile(Xq, p; dims=:draw)
+        leaf = first(parent(r))
+        @test leaf isa TreeArrays.TreeNamedTuple
+        @test TreeArrays.name(TreeArrays.outerdim(leaf)) === :quantile   # cosmetic/show-only default
+        @test parent(leaf) == NamedTuple{keys(p)}(Statistics.quantile(1.0:4.0, values(p)))
+
+        # every column position matches direct Statistics.quantile on the raw slice
+        for j in 1:3
+            leaf_j = parent(r)[j]
+            @test parent(leaf_j) == NamedTuple{keys(p)}(Statistics.quantile(Float64.(4j-3:4j), values(p)))
+        end
+
+        # existing (long-mode, pre-Delta-A) Tables machinery still handles the shape:
+        # field-key axis column + shared :value column, unchanged.
+        cols = Tables.columns(r)
+        @test Tables.columnnames(cols) == (:param, :quantile, :value)
+        @test length(Tables.getcolumn(cols, :value)) == 3 * 3
+        @test Set(Tables.getcolumn(cols, :quantile)) == Set(keys(p))
+    end
+
     # NaN-aware quantile lives in a package extension (todo b1am3w), not a
     # `skipnan` kwarg on Statistics.quantile (user override of 1qbk7u4) --
     # Statistics.quantile itself is untouched and keeps throwing on NaN.
@@ -197,6 +224,33 @@ end
             # fixed mid-implementation) roughly TRIPLED the per-slice allocation at
             # this scale gap -- isapprox (not exact ==) absorbs fixed per-call noise.
             @test isapprox(a_big / (100 * n_cols), a_nan / n_cols; rtol=0.3)
+        end
+
+        @testset "NamedTuple p -> TreeNamedTuple record leaf (mirrors quantile(X, p::NamedTuple; dims))" begin
+            p = (q025=0.25, median=0.5, q975=0.75)
+
+            @testset "no-NaN data matches quantile(X, p::NamedTuple; dims) exactly" begin
+                @test parent(first(parent(nanquantile(Xq, p; dims=:draw)))) ==
+                      parent(first(parent(quantile(Xq, p; dims=:draw))))
+            end
+
+            @testset "some-NaN slice: quantiles over the survivors" begin
+                P = Array(reshape(1.0:12.0, 4, 3))
+                P[1, 1] = NaN
+                Xn = TreeData(P, :draw, :param)
+                r = nanquantile(Xn, p; dims=:draw)
+                @test parent(first(parent(r))) == NamedTuple{keys(p)}(Statistics.quantile(filter(!isnan, P[:, 1]), values(p)))
+            end
+
+            @testset "all-NaN slice: NaN at every field, never throws" begin
+                P = Array(reshape(1.0:12.0, 4, 3))
+                P[:, 1] .= NaN
+                Xn = TreeData(P, :draw, :param)
+                r = nanquantile(Xn, p; dims=:draw)
+                leaf = parent(first(parent(r)))
+                @test all(isnan, values(leaf))
+                @test leaf isa NamedTuple{keys(p),NTuple{3,Float64}}
+            end
         end
     end
 

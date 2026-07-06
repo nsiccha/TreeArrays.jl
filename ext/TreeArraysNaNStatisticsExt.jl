@@ -37,6 +37,25 @@ function _nanquantile(X::TreeData, pdim::TreeDim, ::Type{T}; dims) where T
     end
 end
 
+# NamedTuple `p` -- same NaN-compaction, packed into a WIDE record leaf
+# (mirrors TreeArrays' own `Statistics.quantile(X, p::NamedTuple; dims)`).
+function NaNStatistics.nanquantile(X::TreeData, p::NamedTuple; dims)
+    _nanquantile(X, p, promote_type(float(_eltype(X)), Float64); dims)
+end
+
+function _nanquantile(X::TreeData, p::NamedTuple, ::Type{T}; dims) where T
+    scratch = _eltype(X)[]
+    TreeArrays.mapslices(X; dims) do slice
+        length(scratch) == length(slice) || resize!(scratch, length(slice))
+        copyto!(scratch, slice)
+        n = _compactnan!(scratch)
+        resize!(scratch, n)
+        result = n == 0 ? _nanlike(values(p), T) : quantile!(scratch, values(p))
+        resize!(scratch, length(slice))
+        TreeData(:quantile => NamedTuple{keys(p)}(result))
+    end
+end
+
 # in-place stable partition: move non-NaN values to the front of `v`, return
 # their count. `isnan` is generic on `Real` (always false for non-floats), so
 # this is a safe no-op walk for integer-eltype data.
