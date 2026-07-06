@@ -47,17 +47,19 @@ gen_draws() = randn(N_DRAW, N_SUBJ, N_TIME)   # [draw x subject x time]
 # ---------------------------------------------------------------------------
 function pipeline_array(x)
     nd, ns, nt = size(x)
-    m = Matrix{Float64}(undef, nd, nt)                     # population mean per (draw,time)
-    @inbounds for t in 1:nt, d in 1:nd
-        acc = 0.0
-        for j in 1:ns
-            acc += x[d, j, t]
-        end
-        m[d, t] = acc / ns
-    end
+    # m = Matrix{Float64}(undef, nd, nt)                     # population mean per (draw,time)
+    # @inbounds for t in 1:nt, d in 1:nd
+    #     acc = 0.0
+    #     for j in 1:ns
+    #         acc += x[d, j, t]
+    #     end
+    #     m[d, t] = acc / ns
+    # end
+    m = mean(x; dims=2)
     out = Matrix{Float64}(undef, nt, length(BANDS))        # ribbon per time
     @inbounds for t in 1:nt
-        out[t, :] .= Statistics.quantile(@view(m[:, t]), BANDSV)
+        Statistics.quantile!(@view(out[t, :]), @view(m[:, 1, t]), BANDSV)
+        # out[t, :] .= Statistics.quantile(@view(m[:, t]), BANDSV)
     end
     out
 end
@@ -92,7 +94,8 @@ function pipeline_dd(x)
     mm = parent(m)
     out = Matrix{Float64}(undef, nt, length(BANDS))
     @inbounds for t in 1:nt
-        out[t, :] .= Statistics.quantile(@view(mm[:, t]), BANDSV)
+        # out[t, :] .= Statistics.quantile(@view(mm[:, t]), BANDSV)
+        Statistics.quantile!(@view(out[t, :]), @view(mm[:, t]), BANDSV)
     end
     out
 end
