@@ -18,11 +18,22 @@
 # recurses over the SAME structural cases `_schema` already dispatches on:
 # TreeRaggedArray (outer array of TreeData -- recurse per representative
 # element, once sibling-uniformity is verified), TreeArray / TreeTuple
-# (array/tuple-backed leaf -- one row per position, `:value` column),
-# TreeNamedTuple (record -- outer_dim's name becomes a column holding the
-# field key; every field must melt to an IDENTICAL child schema), and a
+# (array/tuple-backed leaf -- one row per position, `:value` column), and a
 # generic `TreeData` fallback (a bookkeeping wrapper around another
 # TreeData, or a bare scalar leaf).
+#
+# TreeNamedTuple (record) is WIDE, not long (decision 1kpyu7n, user-directed
+# 2026-07-06 -- "why pivot to long at all?" for an inherently wide-sliceable
+# rectangular reduction): each field becomes its OWN column-group,
+# name-prefixed (nesting composes: `outer_inner_...`), sharing the SAME row
+# index as its siblings -- the record itself contributes NO row-dim (no
+# field-key column, unlike the earlier long-mode design this replaces).
+# Fields may have heterogeneous TYPES (decision 1vbt15w) -- each gets its
+# own concretely-typed `ValueColumn`, never a shared/boxed one -- but MUST
+# share identical deeper row-shape (sizes, coordinate values, AND dim
+# name/kind -- `_checksiblingcoords`) since they lay out side by side over
+# one shared row space; a scalar field beside an axis-bearing field
+# (differing row-shape entirely) is an explicit non-goal, not attempted.
 #
 # Ghost/missing/fixed dim -> column mapping (decision oni1bc):
 #   `sliced` ghost (values === nothing)   -> dropped, no coordinate to record
@@ -107,13 +118,7 @@ _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:AbstractArray} = ((:val
 # position, same as the array-of-TreeData case above.
 _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:Tuple{Vararg{<:TreeData}}} = _schema(eltype(P))
 _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:Tuple} = ((:value,), (eltype(P),))
-function _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:NamedTuple}
-    recname = name(fieldtype(fieldtype(T, :meta), :outer_dim))
-    schemas = map(_fieldschema, fieldtypes(P))
-    _allequal(schemas) || error("TreeArrays Tables adapter: record fields have mismatched schemas ($(fieldnames(P)) -> $(schemas)) -- heterogeneous records are not a supported Tables shape")
-    fnames, ftypes = first(schemas)
-    (Tuple(vcat([recname], collect(fnames))), Tuple(vcat([Symbol], collect(ftypes))))
-end
+_childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:NamedTuple} = _wideschema(P)
 _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P<:TreeData} = _schema(P)   # bookkeeping wrapper -> recurse straight through
 function _childschema(::Type{T}, ::Type{P}) where {T<:TreeData,P}   # scalar leaf
     P === Missing && error("TreeArrays Tables adapter: an absent-dim `missing` sentinel is not representable as a table row -- unsupported shape")
@@ -126,6 +131,105 @@ function _fieldschema(::Type{F}) where F
     F <: AbstractArray && error("TreeArrays Tables adapter: a raw (non-TreeData) array-valued record field carries no dim labels -- unsupported shape")
     ((:value,), (F,))
 end
+
+# wide-emit column naming (decision 1kpyu7n): a field's terminal `:value`
+# becomes just the field's own name; a field that itself melts to MULTIPLE
+# sub-columns (a nested record, or a multi-valued leaf) prefixes each with
+# the field name -- so nesting composes into `outer_inner` naturally, with
+# no bound on depth. No uniformity requirement across fields anymore
+# (dropped, along with it, the old "heterogeneous records unsupported"
+# restriction -- that existed only because LONG mode funneled every field
+# into ONE shared `:value` column, which needed one shared type; wide mode
+# gives every field its own column, so nothing requires it -- user decision
+# 1vbt15w, relax).
+_prefixname(fname::Symbol, sub::Symbol) = sub === :value ? fname : Symbol(fname, :_, sub)
+
+_alldimsof(::Type{T}) where T<:TreeData = Tuple(fieldtype(fieldtype(T, :meta), :dims).parameters)
+_parentof(::Type{T}) where T<:TreeData = fieldtype(T, :parent)
+
+# ---- TYPE-level mirror of `_buildwide` (see its comment for the full
+#      rationale) -- same de-duplication (shared axis/fixed columns from a
+#      representative field's TYPE; fan out only at a terminal value or a
+#      nested record), so `Tables.schema` (type-only) and `Tables.columns`
+#      (instance-based) always report the IDENTICAL column set. `ftypes` is
+#      a NamedTuple whose VALUES are field TYPES (`Type` objects, not
+#      instances) -- the type-level analogue of `_buildwide`'s runtime
+#      `fields::NamedTuple` of current-node values.
+#      Assumes, as `_buildwide` does (backed by `_rowdims`/`_fieldsig`'s
+#      RUNTIME checks), that fields share the same STRUCTURAL kind at each
+#      shared level -- a same-size-but-different-container-kind mismatch
+#      (e.g. one field Tuple-backed, another Array-backed, coincidentally
+#      both length 3) isn't distinguishable from TYPES alone; this is an
+#      accepted non-goal, the same footing as the existing
+#      regular/rectangular-only ragged scope.
+function _wideschema(::Type{P}) where P<:NamedTuple
+    ftypes = NamedTuple{fieldnames(P)}(fieldtypes(P))
+    _wideschema_dispatch(first(values(ftypes)), ftypes)
+end
+
+function _wideschema_dispatch(::Type{F}, ftypes) where F<:TreeData
+    # a field NOT even TreeData-wrapped here (a raw array, `missing`, or any
+    # other divergent shape) can't safely share the representative's axis
+    # walk -- bypass sharing for the WHOLE record and let `_schemafanout`
+    # process every field independently via `_fieldschema`, which raises
+    # the correct explicit errors (raw array / absent-dim `missing`) instead
+    # of a confusing internal MethodError from blindly unwrapping a
+    # non-TreeData type.
+    all(FT -> FT <: TreeData, values(ftypes)) || return _schemafanout(ftypes)
+    _wideschema_parent(_parentof(F), F, ftypes)
+end
+_wideschema_dispatch(::Type{F}, ftypes) where F = _schemafanout(ftypes)   # rep is a plain (non-TreeData) field type -- every field independently a terminal NOW
+
+function _wideschema_parent(::Type{Prep}, ::Type{F}, ftypes) where {Prep<:Union{AbstractArray,Tuple},F<:TreeData}
+    axdims, fixed = _splitmelt(_alldimsof(F), _nax(Prep))
+    cnames, ctypes = _wideschemachild(Prep, ftypes)
+    (Tuple(vcat(collect(map(name, axdims)), collect(map(name, fixed)), collect(cnames))),
+     Tuple(vcat(collect(map(_axistype, axdims)), collect(map(_fixedtype, fixed)), collect(ctypes))))
+end
+_wideschema_parent(::Type{Prep}, ::Type{F}, ftypes) where {Prep<:TreeData,F<:TreeData} =   # bookkeeping wrapper -- peel through per field, keep sharing
+    _wideschema_dispatch(Prep, NamedTuple{keys(ftypes)}(map(_parentof, values(ftypes))))
+_wideschema_parent(::Type{Prep}, ::Type{F}, ftypes) where {Prep<:NamedTuple,F<:TreeData} =   # nested record -- fields may diverge in TYPE here (heterogeneity allowed), fan out fully
+    _schemafanout(ftypes)
+function _wideschema_parent(::Type{Prep}, ::Type{F}, ftypes) where {Prep,F<:TreeData}   # a scalar terminal held by a (possibly fixed-dim-bearing) TreeData
+    fixed = _flatfixed(_alldimsof(F))
+    vnames, vtypes = _schematerminalfanout(ftypes, FT -> _parentof(FT))
+    (Tuple(vcat(collect(map(name, fixed)), collect(vnames))), Tuple(vcat(collect(map(_fixedtype, fixed)), collect(vtypes))))
+end
+
+_wideschemachild(::Type{Prep}, ftypes) where Prep<:AbstractArray{<:TreeData} =
+    _wideschema_dispatch(eltype(Prep), NamedTuple{keys(ftypes)}(map(FT -> eltype(_parentof(FT)), values(ftypes))))
+_wideschemachild(::Type{Prep}, ftypes) where Prep<:Tuple{Vararg{<:TreeData}} =
+    _wideschema_dispatch(eltype(Prep), NamedTuple{keys(ftypes)}(map(FT -> eltype(_parentof(FT)), values(ftypes))))
+_wideschemachild(::Type{Prep}, ftypes) where Prep<:AbstractArray =
+    _schematerminalfanout(ftypes, FT -> eltype(_parentof(FT)))
+_wideschemachild(::Type{Prep}, ftypes) where Prep<:Tuple =
+    _schematerminalfanout(ftypes, FT -> eltype(_parentof(FT)))
+
+# every field bottoms out to a terminal value HERE simultaneously (assumed,
+# per the STRUCTURAL-kind caveat above) -- `extractor` gets each field's OWN
+# concrete terminal type (the one place a plain-array-element `eltype(...)`
+# and a bare-scalar direct type differ).
+function _schematerminalfanout(ftypes::NamedTuple{names}, extractor) where names
+    fname = first(names)
+    T = extractor(ftypes[fname])
+    rest = NamedTuple{Base.tail(names)}(Base.tail(values(ftypes)))
+    restnames, resttypes = _schematerminalfanout(rest, extractor)
+    ((fname, restnames...), (T, resttypes...))
+end
+_schematerminalfanout(ftypes::NamedTuple{()}, extractor) = ((), ())
+
+# fields have diverged (a terminal value, or a nested record) -- fan out
+# field-by-field via `_fieldschema` (which already recurses fully for a
+# TreeData field, or returns a single named `:value` type otherwise),
+# prefixing each field's own sub-names.
+function _schemafanout(ftypes::NamedTuple{names}) where names
+    fname = first(names)
+    subnames, subtypes = _fieldschema(ftypes[fname])
+    rest = NamedTuple{Base.tail(names)}(Base.tail(values(ftypes)))
+    restnames, resttypes = _schemafanout(rest)
+    ((map(nm -> _prefixname(fname, nm), subnames)..., restnames...), (subtypes..., resttypes...))
+end
+_schemafanout(ftypes::NamedTuple{()}) = ((), ())
 
 _allequal(xs) = all(==(first(xs)), xs)
 
@@ -172,23 +276,33 @@ function Base.getindex(c::AxisColumn, i::Int)
 end
 Base.IndexStyle(::Type{<:AxisColumn}) = IndexLinear()
 
-# The single `:value` column -- holds the ROOT TreeData BY REFERENCE (never
+# The single value column -- holds the ROOT TreeData BY REFERENCE (never
 # copied) and, on access, decodes row i's full tree-position and walks down
 # to the terminal scalar. Mirrors the same structural dispatch `_schema`
-# uses, index-driven instead of type-driven-only.
-struct ValueColumn{T,TX,K} <: AbstractVector{T}
+# uses, index-driven instead of type-driven-only. `fieldpath` is a FIXED,
+# per-column, compile-time-length tuple of record field-keys, baked in at
+# construction -- wide-emit's one genuinely new mechanism (decision
+# 1kpyu7n): since each named field becomes its OWN column, its ValueColumn
+# must always walk that SAME field, not whichever one a row's `idx` might
+# otherwise pick. Long-mode leaves (no record ancestor) use the default
+# empty fieldpath -- zero behavior change there, `_valueat` never consumes
+# it. `T` is supplied explicitly by the caller (the concrete type of THIS
+# field's own terminal value, already known from the build-time recursion)
+# -- heterogeneous record fields each get their own concretely-typed column
+# this way, never a shared/boxed type.
+struct ValueColumn{T,TX,K,FP<:Tuple{Vararg{Symbol}}} <: AbstractVector{T}
     x::TX
     rowdims::NTuple{K,Int}
     len::Int
+    fieldpath::FP
 end
-function ValueColumn(x::TreeData, rowdims::NTuple{K,Int}, len::Int) where K
-    T = last(_schema(typeof(x))[2])
-    ValueColumn{T,typeof(x),K}(x, rowdims, len)
+function ValueColumn{T}(x::TreeData, rowdims::NTuple{K,Int}, len::Int, fieldpath::Tuple{Vararg{Symbol}}=()) where {T,K}
+    ValueColumn{T,typeof(x),K,typeof(fieldpath)}(x, rowdims, len, fieldpath)
 end
 Base.size(c::ValueColumn) = (c.len,)
 function Base.getindex(c::ValueColumn, i::Int)
     idx = Tuple(CartesianIndices(c.rowdims)[i])
-    _valueat(c.x, idx)
+    _valueat(c.x, idx, c.fieldpath)
 end
 Base.IndexStyle(::Type{<:ValueColumn}) = IndexLinear()
 
@@ -203,27 +317,32 @@ _taken(t::Tuple, ::Val{N}) where N = ntuple(k -> t[k], Val(N))
 _dropn(t::Tuple, ::Val{0}) = t
 _dropn(t::Tuple, ::Val{N}) where N = _dropn(Base.tail(t), Val(N - 1))
 
-# ---- the `:value` walk: consumes idx components from the front, mirroring
-#      `_schema`'s structural dispatch exactly (same rules, index-driven). ----
-_valueat(X::TreeData, idx::Tuple) = _valueat_node(parent(X), idx)
+# ---- the value walk: consumes idx components from the front (unnamed
+#      axes) and fieldpath components from the front (named/record
+#      boundaries) INDEPENDENTLY -- a record consumes ONE fieldpath symbol
+#      and ZERO idx slots (wide emit: it contributes no row-dim), every
+#      other node passes fieldpath through unchanged and consumes idx as
+#      before. Mirrors `_schema`'s structural dispatch exactly (same rules,
+#      index-driven for unnamed structure, fieldpath-driven for named).
+_valueat(X::TreeData, idx::Tuple, fieldpath::Tuple{Vararg{Symbol}}=()) = _valueat_node(parent(X), idx, fieldpath)
 
-function _valueat_node(p::AbstractArray{<:TreeData}, idx::Tuple)
+function _valueat_node(p::AbstractArray{<:TreeData}, idx::Tuple, fieldpath::Tuple)
     v = _naxval(typeof(p))
-    _valueat(p[CartesianIndex(_taken(idx, v))], _dropn(idx, v))
+    _valueat(p[CartesianIndex(_taken(idx, v))], _dropn(idx, v), fieldpath)
 end
-function _valueat_node(p::Tuple{Vararg{<:TreeData}}, idx::Tuple)
-    _valueat(p[idx[1]], _dropn(idx, Val(1)))
+function _valueat_node(p::Tuple{Vararg{<:TreeData}}, idx::Tuple, fieldpath::Tuple)
+    _valueat(p[idx[1]], _dropn(idx, Val(1)), fieldpath)
 end
-_valueat_node(p::AbstractArray, idx::Tuple) = p[CartesianIndex(_taken(idx, _naxval(typeof(p))))]
-_valueat_node(p::Tuple, idx::Tuple) = p[idx[1]]
-function _valueat_node(p::NamedTuple, idx::Tuple)
-    _valueat_field(p[idx[1]], _dropn(idx, Val(1)))
+_valueat_node(p::AbstractArray, idx::Tuple, fieldpath::Tuple) = p[CartesianIndex(_taken(idx, _naxval(typeof(p))))]
+_valueat_node(p::Tuple, idx::Tuple, fieldpath::Tuple) = p[idx[1]]
+function _valueat_node(p::NamedTuple, idx::Tuple, fieldpath::Tuple)
+    _valueat_field(p[fieldpath[1]], idx, Base.tail(fieldpath))   # fieldpath-driven field pick -- idx untouched
 end
-_valueat_node(p::TreeData, idx::Tuple) = _valueat(p, idx)   # bookkeeping wrapper -- consumes nothing
-_valueat_node(p, idx::Tuple) = p                             # scalar leaf terminal
+_valueat_node(p::TreeData, idx::Tuple, fieldpath::Tuple) = _valueat(p, idx, fieldpath)   # bookkeeping wrapper -- consumes nothing
+_valueat_node(p, idx::Tuple, fieldpath::Tuple) = p                                        # scalar leaf terminal
 
-_valueat_field(v::TreeData, idx::Tuple) = _valueat(v, idx)
-_valueat_field(v, idx::Tuple) = v
+_valueat_field(v::TreeData, idx::Tuple, fieldpath::Tuple) = _valueat(v, idx, fieldpath)
+_valueat_field(v, idx::Tuple, fieldpath::Tuple) = v
 
 # ---- rowdims: one integer per row-varying dim (real axes + record-key
 #      "axes"), in nesting order (outermost first). Row index i (1-based,
@@ -292,31 +411,44 @@ function _rowdims_node(p::AbstractArray{<:TreeData})
     reps = map(_rowdims, p)
     _allequal(reps) ||
         error("TreeArrays Tables adapter: sibling TreeData elements (among $(length(p))) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
-    _checksiblingcoords(p)
+    _checksiblingcoords(p, _coordsig)
     (size(p)..., first(reps)...)
 end
 function _rowdims_node(p::Tuple{Vararg{<:TreeData}})
     reps = map(_rowdims, p)
     _allequal(reps) ||
         error("TreeArrays Tables adapter: sibling TreeData elements (among $(length(p))) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
-    _checksiblingcoords(p)
+    _checksiblingcoords(p, _coordsig)
     (length(p), first(reps)...)
 end
 function _rowdims_node(p::NamedTuple)
     reps = map(_fielddims, values(p))
     _allequal(reps) ||
         error("TreeArrays Tables adapter: record fields $(keys(p)) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
-    _checksiblingcoords(values(p))
-    (length(p), first(reps)...)
+    _checksiblingcoords(values(p), _fieldsig)
+    first(reps)   # wide emit: the record contributes NO row-dim of its own (decision 1kpyu7n) -- fields
+                   # become columns, not extra rows; their (validated-identical) deeper shape is the row-dim.
 end
 _fielddims(v::TreeData) = _rowdims(v)
 _fielddims(v) = ()
 
 # ---- coordinate signature: `_rowdims`'s recursive shape, collecting
 #      `name => values` pairs instead of sizes (see the guard comment
-#      above). Splicing (`...`) flattens every level into ONE flat tuple of
-#      pairs, so two siblings' signatures compare elementwise regardless of
-#      nesting depth.
+#      above). AXIS dims only -- used at the array-of-TreeData /
+#      tuple-of-TreeData sibling-check boundary, where the element count is
+#      the ROW count and so MUST stay O(structure), not O(rows): a fixed dim
+#      contributes nothing here on purpose, because for the common
+#      "scalar-leaf-per-row" shape (every `quantile`/`mapslices` output) that
+#      keeps `_coordsig` returning the trivial `()` -- a zero-size singleton
+#      tuple `map`s over `elems` for free, regardless of row count. Widening
+#      this to capture fixed dims too (which `_fieldsig` below does, and an
+#      earlier version of this function did) turns that `()` into a small
+#      but NON-empty per-element struct, and `map` over N ROWS of those
+#      allocates O(rows) -- measured directly: reintroducing it made
+#      `Tables.columns` on a 5000-column tree allocate ~25x a 50-column one
+#      instead of flat (violates the "no allocated vector anywhere" gate).
+#      Splicing (`...`) flattens every level into ONE flat tuple of pairs,
+#      so two siblings' signatures compare elementwise regardless of depth.
 _coordsig(X::TreeData) = _coordsig_node(X, parent(X))
 _coordsig(x) = ()   # a non-TreeData record-field value (plain scalar) -- no coords to collect
 
@@ -324,22 +456,50 @@ function _coordsig_node(X::TreeData, p::Union{AbstractArray,Tuple})
     axdims, _ = _splitmelt(TreeArrays.dims(X), _nax(typeof(p)))
     (map(d -> name(d) => meta(d).values, axdims)..., _coordsig_child(p)...)
 end
-function _coordsig_node(X::TreeData, p::NamedTuple)
-    (name(outerdim(X)) => keys(p), _coordsig_child(p)...)
-end
 _coordsig_node(X::TreeData, p::TreeData) = _coordsig(p)   # bookkeeping wrapper -- 0 own coords
-_coordsig_node(X::TreeData, p) = ()                        # scalar leaf terminal
+_coordsig_node(X::TreeData, p) = ()                        # scalar leaf terminal (incl. NamedTuple -- not reachable here, only `_fieldsig` walks records)
 
 _coordsig_child(p::AbstractArray{<:TreeData}) = _coordsig(first(p))   # ONE representative path down
 _coordsig_child(p::Tuple{Vararg{<:TreeData}}) = _coordsig(first(p))
 _coordsig_child(p::AbstractArray) = ()   # plain array leaf -- no deeper TreeData child
 _coordsig_child(p::Tuple) = ()
-_coordsig_child(p::NamedTuple) = _coordsig(first(values(p)))
 
+# ---- field signature: the SAME recursive shape as `_coordsig`, but
+#      collecting EVERY own dim (axis AND fixed AND ghost, tagged with its
+#      KIND) -- used ONLY at the NamedTuple record-field-agreement boundary
+#      (`_rowdims_node(::NamedTuple)`), where the element count is the
+#      record's FIELD count, not the row count -- a small, structure-fixed
+#      number (2-5 typically), so the same O(N) `map` that would be
+#      dangerous for `_coordsig`'s row-bounded call site is safe here. This
+#      is what makes the representative-based shared-column build sound for
+#      wide-emit record fields (scope-fork 2, mandatory): two fields can
+#      match on sizes and on axis VALUES yet still disagree on a FIXED dim's
+#      name/value, or on a dim's KIND entirely -- comparing only axis values
+#      misses that; comparing the full own-dim set catches it.
+_fieldsig(X::TreeData) = (_fieldsig_own(X)..., _fieldsig_child(parent(X))...)
+_fieldsig(x) = ()   # a non-TreeData record-field value (plain scalar) -- no coords to collect
+
+_fieldsig_own(X::TreeData) = map(d -> name(d) => (_dimkind(d), meta(d).values), TreeArrays.dims(X))
+
+_fieldsig_child(p::AbstractArray{<:TreeData}) = _fieldsig(first(p))   # ONE representative path down
+_fieldsig_child(p::Tuple{Vararg{<:TreeData}}) = _fieldsig(first(p))
+_fieldsig_child(p::AbstractArray) = ()   # plain array leaf -- no deeper TreeData child
+_fieldsig_child(p::Tuple) = ()
+_fieldsig_child(p::NamedTuple) = _fieldsig(first(values(p)))
+_fieldsig_child(p::TreeData) = _fieldsig(p)   # bookkeeping wrapper -- recurse straight through
+_fieldsig_child(p) = ()                        # scalar leaf terminal
+
+# `===` on a freshly-built `name => values` (or `name => (kind, values)`)
+# pair still hits the O(1) fast path when `values` is a shared/hoisted
+# object: `Pair`/`Tuple` are immutable, so Julia's `===` (egal) on them
+# recurses structurally field-by-field rather than requiring literal
+# same-allocation identity -- verified directly (a fresh `:t => shared` pair
+# `===` another fresh one wrapping the SAME `shared` array, `false` for a
+# distinct-but-equal copy).
 _sigmatch(a, b) = a === b || isequal(a, b)
 
-function _checksiblingcoords(elems)
-    sigs = map(_coordsig, elems)
+function _checksiblingcoords(elems, sigfn)
+    sigs = map(sigfn, elems)
     ref = first(sigs)
     for s in sigs
         for k in eachindex(s)
@@ -350,10 +510,16 @@ function _checksiblingcoords(elems)
 end
 
 # ---- building the columns: mirrors `_ownschema`+`_childschema`'s dispatch
-#      exactly, threading (root, rowdims, offset, n) instead of accumulating
-#      (names, types) -- `root` is the ORIGINAL TreeData `Tables.columns` was
-#      called on (every ValueColumn walks from there); `offset` is how many
-#      leading `rowdims` slots enclosing levels have already claimed. ----
+#      exactly, threading (root, rowdims, offset, n, fieldpath) instead of
+#      accumulating (names, types) -- `root` is the ORIGINAL TreeData
+#      `Tables.columns` was called on (every ValueColumn walks from there);
+#      `offset` is how many leading `rowdims` slots enclosing levels have
+#      already claimed; `fieldpath` is which record field(s) enclosing
+#      levels have already committed to (empty outside any record). Every
+#      column returned is a lazy view struct (`ConstColumn`/`AxisColumn`/
+#      `ValueColumn`) built in O(structure depth) -- no Vector is ever
+#      allocated to hold row DATA here; materialization happens only at a
+#      consumer's own `rowtable`/`columntable`/`collect` call. ----
 function _buildcolumns(X::TreeData)
     rowdims = _rowdims(X)
     n = prod(rowdims; init=1)
@@ -361,45 +527,133 @@ function _buildcolumns(X::TreeData)
     NamedTuple{names}(cols)
 end
 
-function _buildnode(root::TreeData, X::TreeData, p::Union{AbstractArray,Tuple}, rowdims, offset, n)
+function _buildnode(root::TreeData, X::TreeData, p::Union{AbstractArray,Tuple}, rowdims, offset, n, fieldpath::Tuple{Vararg{Symbol}}=())
     nax = _nax(typeof(p))
     axdims, fixed = _splitmelt(TreeArrays.dims(X), nax)
     axcols = ntuple(k -> AxisColumn(meta(axdims[k]).values, offset + k, rowdims, n), nax)
     fixcols = map(d -> ConstColumn(meta(d).values, n), fixed)
-    cnames, ccols = _buildchild(root, p, rowdims, offset + nax, n)
+    cnames, ccols = _buildchild(root, p, rowdims, offset + nax, n, fieldpath)
     ((map(name, axdims)..., map(name, fixed)..., cnames...), (axcols..., fixcols..., ccols...))
 end
-function _buildnode(root::TreeData, X::TreeData, p::NamedTuple, rowdims, offset, n)
+# wide emit (decision 1kpyu7n): every field becomes its OWN column-group,
+# name-prefixed, sharing the record's rowdims (the record itself contributes
+# NO row-dim -- see `_rowdims_node(::NamedTuple)`). Fields are validated
+# consistent (sizes, coordinates, AND now dim name/kind -- scope-fork 2) by
+# `_rowdims`/`_checksiblingcoords` BEFORE `_buildcolumns` ever starts, so no
+# re-validation happens here; heterogeneous field TYPES are fine (decision
+# 1vbt15w) since each field gets its own concretely-typed column(s), never a
+# shared/boxed one.
+function _buildnode(root::TreeData, X::TreeData, p::NamedTuple, rowdims, offset, n, fieldpath::Tuple{Vararg{Symbol}}=())
     recname = name(outerdim(X))
     fixed = _flatfixed(filter(d -> name(d) !== recname, TreeArrays.dims(X)))
     fixcols = map(d -> ConstColumn(meta(d).values, n), fixed)
-    reccol = AxisColumn(keys(p), offset + 1, rowdims, n)
-    fnames, fcols = _buildfield(root, first(values(p)), rowdims, offset + 1, n)
-    ((map(name, fixed)..., recname, fnames...), (fixcols..., reccol, fcols...))
+    fnames, fcols = _buildwide(root, p, rowdims, offset, n, fieldpath)
+    ((map(name, fixed)..., fnames...), (fixcols..., fcols...))
 end
-function _buildnode(root::TreeData, X::TreeData, p, rowdims, offset, n)   # bookkeeping wrapper (p::TreeData) or scalar leaf
+function _buildnode(root::TreeData, X::TreeData, p, rowdims, offset, n, fieldpath::Tuple{Vararg{Symbol}}=())   # bookkeeping wrapper (p::TreeData) or scalar leaf
     fixed = _flatfixed(TreeArrays.dims(X))
     fixcols = map(d -> ConstColumn(meta(d).values, n), fixed)
-    vnames, vcols = _terminalbuild(root, p, rowdims, offset, n)
+    vnames, vcols = _terminalbuild(root, p, rowdims, offset, n, fieldpath)
     ((map(name, fixed)..., vnames...), (fixcols..., vcols...))
 end
 
-function _buildchild(root::TreeData, p::AbstractArray{<:TreeData}, rowdims, offset, n)
-    c = first(p)
-    _buildnode(root, c, parent(c), rowdims, offset, n)
-end
-function _buildchild(root::TreeData, p::Tuple{Vararg{<:TreeData}}, rowdims, offset, n)
-    c = first(p)
-    _buildnode(root, c, parent(c), rowdims, offset, n)
-end
-_buildchild(root::TreeData, p::AbstractArray, rowdims, offset, n) = ((:value,), (ValueColumn(root, rowdims, n),))
-_buildchild(root::TreeData, p::Tuple, rowdims, offset, n) = ((:value,), (ValueColumn(root, rowdims, n),))
+# ---- wide fan-out, de-duplicated: fields validated structurally identical
+#      (by `_rowdims`/`_checksiblingcoords`, scope-fork 2 included) share
+#      their axis/fixed columns -- built ONCE from a representative field,
+#      not once per field -- and per-field divergence (prefixed columns)
+#      only starts at the point fields ACTUALLY differ: a terminal value
+#      (own concrete type per field) or a nested record (own fan-out per
+#      field). Without this, N fields walking the SAME deeper axis would
+#      each independently re-emit that axis as N byte-identical columns
+#      (e.g. 5 stat fields sharing one population/posterior axis pair would
+#      otherwise produce 5 redundant `<field>_population` columns instead of
+#      one shared `population`). `fields` threads the CURRENT node for every
+#      sibling field in parallel with `rep` (any one of them, used only to
+#      decide dispatch/read shared dims -- by the pre-validated invariant
+#      every field would give the identical answer here).
+_buildwide(root::TreeData, fields::NamedTuple, rowdims, offset, n, fieldpath) =
+    _buildwide_dispatch(root, fields, first(values(fields)), rowdims, offset, n, fieldpath)
 
-_buildfield(root::TreeData, v::TreeData, rowdims, offset, n) = _buildnode(root, v, parent(v), rowdims, offset, n)
-_buildfield(root::TreeData, v, rowdims, offset, n) = ((:value,), (ValueColumn(root, rowdims, n),))
+_buildwide_dispatch(root::TreeData, fields::NamedTuple, rep::TreeData, rowdims, offset, n, fieldpath) =
+    _buildwide_parent(root, fields, rep, parent(rep), rowdims, offset, n, fieldpath)
+_buildwide_dispatch(root::TreeData, fields::NamedTuple, rep, rowdims, offset, n, fieldpath) =   # rep is a plain scalar -- every field is independently a terminal NOW
+    _buildfanout(root, fields, rowdims, offset, n, fieldpath)
 
-_terminalbuild(root::TreeData, p::TreeData, rowdims, offset, n) = _buildnode(root, p, parent(p), rowdims, offset, n)
-_terminalbuild(root::TreeData, p, rowdims, offset, n) = ((:value,), (ValueColumn(root, rowdims, n),))
+function _buildwide_parent(root::TreeData, fields::NamedTuple, rep::TreeData, p::Union{AbstractArray,Tuple}, rowdims, offset, n, fieldpath)
+    nax = _nax(typeof(p))
+    axdims, fixed = _splitmelt(TreeArrays.dims(rep), nax)
+    axcols = ntuple(k -> AxisColumn(meta(axdims[k]).values, offset + k, rowdims, n), nax)
+    fixcols = map(d -> ConstColumn(meta(d).values, n), fixed)
+    cnames, ccols = _buildwidechild(root, fields, p, rowdims, offset + nax, n, fieldpath)
+    ((map(name, axdims)..., map(name, fixed)..., cnames...), (axcols..., fixcols..., ccols...))
+end
+_buildwide_parent(root::TreeData, fields::NamedTuple, rep::TreeData, p::TreeData, rowdims, offset, n, fieldpath) =   # bookkeeping wrapper -- peel through per field, keep sharing
+    _buildwide(root, map(parent, fields), rowdims, offset, n, fieldpath)
+_buildwide_parent(root::TreeData, fields::NamedTuple, rep::TreeData, p::NamedTuple, rowdims, offset, n, fieldpath) =   # a nested record -- fields may genuinely diverge in TYPE here (heterogeneity allowed), fan out fully
+    _buildfanout(root, fields, rowdims, offset, n, fieldpath)
+function _buildwide_parent(root::TreeData, fields::NamedTuple, rep::TreeData, p, rowdims, offset, n, fieldpath)   # a scalar terminal held by a (possibly fixed-dim-bearing) TreeData -- share the fixed dims once, fan out only the terminal value
+    fixed = _flatfixed(TreeArrays.dims(rep))
+    fixcols = map(d -> ConstColumn(meta(d).values, n), fixed)
+    vnames, vcols = _buildterminalfanout(root, fields, v -> typeof(parent(v)), rowdims, offset, n, fieldpath)
+    ((map(name, fixed)..., vnames...), (fixcols..., vcols...))
+end
+
+_buildwidechild(root::TreeData, fields::NamedTuple, p::AbstractArray{<:TreeData}, rowdims, offset, n, fieldpath) =
+    _buildwide(root, map(v -> first(parent(v)), fields), rowdims, offset, n, fieldpath)
+_buildwidechild(root::TreeData, fields::NamedTuple, p::Tuple{Vararg{<:TreeData}}, rowdims, offset, n, fieldpath) =
+    _buildwide(root, map(v -> first(parent(v)), fields), rowdims, offset, n, fieldpath)
+_buildwidechild(root::TreeData, fields::NamedTuple, p::AbstractArray, rowdims, offset, n, fieldpath) =
+    _buildterminalfanout(root, fields, v -> eltype(parent(v)), rowdims, offset, n, fieldpath)
+_buildwidechild(root::TreeData, fields::NamedTuple, p::Tuple, rowdims, offset, n, fieldpath) =
+    _buildterminalfanout(root, fields, v -> eltype(parent(v)), rowdims, offset, n, fieldpath)
+
+# every field bottoms out to a terminal value HERE simultaneously (guaranteed
+# by the pre-validated shared-rowdims invariant) -- each field's OWN concrete
+# type (via `ttype`, the one place a plain-array-element `eltype(parent(v))`
+# and a bare-scalar `typeof(parent(v))` differ) becomes its own `ValueColumn`.
+function _buildterminalfanout(root::TreeData, fields::NamedTuple{names}, ttype, rowdims, offset, n, fieldpath) where names
+    fname = first(names)
+    col = ValueColumn{ttype(fields[fname])}(root, rowdims, n, (fieldpath..., fname))
+    rest = NamedTuple{Base.tail(names)}(Base.tail(values(fields)))
+    restnames, restcols = _buildterminalfanout(root, rest, ttype, rowdims, offset, n, fieldpath)
+    ((fname, restnames...), (col, restcols...))
+end
+_buildterminalfanout(root::TreeData, fields::NamedTuple{()}, ttype, rowdims, offset, n, fieldpath) = ((), ())
+
+# fields have diverged (a terminal value, or a nested record) -- recurse
+# field-by-field via `NamedTuple{names}`'s own `names` tuple (field COUNT is
+# static, so this is compile-time-specialized recursion, matching
+# `_taken`/`_dropn`'s existing tuple-recursion idiom -- no intermediate
+# Vector accumulator). Every field independently re-derives whatever OWN
+# axis/fixed structure it still has below this point -- correct (per-field
+# structure can genuinely differ once fields have diverged, e.g. a nested
+# record's own further fields), just no longer de-duplicated -- there is
+# nothing left to de-duplicate against once fields disagree in KIND.
+function _buildfanout(root::TreeData, p::NamedTuple{names}, rowdims, offset, n, fieldpath) where names
+    fname = first(names)
+    subnames, subcols = _buildfield(root, p[fname], rowdims, offset, n, (fieldpath..., fname))
+    rest = NamedTuple{Base.tail(names)}(Base.tail(values(p)))
+    restnames, restcols = _buildfanout(root, rest, rowdims, offset, n, fieldpath)
+    ((map(nm -> _prefixname(fname, nm), subnames)..., restnames...), (subcols..., restcols...))
+end
+_buildfanout(root::TreeData, p::NamedTuple{()}, rowdims, offset, n, fieldpath) = ((), ())
+
+function _buildchild(root::TreeData, p::AbstractArray{<:TreeData}, rowdims, offset, n, fieldpath)
+    c = first(p)
+    _buildnode(root, c, parent(c), rowdims, offset, n, fieldpath)
+end
+function _buildchild(root::TreeData, p::Tuple{Vararg{<:TreeData}}, rowdims, offset, n, fieldpath)
+    c = first(p)
+    _buildnode(root, c, parent(c), rowdims, offset, n, fieldpath)
+end
+_buildchild(root::TreeData, p::AbstractArray, rowdims, offset, n, fieldpath) = ((:value,), (ValueColumn{eltype(p)}(root, rowdims, n, fieldpath),))
+_buildchild(root::TreeData, p::Tuple, rowdims, offset, n, fieldpath) = ((:value,), (ValueColumn{eltype(p)}(root, rowdims, n, fieldpath),))
+
+_buildfield(root::TreeData, v::TreeData, rowdims, offset, n, fieldpath) = _buildnode(root, v, parent(v), rowdims, offset, n, fieldpath)
+_buildfield(root::TreeData, v, rowdims, offset, n, fieldpath) = ((:value,), (ValueColumn{typeof(v)}(root, rowdims, n, fieldpath),))
+
+_terminalbuild(root::TreeData, p::TreeData, rowdims, offset, n, fieldpath) = _buildnode(root, p, parent(p), rowdims, offset, n, fieldpath)
+_terminalbuild(root::TreeData, p, rowdims, offset, n, fieldpath) = ((:value,), (ValueColumn{typeof(p)}(root, rowdims, n, fieldpath),))
 
 function Tables.columns(X::TreeData)
     _schema(typeof(X))   # cheap, type-only -- preserves every existing validation
