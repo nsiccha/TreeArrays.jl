@@ -2,6 +2,8 @@ using Test
 using TreeArrays
 using Tables
 using FillArrays: Fill
+using NaNStatistics
+using Statistics
 
 # a small-scale replica of docs/pkpd_demo.jl's chained-quantile shapes -- the
 # two acceptance-bar targets for the Tables.jl adapter.
@@ -126,6 +128,77 @@ end
 
         chained_scalar = quantile(scalar_result, TreeDim(:median2, 0.5); dims=:param)  # was: MethodError CartesianIndices(::Number)
         @test parent(parent(chained_scalar)) isa Number
+    end
+
+    # NaN-aware quantile lives in a package extension (todo b1am3w), not a
+    # `skipnan` kwarg on Statistics.quantile (user override of 1qbk7u4) --
+    # Statistics.quantile itself is untouched and keeps throwing on NaN.
+    @testset "NaNStatistics.nanquantile(X, pdim::TreeDim; dims) extension" begin
+        ext = Base.get_extension(TreeArrays, :TreeArraysNaNStatisticsExt)
+        @test ext !== nothing
+
+        Xq = TreeData(reshape(1.0:12.0, 4, 3), :draw, :param)
+        pdim = TreeDim(:pct, (0.25, 0.5, 0.75))
+
+        @testset "no-NaN data matches Statistics.quantile exactly" begin
+            @test parent(nanquantile(Xq, pdim; dims=:draw)) == parent(quantile(Xq, pdim; dims=:draw))
+        end
+
+        @testset "some-NaN slice: quantiles over the survivors; Statistics.quantile still throws" begin
+            P = Array(reshape(1.0:12.0, 4, 3))
+            P[1, 1] = NaN
+            Xn = TreeData(P, :draw, :param)
+            @test_throws Exception quantile(Xn, pdim; dims=:draw)
+
+            r = nanquantile(Xn, pdim; dims=:draw)
+            @test parent(parent(r)[1]) == Statistics.quantile(filter(!isnan, P[:, 1]), (0.25, 0.5, 0.75))
+            @test parent(parent(r)[2]) == Statistics.quantile(P[:, 2], (0.25, 0.5, 0.75))   # untouched column unaffected
+        end
+
+        @testset "all-NaN slice: NaN at every level, container shape mirrored, never throws" begin
+            P = Array(reshape(1.0:12.0, 4, 3))
+            P[:, 1] .= NaN
+            Xn = TreeData(P, :draw, :param)
+
+            r_tup = nanquantile(Xn, TreeDim(:pct, (0.25, 0.5, 0.75)); dims=:draw)
+            @test all(isnan, parent(parent(r_tup)[1]))
+            @test parent(parent(r_tup)[1]) isa NTuple{3,Float64}
+
+            r_scalar = nanquantile(Xn, TreeDim(:median, 0.5); dims=:draw)
+            @test isnan(parent(parent(r_scalar)[1]))
+
+            r_vec = nanquantile(Xn, TreeDim(:pct2, [0.25, 0.5, 0.75]); dims=:draw)
+            @test all(isnan, parent(parent(r_vec)[1]))
+            @test parent(parent(r_vec)[1]) isa Vector{Float64}
+        end
+
+        @testset "type-stability: all-NaN leaf type matches a normal slice's leaf type (Float32 data)" begin
+            P32 = Float32.(reshape(1:12, 4, 3))
+            P32[:, 1] .= NaN32
+            X32n = TreeData(P32, :draw, :param)
+            r = nanquantile(X32n, pdim; dims=:draw)
+            @test typeof(parent(parent(r)[1])) == typeof(parent(parent(r)[2]))   # all-NaN vs normal leaf
+            @test isconcretetype(eltype(parent(r)))                              # the gathered TreeData is concrete
+        end
+
+        @testset "no per-slice allocation regression (shared scratch, O(1) per slice)" begin
+            n_draws, n_cols = 50, 200
+            X = TreeData(randn(n_draws, n_cols), :draw, :param)
+            pdim3 = TreeDim(:pct, (0.1, 0.5, 0.9))
+            quantile(X, pdim3; dims=:draw)          # warm up both paths
+            nanquantile(X, pdim3; dims=:draw)
+            a_base = @allocated quantile(X, pdim3; dims=:draw)
+            a_nan  = @allocated nanquantile(X, pdim3; dims=:draw)
+            @test a_nan == a_base   # byte-identical per-slice profile to the untouched Statistics.quantile baseline
+
+            Xbig = TreeData(randn(n_draws, 100 * n_cols), :draw, :param)
+            nanquantile(Xbig, pdim3; dims=:draw)
+            a_big = @allocated nanquantile(Xbig, pdim3; dims=:draw)
+            # O(1) per slice, not O(nslices): a real per-slice leak (as found and
+            # fixed mid-implementation) roughly TRIPLED the per-slice allocation at
+            # this scale gap -- isapprox (not exact ==) absorbs fixed per-call noise.
+            @test isapprox(a_big / (100 * n_cols), a_nan / n_cols; rtol=0.3)
+        end
     end
 
     @testset "Tables.jl: stats_percentiles schema + melt (stat/population/posterior)" begin
