@@ -236,27 +236,51 @@ _valueat_field(v, idx::Tuple) = v
 #      order) -- Tables.jl doesn't mandate one, and no test pins one down;
 #      value-equivalence tests compare row SETS, not row-for-row order.
 #
-#      Ragged guard: raggedness can only arise where an array/tuple-of-
-#      TreeData or a NamedTuple's fields have genuinely independent instance
-#      shapes (a lone plain array/tuple/namedtuple is uniform by
-#      construction). At exactly those boundaries, verify every sibling's
-#      SIZE signature (`_rowdims` itself, recursively -- sizes/lengths/
-#      nfields only, never touching axis coordinate VALUES) agrees before
-#      trusting one representative path for the deeper structure/coordinate
-#      lookups -- matches the supervisor's own definition of ragged (unequal
-#      child LENGTHS). This is a deliberate scoping choice, not an oversight:
-#      comparing full coordinate VALUES (catching the narrower "same length,
-#      different per-sibling coordinates" case too) was tried and costs
-#      O(rows) whenever siblings are themselves the row-terminal (e.g. every
-#      per-slice scalar leaf a `quantile`/`mapslices` call produces is,
-#      structurally, exactly this shape) -- which breaks the flat/O(1)-
-#      construction requirement for the single most common output shape.
-#      Sizes-only stays O(structure) always. Flagged to the supervisor as a
-#      scope note: a hand-built array of TreeData siblings with the SAME
-#      length but genuinely differing axis coordinate values is not
-#      detected here (axis/coordinate columns would silently use one
-#      sibling's coordinates for all -- `:value` stays correct regardless,
-#      it always walks the real tree per row).
+#      Ragged guard, two parts, both required at every array/tuple-of-
+#      TreeData / NamedTuple-fields boundary (a lone plain array/tuple/
+#      namedtuple is uniform by construction -- these are the ONLY places
+#      sibling instances can genuinely diverge):
+#      1. SIZE signature (`_rowdims` itself, recursively -- sizes/lengths/
+#         nfields only) -- catches unequal child LENGTHS.
+#      2. COORDINATE signature (`_coordsig`, below) -- catches the narrower
+#         "same length, different per-sibling coordinate VALUES" case (user-
+#         greenlit fast-follow, 2026-07-06, overriding an earlier document-
+#         and-defer call). `_coordsig` mirrors `_rowdims`'s own recursive
+#         shape -- descending through the SAME representative (`first(p)`)
+#         at every nested boundary that `_buildcolumns` itself uses -- but
+#         collects `name => meta(d).values` pairs instead of sizes, at every
+#         level, not just the boundary's own. That full-depth walk is what
+#         closes a real gap a shallower (own-level-only) version has: two
+#         siblings can each be internally uniform yet disagree on a DEEPER
+#         axis (e.g. subject A's visits all share one `:time` array, subject
+#         B's visits all share a DIFFERENT one) -- comparing only each
+#         sibling's own-level axis misses this; comparing the full
+#         recursive signature catches it, because the representative-path
+#         walk for sibling A and for sibling B pass through their own
+#         deeper levels directly against each other. Internal
+#         inconsistency WITHIN one sibling's own deeper structure (A's
+#         visit 1 vs visit 2) is still caught independently, when
+#         `_rowdims`'s existing recursion reaches THAT nested boundary and
+#         this same two-part check fires there too -- no separate pass
+#         needed, it falls out of the existing per-level fold-in.
+#      Never touching leaf DATA (only axis/record-key METADATA, and only
+#      along one representative path per level, never iterating a full
+#      sibling array) keeps this O(structure depth), not O(rows) -- the
+#      distinction that matters: an EARLIER attempt at full coordinate
+#      checking compared full recursive dims signatures INCLUDING descending
+#      into and iterating actual per-slice leaf VALUES, which cost O(rows)
+#      for the extremely common "flat array of per-slice scalar leaves"
+#      shape (every `quantile`/`mapslices` output). This version never does
+#      that -- a scalar leaf / non-TreeData value contributes `()`, so the
+#      cost is bounded by tree depth times sibling count at each level, the
+#      same order the size check already pays.
+#      `_sigmatch` compares each coordinate pair via `===` first (O(1),
+#      handles the common case of a hoisted/shared coordinate object, and is
+#      `missing`-safe/short-circuiting for unlabelled axes) and falls back to
+#      `isequal` (not `==`) only on an identity miss -- `isequal` avoids
+#      `==`'s three-valued `missing`-propagation and its `NaN != NaN`
+#      surprise, so an independently-constructed-but-equal coordinate array
+#      is correctly accepted, not spuriously rejected.
 _rowdims(X::TreeData) = _rowdims_node(parent(X))
 
 _rowdims_node(p::AbstractArray) = size(p)   # plain array leaf -- always uniform (one array)
@@ -268,22 +292,62 @@ function _rowdims_node(p::AbstractArray{<:TreeData})
     reps = map(_rowdims, p)
     _allequal(reps) ||
         error("TreeArrays Tables adapter: sibling TreeData elements (among $(length(p))) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
+    _checksiblingcoords(p)
     (size(p)..., first(reps)...)
 end
 function _rowdims_node(p::Tuple{Vararg{<:TreeData}})
     reps = map(_rowdims, p)
     _allequal(reps) ||
         error("TreeArrays Tables adapter: sibling TreeData elements (among $(length(p))) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
+    _checksiblingcoords(p)
     (length(p), first(reps)...)
 end
 function _rowdims_node(p::NamedTuple)
     reps = map(_fielddims, values(p))
     _allequal(reps) ||
         error("TreeArrays Tables adapter: record fields $(keys(p)) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
+    _checksiblingcoords(values(p))
     (length(p), first(reps)...)
 end
 _fielddims(v::TreeData) = _rowdims(v)
 _fielddims(v) = ()
+
+# ---- coordinate signature: `_rowdims`'s recursive shape, collecting
+#      `name => values` pairs instead of sizes (see the guard comment
+#      above). Splicing (`...`) flattens every level into ONE flat tuple of
+#      pairs, so two siblings' signatures compare elementwise regardless of
+#      nesting depth.
+_coordsig(X::TreeData) = _coordsig_node(X, parent(X))
+_coordsig(x) = ()   # a non-TreeData record-field value (plain scalar) -- no coords to collect
+
+function _coordsig_node(X::TreeData, p::Union{AbstractArray,Tuple})
+    axdims, _ = _splitmelt(TreeArrays.dims(X), _nax(typeof(p)))
+    (map(d -> name(d) => meta(d).values, axdims)..., _coordsig_child(p)...)
+end
+function _coordsig_node(X::TreeData, p::NamedTuple)
+    (name(outerdim(X)) => keys(p), _coordsig_child(p)...)
+end
+_coordsig_node(X::TreeData, p::TreeData) = _coordsig(p)   # bookkeeping wrapper -- 0 own coords
+_coordsig_node(X::TreeData, p) = ()                        # scalar leaf terminal
+
+_coordsig_child(p::AbstractArray{<:TreeData}) = _coordsig(first(p))   # ONE representative path down
+_coordsig_child(p::Tuple{Vararg{<:TreeData}}) = _coordsig(first(p))
+_coordsig_child(p::AbstractArray) = ()   # plain array leaf -- no deeper TreeData child
+_coordsig_child(p::Tuple) = ()
+_coordsig_child(p::NamedTuple) = _coordsig(first(values(p)))
+
+_sigmatch(a, b) = a === b || isequal(a, b)
+
+function _checksiblingcoords(elems)
+    sigs = map(_coordsig, elems)
+    ref = first(sigs)
+    for s in sigs
+        for k in eachindex(s)
+            _sigmatch(s[k], ref[k]) ||
+                error("TreeArrays Tables adapter: sibling TreeData elements (among $(length(elems))) disagree on axis `$(first(s[k]))`'s coordinate values -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
+        end
+    end
+end
 
 # ---- building the columns: mirrors `_ownschema`+`_childschema`'s dispatch
 #      exactly, threading (root, rowdims, offset, n) instead of accumulating

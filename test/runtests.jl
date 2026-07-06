@@ -346,6 +346,48 @@ end
         @test length(Tables.getcolumn(cols, :value)) == n_subjects * 3
     end
 
+    @testset "Tables.jl: coordinate-value guard (===-fast-path + isequal fallback, Option A)" begin
+        # false positive 1: siblings share the SAME coordinate object -- every
+        # comparison is an `===` hit, O(1), zero `isequal` calls needed.
+        shared_times = sort(randn(3))
+        shared_obj = TreeData(map(_ -> TreeData(randn(3), :time => shared_times), 1:4), :subject)
+        @test length(Tables.getcolumn(Tables.columns(shared_obj), :value)) == 12
+
+        # false positive 2: siblings each get their OWN, independently-built but
+        # value-equal coordinate array -- `===` misses, `isequal` accepts, still
+        # NOT rejected as ragged.
+        distinct_but_equal = TreeData(map(_ -> TreeData(randn(3), :time => copy(shared_times)), 1:4), :subject)
+        @test length(Tables.getcolumn(Tables.columns(distinct_but_equal), :value)) == 12
+
+        # true positive, single-level: same lengths, genuinely different
+        # per-sibling coordinate VALUES -- rejected, message names the dim.
+        differing = TreeData([TreeData(randn(3), :time => sort(randn(3))) for _ in 1:4], :subject)
+        @test_throws "ragged trees are not a supported Tables shape yet" Tables.columns(differing)
+        @test_throws "time" Tables.columns(differing)
+        @test Tables.schema(differing) isa Tables.Schema   # schema still succeeds -- type-only
+
+        # true positive, multi-level: TWO top-level siblings, each internally
+        # uniform (all of subject A's visits share ONE :time array, all of
+        # subject B's visits share a DIFFERENT one) -- an own-level-only check
+        # would miss this (each boundary's own siblings look consistent); the
+        # full recursive coordinate signature catches it via the representative
+        # (first-visit) path comparison at the TOP boundary.
+        time_a, time_b = sort(randn(2)), sort(randn(2))
+        subject_a = TreeData([TreeData(randn(2), :time => time_a) for _ in 1:3], :visit)
+        subject_b = TreeData([TreeData(randn(2), :time => time_b) for _ in 1:3], :visit)
+        nested_differing = TreeData([subject_a, subject_b], :subject)
+        @test_throws "ragged trees are not a supported Tables shape yet" Tables.columns(nested_differing)
+        @test_throws "time" Tables.columns(nested_differing)
+
+        # the multi-level REGULAR counterpart (both subjects share ONE :time
+        # object across all visits, all subjects) still works.
+        time_shared = sort(randn(2))
+        subject_a2 = TreeData([TreeData(randn(2), :time => time_shared) for _ in 1:3], :visit)
+        subject_b2 = TreeData([TreeData(randn(2), :time => time_shared) for _ in 1:3], :visit)
+        nested_regular = TreeData([subject_a2, subject_b2], :subject)
+        @test length(Tables.getcolumn(Tables.columns(nested_regular), :value)) == 2 * 3 * 2
+    end
+
     @testset "Tables.jl: unsupported shapes error clearly" begin
         heterogeneous = TreeData(:rec => (;a=TreeData(randn(3), :t), b=5.0))
         @test_throws "heterogeneous records" Tables.schema(heterogeneous)
