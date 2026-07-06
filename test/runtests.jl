@@ -1,5 +1,37 @@
 using Test
 using TreeArrays
+using Tables
+using FillArrays: Fill
+
+# a small-scale replica of docs/pkpd_demo.jl's chained-quantile shapes -- the
+# two acceptance-bar targets for the Tables.jl adapter.
+@kernel (:time => :stat) function _tt_compute_stats(L)
+    trough, peak = extrema(L)
+    baseline = L[1]
+    dtrough, dpeak = extrema(L .- baseline)
+    (;trough, peak, baseline, dtrough, dpeak)
+end
+
+function _tt_stats_percentiles(; n_draws=6, n_subjects=4, n_dense=3, n_cols=5)
+    dense_loc(args...) = TreeData(randn(n_draws, n_subjects, n_dense), :draw, :subject, :time=>range(0, 1, n_dense))
+    input_draws = TreeData(randn(n_draws, n_cols), :draw, :param; random_effect=:in_sample, placebo=:on, space=:sampler)
+    map(Iterators.product(
+        TreeDim(:random_effect, (:zero, :population)),
+        TreeDim(:placebo, (:on, :off)),
+        TreeDim(:schedule, ("some schedule",)),
+        TreeDim(:dose, (20, 200)),
+    )) do args...
+        quantile(
+            quantile(_tt_compute_stats(dense_loc(input_draws, args...)), TreeDim(:population, (0.05, 0.5, 0.95)); dims=:subject),
+            TreeDim(:posterior, (0.05, 0.5, 0.95)); dims=:draw,
+        )
+    end
+end
+
+function _tt_median_draws(; n_draws=6, n_cols=5)
+    input_draws = TreeData(randn(n_draws, n_cols), :draw, :param; random_effect=:in_sample, placebo=:on, space=:sampler)
+    quantile(input_draws, TreeDim(:median, 0.5); dims=:draw)
+end
 
 @testset "TreeArrays" begin
 
@@ -94,6 +126,72 @@ using TreeArrays
 
         chained_scalar = quantile(scalar_result, TreeDim(:median2, 0.5); dims=:param)  # was: MethodError CartesianIndices(::Number)
         @test parent(parent(chained_scalar)) isa Number
+    end
+
+    @testset "Tables.jl: stats_percentiles schema + melt (stat/population/posterior)" begin
+        stats_percentiles = _tt_stats_percentiles()
+        @test Tables.istable(typeof(stats_percentiles))
+
+        TreeArrays.MELT_COUNT[] = 0
+        sch = Tables.schema(stats_percentiles)
+        @test TreeArrays.MELT_COUNT[] == 0   # schema is metadata-only -- never melts
+        @test sch.names == (:random_effect, :placebo, :schedule, :dose, :stat, :population, :posterior, :value)
+        @test sch.types == (Symbol, Symbol, String, Int, Symbol, Float64, Float64, Float64)
+        @test Tables.columnnames(stats_percentiles) == sch.names
+        @test TreeArrays.MELT_COUNT[] == 0   # columnnames is metadata-only too
+
+        cols = Tables.columns(stats_percentiles)
+        @test TreeArrays.MELT_COUNT[] == 1
+        n = 2 * 2 * 1 * 2 * 5 * 3 * 3   # random_effect x placebo x schedule x dose x stat x population x posterior
+        for nm in Tables.columnnames(cols)
+            col = Tables.getcolumn(cols, nm)
+            @test length(col) == n
+            @test isconcretetype(eltype(col))   # the "no Any columns" bar -- checked per column,
+        end                                     # not via @inferred(getcolumn(::Symbol)) (inherently
+        @test TreeArrays.MELT_COUNT[] == 1      # non-monomorphic for a heterogeneous NamedTuple)
+
+        @test Tables.getcolumn(cols, :value) isa Vector{Float64}
+        @test Tables.getcolumn(cols, :population) isa Vector{Float64}
+        @test Tables.getcolumn(cols, :stat) isa Vector{Symbol}
+        @test sort(unique(Tables.getcolumn(cols, :stat))) == sort([:trough, :peak, :baseline, :dtrough, :dpeak])
+        @test Tables.getcolumn(cols, :schedule) isa Fill   # constant across every row -- decision oni1bc
+
+        rt = Tables.rowtable(stats_percentiles)
+        @test length(rt) == n
+        @test Set(keys(rt[1])) == Set(sch.names)
+    end
+
+    @testset "Tables.jl: median_draws (scalar quantile -> constant column)" begin
+        median_draws = _tt_median_draws(; n_cols=7)
+        cols = Tables.columns(median_draws)
+        @test Tables.columnnames(cols) == (:random_effect, :placebo, :space, :param, :median, :value)
+        @test length(Tables.getcolumn(cols, :value)) == 7
+        @test Tables.getcolumn(cols, :param) == 1:7          # unlabelled axis -> 1-based position
+        @test Tables.getcolumn(cols, :median) isa Fill        # fixed scalar p -> constant column
+        @test all(==(0.5), Tables.getcolumn(cols, :median))
+        @test Tables.getcolumn(cols, :random_effect) isa Fill
+        @test all(==(:in_sample), Tables.getcolumn(cols, :random_effect))
+    end
+
+    @testset "Tables.jl: laziness -- construction never melts" begin
+        TreeArrays.MELT_COUNT[] = 0
+        stats_percentiles = _tt_stats_percentiles()
+        median_draws = _tt_median_draws()
+        @test TreeArrays.MELT_COUNT[] == 0   # mapslices/quantile construction touched nothing here
+        Tables.columns(stats_percentiles)
+        Tables.columns(median_draws)
+        @test TreeArrays.MELT_COUNT[] == 2   # exactly one melt per Tables.columns call
+    end
+
+    @testset "Tables.jl: unsupported shapes error clearly" begin
+        heterogeneous = TreeData(:rec => (;a=TreeData(randn(3), :t), b=5.0))
+        @test_throws "heterogeneous records" Tables.schema(heterogeneous)
+
+        rawarray = TreeData(:rec => (;a=TreeData(randn(3), :t), b=[1, 2, 3]))
+        @test_throws "carries no dim labels" Tables.schema(rawarray)
+
+        absentfield = TreeData(:rec => (;a=TreeData(randn(3), :t), b=missing))
+        @test_throws "absent-dim `missing` sentinel" Tables.schema(absentfield)
     end
 
 end

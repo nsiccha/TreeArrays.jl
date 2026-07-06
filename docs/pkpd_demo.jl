@@ -118,3 +118,21 @@ display(stats_percentiles)
 # slice holds one scalar value (not a length-1 vector).
 median_draws = quantile(input_draws, TreeDim(:median, 0.5); dims=:draw)
 display(median_draws)
+
+# ## Tables.jl export
+#
+# Both chained-reduction results above are, unmodified, Tables.jl COLUMN
+# sources -- no separate export step, no DataFrame in between. Nothing melts
+# at construction (everything above stayed lazy); the tree -> columns melt
+# happens exactly once, here, at `Tables.columns`.
+using Tables
+
+Tables.istable(stats_percentiles)   # true
+sch = Tables.schema(stats_percentiles)   # computed from the TYPE alone, no melt
+display(sch)
+
+cols = Tables.columns(stats_percentiles)
+display(Tables.columnnames(cols))
+display(first(Tables.rowtable(stats_percentiles), 3))
+
+display(Tables.columns(median_draws))
