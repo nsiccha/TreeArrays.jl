@@ -627,9 +627,64 @@ end
         @test occursin("6 rows", hs) && !occursin("showing the first", hs)
         @test count("<tr>", hs) == 7
 
-        # the unbuilt wide-pivot still throws here -- display is not where a known
-        # gap gets to silently render the wrong (long) shape
-        @test_throws ErrorException html(TreeTable(big; wide=:param))
+        # a wide pivot renders too: its levels are the columns, rows drop to the draws
+        hw = html(TreeTable(big; wide=:param))
+        @test occursin("param_1", hw) && occursin("50 rows", hw)
+
+        # but a wide dim that has no levels to spread still throws out of `show` --
+        # display is not where a bad shape gets to render as if it were fine
+        fixedX = TreeData(randn(4), TreeDim(:draw, 1:4), TreeDim(:tag, :fixedtag))
+        @test_throws "not a real axis" html(TreeTable(fixedX; wide=:tag))
+    end
+
+    # `wide=:band` spreads an axis's levels into columns. It is a pure RE-INDEXING of
+    # the columns the long melt already built -- same lazy column objects, one slot
+    # deleted from the shared row space -- so nothing recomputes and nothing densifies.
+    # This is the shape AoV's `lineribbon(bands=[:lower => :upper])` consumes.
+    @testset "TreeTable(wide=) pivots an axis's levels into columns" begin
+        spec = (lower=0.25, median=0.5, upper=0.75)
+        Xq = TreeData(reshape(1.0:12.0, 4, 3), :draw, :param)
+        r  = quantile(Xq, :band => spec; dims=:draw)
+
+        @test Set(Tables.columnnames(Tables.columns(TreeTable(r)))) == Set((:param, :band, :value))
+
+        # `:band` sits on the LEAF, not at the top level -- validate + pivot anyway
+        tt = TreeTable(r; wide=:band)
+        cols = Tables.columns(tt)
+        @test Set(Tables.columnnames(cols)) == Set((:param, :lower, :median, :upper))
+        @test Tables.schema(tt).names == Tables.columnnames(cols)
+        @test all(isconcretetype ∘ eltype, values(cols))     # aov-use §2 column contract
+
+        # the band axis leaves the row space: 3*3 long rows collapse to 3 wide rows
+        @test length(Tables.rowtable(TreeTable(r))) == 9
+        @test length(Tables.rowtable(tt)) == 3
+
+        # every wide cell equals the long melt's corresponding cell
+        long = Tables.rowtable(TreeTable(r))
+        for row in Tables.rowtable(tt), lvl in keys(spec)
+            @test getproperty(row, lvl) == only(filter(l -> l.param == row.param && l.band === lvl, long)).value
+        end
+        # ... and equals a direct quantile of that column
+        for (j, row) in enumerate(Tables.rowtable(tt))
+            col = Float64.(4j-3:4j)
+            @test (row.lower, row.median, row.upper) == Tuple(Statistics.quantile(col, values(spec)))
+        end
+
+        @test_throws "is not a dim of this TreeData" TreeTable(r; wide=:nope)
+
+        # an unlabelled axis widens positionally, prefixed by its dim (never a bare `1`)
+        wp = Tables.columns(TreeTable(Xq; wide=:param))
+        @test Set(Tables.columnnames(wp)) == Set((:draw, :param_1, :param_2, :param_3))
+        @test collect(Tables.getcolumn(wp, :param_2)) == collect(5.0:8.0)
+
+        # a fixed/ghost dim has no levels -- loud, never a silent passthrough
+        fixedX = TreeData(randn(4), TreeDim(:draw, 1:4), TreeDim(:tag, :fixedtag))
+        @test_throws "not a real axis" Tables.columns(TreeTable(fixedX; wide=:tag))
+
+        # Vega-Lite reads a dot in a field name as nested property access (aov-use §9)
+        dotted = TreeData(randn(2, 2), :draw, :time => [0.1, 0.25])
+        @test Set(Tables.columnnames(Tables.columns(TreeTable(dotted; wide=:time)))) ==
+              Set((:draw, :time_0_1, :time_0_25))
     end
 
 end
