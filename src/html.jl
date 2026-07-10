@@ -1,14 +1,23 @@
 # ===================== rich HTML display =====================
 # `showable(MIME"text/html"(), x)` is exactly what HTMX.jl's element-builder loop
-# checks before falling back to `print(io, child)` (htmxo-use §8a). So defining
-# these two methods is ALL it takes for a `TreeData`/`TreeTable` dropped straight
-# into an `h.div(...)` to render rich -- no HTMXObjects dependency, no package
-# extension, no consumer opt-in (user steer, 2026-07-10: "'more automatic' rich
-# display would be the feature to reach for").
+# checks before falling back to `print(io, child)`. So defining these two methods
+# is ALL it takes for a `TreeData`/`TreeTable` dropped straight into an `h.div(...)`
+# to render rich -- no HTMXObjects dependency, no package extension, no consumer
+# opt-in (user steer, 2026-07-10: "'more automatic' rich display would be the
+# feature to reach for"). `HTMX.jl:202` is the branch, and `m` is pinned by its
+# enclosing `show(::IO, m::MIME"text/html", ::Node)` signature, so the call is
+# exactly `show(io, MIME"text/html"(), child)`.
 #
 # TA owns the methods rather than HTMXO/AoV because `MIME` and `show` are Base and
 # the dependency arrow only ever points HTMXO -> TA: a method here costs TA nothing
-# and reaches every consumer at once.
+# and reaches every consumer at once (Pluto and Jupyter light up for free).
+#
+# ⚠ HTML REP ONLY. HTMX's markdown rep takes a different path with a
+# `show(io, ::MIME"text/markdown", val) = print(io, string(val))` CATCH-ALL and no
+# `showable` guard, so an HTMXO `?plain` request silently renders `string(x)` --
+# `print_tree`, which sets no `:limit` and dumped 917 KB for a 1000x100 leaf where
+# this method emits 919 chars. Fixing that needs a `MIME"text/markdown"` method
+# here (todo `5ou6j6`), not a change to the HTML one.
 #
 # BOUNDED BY CONSTRUCTION -- a display method must never densify the tree (eager
 # compute / lazy assembly, decision 1uzarfr):
@@ -37,7 +46,20 @@ const _MAX_COORDS = 60        # chars of a dim's coordinate preview
 const _MAX_TUPLE_ELEMS = 8    # Tuple elements rendered before eliding (`show` ignores `:limit`)
 const _MAX_DUMP_CHARS = 2000  # hard cap on any single <pre> value dump
 
-_esc(s::AbstractString) = replace(s, '&' => "&amp;", '<' => "&lt;", '>' => "&gt;", '"' => "&quot;")
+# HTMX splices a `showable` child's output into the document RAW -- `HTMX.jl:202`
+# takes `show(io, MIME"text/html"(), child)` and never escapes it (that same branch
+# is why `h.code()(src)` passes text through unescaped). So the EMITTER owns
+# escaping: a `<` in an axis label would otherwise corrupt the document, and is
+# XSS-adjacent once a coordinate carries user data. Confirmed against HTMX.jl by
+# `HTMXObjects:consult.tfgq0l`, 2026-07-10.
+#
+# Escapes the full `& < > " '` set even though every call site below emits element
+# TEXT (where the quote forms are inert), so `_esc` is a CONTEXT-FREE escaper: a
+# later edit that drops an escaped value into an attribute stays safe by
+# construction rather than by remembering this comment.
+# `replace` with several pairs is single-pass, so `&` -> `&amp;` is not re-escaped.
+_esc(s::AbstractString) = replace(s,
+    '&' => "&amp;", '<' => "&lt;", '>' => "&gt;", '"' => "&quot;", '\'' => "&#39;")
 _esc(x) = _esc(string(x))
 
 # clamp on CHARACTERS, before escaping -- escaping last means an entity can never be

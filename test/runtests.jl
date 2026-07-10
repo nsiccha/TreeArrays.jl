@@ -602,10 +602,17 @@ end
         @test occursin("<code>draw</code>", html(X)) && occursin("<code>param</code>", html(X))
         @test occursin("TreeArray", html(X))
 
-        # coords carrying HTML metacharacters must not break the DOM below the node
+        # HTMX splices a showable child's output RAW (HTMX.jl:202) -- the emitter owns
+        # escaping, so coords carrying HTML metacharacters must not break the DOM.
         Xesc = TreeData(randn(2), TreeDim(:tag, ("<b>&x", "y")))
         @test occursin("&lt;b&gt;&amp;x", html(Xesc))
         @test !occursin("<b>", html(Xesc))
+
+        # `_esc` is context-free: the full `& < > " '` set, so a future edit that puts
+        # an escaped value in an ATTRIBUTE is safe by construction, not by memory.
+        @test TreeArrays._esc("""<a href="x" class='y'>&""") ==
+              "&lt;a href=&quot;x&quot; class=&#39;y&#39;&gt;&amp;"
+        @test TreeArrays._esc("&amp;") == "&amp;amp;"      # single-pass: no double-escape
 
         # a record: one collapsible section per field, outer_dim labelled `record`
         Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
