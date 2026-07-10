@@ -591,4 +591,45 @@ end
         @test_throws "absent-dim `missing` sentinel" Tables.schema(absentfield)
     end
 
+    # `showable(MIME"text/html"(), x)` is the branch HTMX's builder loop takes before
+    # falling back to `print(io, child)`, so these methods are the whole of "automatic
+    # rich display". Every preview is bounded -- a display method must never densify.
+    @testset "rich HTML display is automatic, escaped, and bounded" begin
+        html(x) = sprint(show, MIME"text/html"(), x)
+
+        X = TreeData(randn(4, 3), :draw, :param)
+        @test showable(MIME"text/html"(), X)          # the chokepoint
+        @test occursin("<code>draw</code>", html(X)) && occursin("<code>param</code>", html(X))
+        @test occursin("TreeArray", html(X))
+
+        # coords carrying HTML metacharacters must not break the DOM below the node
+        Xesc = TreeData(randn(2), TreeDim(:tag, ("<b>&x", "y")))
+        @test occursin("&lt;b&gt;&amp;x", html(Xesc))
+        @test !occursin("<b>", html(Xesc))
+
+        # a record: one collapsible section per field, outer_dim labelled `record`
+        Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
+        @test count("<details>", html(Xnt)) == 2
+        @test occursin("record", html(Xnt))
+
+        # ragged: bounded leaf preview that SAYS how many it skipped (never silent)
+        hr = html(TreeData([TreeData(randn(2, 3), :time, :chan) for _ in 1:5], :subject))
+        @test count("<details>", hr) == TreeArrays._MAX_LEAVES
+        @test occursin("2 more leaves", hr)
+
+        # TreeTable renders real rows off the lazy melt, capped and self-announcing
+        big = TreeData(reshape(1.0:150.0, 50, 3), :draw, :param)
+        ht = html(TreeTable(big))
+        @test occursin("150 rows", ht) && occursin("showing the first 20", ht)
+        @test count("<tr>", ht) == TreeArrays._MAX_ROWS + 1        # header + body
+
+        hs = html(TreeTable(TreeData(reshape(1.0:6.0, 2, 3), :draw, :param)))
+        @test occursin("6 rows", hs) && !occursin("showing the first", hs)
+        @test count("<tr>", hs) == 7
+
+        # the unbuilt wide-pivot still throws here -- display is not where a known
+        # gap gets to silently render the wrong (long) shape
+        @test_throws ErrorException html(TreeTable(big; wide=:param))
+    end
+
 end
