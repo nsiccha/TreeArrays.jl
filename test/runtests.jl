@@ -143,6 +143,43 @@ end
         @test (try; setdim((:draw, :param); foo=:bar); false; catch; true; end)  # was: bare error() with no message
     end
 
+    @testset "selectdim — restrict a named axis by a label predicate (snag named-axis-label)" begin
+        # Reporter's exact shape: TreeData(mat, :draw, :chain, :param => names); :draw/:chain unlabelled.
+        axvals(x, i) = TreeArrays.meta(TreeArrays.dims(x)[i]).values
+        names = vcat(["unit_params_covariate_effects.$i" for i in 1:5], ["sigma", "lp__", "beta"])
+        mat   = reshape(collect(1.0:(6*2*8)), 6, 2, 8)
+        X     = TreeData(mat, :draw, :chain, :param => names)
+        pat   = r"^unit_params_covariate_effects\."
+        mask  = map(contains(pat), names)                       # what draws_core's subdf_pattern computes
+
+        # Regex — the subdf(pattern::Regex) case: sub-tree over the matched labels, others intact.
+        Y = selectdim(X, :param => pat)
+        @test parent(Y) isa SubArray && parent(Y) == mat[:, :, mask]        # NO data copy: a view
+        @test parent(Y).parent === mat                                     # shares the original's memory
+        @test collect(axvals(Y, 3)) == names[mask]
+        @test size(parent(Y)) == (6, 2, 5)
+        @test map(TreeArrays.name, TreeArrays.dims(Y)) == (:draw, :chain, :param)   # other axes intact
+
+        @test parent(selectdim(X, :param, pat)) == parent(Y)               # 3-arg form == Pair form
+        @test all(startswith("sigma"), axvals(selectdim(X, :param => startswith("sigma")), 3))
+        @test parent(selectdim(X, :param => mask)) == mat[:, :, mask]       # explicit Bool mask
+        @test parent(selectdim(X, :param => [8, 1])) == mat[:, :, [8, 1]]   # explicit integer index (reorder)
+        @test size(parent(selectdim(X, :chain => [1]))) == (6, 1, 8)       # positional select of an UNLABELLED axis
+        @test size(parent(selectdim(X, :param => r"^nomatch"))) == (6, 2, 0)   # empty match = zero-width axis, no error
+
+        # loud, never silently wrong:
+        @test_throws "no axis named" selectdim(X, :prm => pat)                    # typo
+        @test_throws "ambiguous" selectdim(X, :param => "beta")                   # bare String
+        @test_throws "must return Bool" selectdim(X, :param => (s -> length(s)))  # predicate returns Int
+        @test_throws "Bool mask has length" selectdim(X, :param => [true, false]) # wrong-length mask
+        @test_throws "unlabelled axis" selectdim(X, :draw => pat)                 # Regex on an unlabelled axis
+
+        # Tuple axis stays a Tuple; select ∘ reduce chains and stays a TreeData.
+        T = TreeData(randn(3, 4), :a => (:x, :y, :z), :b)
+        @test axvals(selectdim(T, :a => in((:x, :z))), 1) === (:x, :z)
+        @test size(parent(mean(selectdim(X, :param => pat); dims = :draw))) == (2, 5)
+    end
+
     @testset "outer_dim survives TreeData-forwarding" begin
         Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
         Y = TreeData(Xnt, TreeDim(:extra, nothing))
