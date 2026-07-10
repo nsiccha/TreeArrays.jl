@@ -34,6 +34,16 @@ function _tt_median_draws(; n_draws=6, n_cols=5)
     quantile(input_draws, TreeDim(:median, 0.5); dims=:draw)
 end
 
+# an index-backed outer axis: each leaf is BUILT on `getindex`, so indexing it is observable.
+struct _LazyLeaves{T,F} <: AbstractVector{T}
+    n::Int
+    f::F
+end
+_LazyLeaves(n, f) = _LazyLeaves{typeof(f(1)),typeof(f)}(n, f)
+Base.size(L::_LazyLeaves) = (L.n,)
+Base.IndexStyle(::Type{<:_LazyLeaves}) = IndexLinear()
+Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
+
 @testset "TreeArrays" begin
 
     @testset "sum(X) default + TreeArray array interface" begin
@@ -873,6 +883,33 @@ end
         # _MAX_COORDS chars, so only the ELEMENT elision can mark the drop.
         shortsyms = TreeData(randn(2), TreeDim(:p, ntuple(i -> Symbol('a' + i - 1), 13)))
         @test occursin("… 5 more", html(shortsyms))
+    end
+
+    @testset "outer-axis reduce indexes a lazy parent once per leaf" begin
+        # `TreeRaggedArray`'s `P<:AbstractArray{<:TreeData}` admits an index-backed parent that
+        # builds its leaves on `getindex`. An outer-axis reduce must walk that parent ONCE per
+        # leaf: an inner-major gather rebuilds each leaf `length(leaf)` times, which is silent
+        # (correct values, no error) and scales with exactly the size that motivates laziness.
+        builds = Ref(0)
+        Xl = TreeData(_LazyLeaves(4, i -> (builds[] += 1; TreeData(fill(Float64(i), 25), :row))), :boot)
+        @test Xl isa TreeRaggedArray
+
+        builds[] = 0
+        r = mapslices(sum, Xl; dims=:boot)
+        @test builds[] == 4                                   # == n_boot, NOT 1 + 25*4
+        @test parent(r) == fill(Float64(sum(1:4)), 25)        # and the values are right
+
+        # the count must not track the INNER length -- that is the regression that bit Bruno.
+        for n_inner in (25, 50, 100)
+            Xn = TreeData(_LazyLeaves(4, i -> (builds[] += 1; TreeData(fill(Float64(i), n_inner), :row))), :boot)
+            builds[] = 0
+            mapslices(sum, Xn; dims=:boot)
+            @test builds[] == 4
+        end
+
+        # an eager parent must be untouched by the same code path
+        Xe = TreeData([TreeData(fill(Float64(i), 25), :row) for i in 1:4], :boot)
+        @test parent(mapslices(sum, Xe; dims=:boot)) == parent(r)
     end
 
 end
