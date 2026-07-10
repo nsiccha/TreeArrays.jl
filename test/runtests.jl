@@ -1332,22 +1332,69 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         #     drop their tails. Previously returned a plausible 3x3 matrix with no error.
         @test_throws "not conformable" mean(subj; dims=:subject)
 
-        # (b) `dims=` straddling the ragged boundary: previously reduced ONLY :subject and
-        #     handed back a result whose :draw axis was still live.
-        @test_throws "ragged nesting boundary" mean(subj; dims=(:draw, :subject))
-        @test_throws "ragged nesting boundary" quantile(subj, TreeDim(:r, (0.5,)); dims=(:draw, :subject))
+        # (b) `dims=` straddling the ragged boundary while a KEPT inner axis is itself ragged
+        #     (here :time is kept and has lengths 3/5/4): the pooled result cannot be rectangular,
+        #     so the conformability check on the kept axes refuses it by name.
+        @test_throws "not conformable" mean(subj; dims=(:draw, :subject))
+        @test_throws "not conformable" quantile(subj, TreeDim(:r, (0.5,)); dims=(:draw, :subject))
 
-        # the LEGAL flow (skill §8) is untouched: collapse the ragged inner axis, THEN the
-        # outer one -- and the straddle still refuses even once leaves are conformable,
-        # because pooling is not the composition of two reductions.
-        step1 = mapslices(maximum, subj; dims=:time)
+        # the LEGAL chained flow (skill §8) is untouched: collapse the ragged inner axis, THEN
+        # reduce the outer one.
+        step1 = mapslices(maximum, subj; dims=:time)   # -> (subject -> (draw,)), conformable
         @test collect(parent(mean(step1; dims=:subject))) ≈
               [mean([maximum(mat[d, idx[s]]) for s in 1:3]) for d in 1:3]
-        @test_throws "ragged nesting boundary" mean(step1; dims=(:draw, :subject))
 
-        # a purely-inner multi-dim reduce never reaches the boundary check
+        # ...and once the kept axes ARE conformable, a straddle now POOLS across the ragged
+        # boundary (snag pooled-reduce-ov): pool :draw AND :subject into one bag -- identical to
+        # the dense equivalent, NOT the composition of two reductions. (Was refused pre-a4734df9.)
+        @test parent(mean(step1; dims=(:draw, :subject))) ≈
+              mean([maximum(mat[d, idx[s]]) for d in 1:3, s in 1:3])
+
+        # a purely-inner multi-dim reduce never reaches the straddle path
         wide = TreeData([TreeData(randn(3, 4, 2), :draw, :time, :chan) for _ in 1:3], :subject)
         @test mapslices(mean, wide; dims=(:time, :chan)) isa TreeData
+    end
+
+    # Pooled reduce that STRADDLES a ragged nesting boundary (snag pooled-reduce-ov-a4734df9,
+    # reporter Bruno:treearrays): `dims=(:draw,:chain)` on a `(chain -> (draw,param))` ragged tree
+    # pools ALL draws x chains per param -- the shape a pooled posterior CI needs from per-chain
+    # @mmap'd matrices held as a lazy collection (never hcat'd into a dense block). The anchor: it
+    # must equal, byte-for-byte, the DENSE `TreeData(A, :draw,:chain,:param)` reduce (which the
+    # pooled-reduce testset above already pins against base-Julia).
+    @testset "pooled reduce across a ragged nesting boundary (dims straddle)" begin
+        ps = (0.025, 0.5, 0.975)
+        nchain, ndraw, nparam = 4, 40, 3
+        A = randn(ndraw, nchain, nparam)
+        dense  = TreeData(A, :draw, :chain, :param => (:a, :b, :c))
+        ragged = TreeData([TreeData(A[:, c, :], :draw, :param => (:a, :b, :c)) for c in 1:nchain], :chain)
+        @test ragged isa TreeArrays.TreeRaggedArray
+
+        r_ragged = quantile(ragged, TreeDim(:ribbon, ps); dims=(:draw, :chain))
+        r_dense  = quantile(dense,  TreeDim(:ribbon, ps); dims=(:draw, :chain))
+        for j in 1:nparam   # byte-identical to the dense reduce AND to the base-Julia pool
+            @test collect(parent(parent(r_ragged)[j])) == collect(parent(parent(r_dense)[j]))
+            @test collect(parent(parent(r_ragged)[j])) == quantile(vec(A[:, :, j]), collect(ps))
+        end
+        # kept :param live; :draw + :chain sliced ghosts (same dim SET as the dense reduce)
+        @test map(TreeArrays.name, TreeArrays.dims(r_ragged)) == (:param, :draw, :chain)
+
+        # mean/sum + both wide spellings pool identically; reducing EVERY axis -> one leaf
+        @test all(parent(mean(ragged; dims=(:draw, :chain)))[j] ≈ mean(vec(A[:, :, j])) for j in 1:nparam)
+        @test all(parent(sum(ragged;  dims=(:draw, :chain)))[j] ≈ sum(vec(A[:, :, j]))  for j in 1:nparam)
+        rp = quantile(ragged, :band => (lo=0.025, med=0.5); dims=(:draw, :chain))
+        @test parent(parent(rp)[1])[2] ≈ quantile(vec(A[:, :, 1]), 0.5)
+        rw = nanquantile(ragged, (median=0.5, lo=0.025); dims=(:draw, :chain))
+        @test parent(parent(rw)[1]).median ≈ quantile(vec(A[:, :, 1]), 0.5)
+        @test collect(parent(quantile(ragged, TreeDim(:ribbon, ps); dims=(:draw, :chain, :param)))) ==
+              quantile(vec(A), collect(ps))
+
+        # the per-chain backing matrices are REFERENCED, not copied into a pooled block
+        @test parent(parent(ragged)[1]) === parent(parent(ragged)[1])
+
+        # KEPT outer axis (a 2-D grid of ragged cells: pool :chain, keep :grp) is still
+        # unimplemented -> throws by name rather than answer a partial pool
+        grid = TreeData([TreeData(randn(5, 3), :draw, :param) for _ in 1:6, _ in 1:2], :chain, :grp)
+        @test_throws "KEEPING part of this node's outer axis" mean(grid; dims=(:draw, :chain))
     end
 
 

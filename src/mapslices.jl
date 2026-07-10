@@ -308,33 +308,63 @@ Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims)
     _mapslices(f, X, valwant)
 end
 function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}) where want
-    _assertnostraddle(X, valwant)
+    _isstraddle(X, valwant) && return _pooledstraddle(f, X, valwant)   # outer axis + named leaf-inner dims: pool
     r = _reduceouter(f, X, valwant)
     isnothing(r) || return r
     TreeData(map(el -> _mapslices(f, el, valwant), parent(X)), meta(X))   # `_mapslices`: children never re-assert
 end
 
-# A multi-dim `dims=` that names BOTH this ragged node's outer axis AND a dim living inside
-# its leaves cannot be served by the gather-loop: the gather pools along the outer axis at
-# FIXED inner positions, so `_reduceouter` reduces the outer axis, returns, and the inner
-# names are never reduced at all -- the result claims the outer dim is sliced while the inner
-# one is still a live axis. That is `foundany`, not `foundall`: a silent under-reduction.
-# A genuine joint pooled reduce across a ragged nesting boundary is a real (unimplemented)
-# operation, not a bug in the caller's spelling -- so refuse it by name rather than answer
-# wrongly. Reducing purely-inner dims is unaffected (it never reaches `_reduceouter`).
-function _assertnostraddle(X::TreeRaggedArray, ::Val{want}) where want
+# A `dims=` that names BOTH this ragged node's outer axis AND a dim living inside its leaves is a
+# STRADDLE. The plain gather-loop cannot serve it directly -- it pools along the outer axis at FIXED
+# inner positions, so it would reduce the outer axis and leave the named inner one a LIVE axis
+# (`foundany`, not `foundall`: a silent under-reduction). But the straddle is a real, well-defined
+# operation, not a caller mistake: it is exactly what the DENSE reduce
+# `TreeData(arr, :draw,:chain,:param=>…); dims=(:draw,:chain)` already computes -- `eachslice` over the
+# KEPT axes hands the kernel the whole pooled (draw x chain) slice per kept index (see the pooled-reduce
+# testset). The only reason a ragged nesting couldn't was that it was UNIMPLEMENTED. `_pooledstraddle`
+# implements it as a STREAMING pooled gather (peak = ONE kept-index's pooled slice; the per-leaf backing
+# arrays are referenced, never copied or stacked), so a consumer holding per-chain @mmap'd matrices as a
+# `(chain -> (draw,param))` tree pools across chains WITHOUT an eager `hcat` into a dense block. A
+# purely-inner reduce never reaches here (the recursion in `_mapslices` handles it).
+_isstraddle(X::TreeRaggedArray, ::Val{want}) where want = begin
     alldims = TreeArrays.dims(X)
-    here    = map(name, alldims)
     outer   = ntuple(i -> name(alldims[i]), ndims(parent(X)))
-    any(nm -> nm in outer, want) || return nothing      # purely-inner reduce: recursion handles it
-    straddle = filter(nm -> !(nm in here), want)
-    isempty(straddle) && return nothing
-    throw(ArgumentError(
-        "cannot jointly reduce dims " * string(want) * " across a ragged nesting boundary: " *
-        string(outer) * " is this node's outer axis, while " * string(straddle) * " lives " *
-        "inside its leaves. Reduce the inner dim(s) first, then the outer axis -- a chained " *
-        "reduction, not a pooled one (they differ: pooling is not the composition of two " *
-        "reductions). A pooled reduce that straddles a ragged boundary is not implemented."))
+    any(nm -> nm in outer, want) || return false          # outer axis not reduced here: not a straddle
+    any(nm -> !(nm in map(name, alldims)), want)          # ...and some named dim lives inside the leaves
+end
+
+# Pool this ragged node's OUTER axis together with the named LEAF-INNER dims, keeping the un-named inner
+# axes. v1 serves the shape a pooled posterior summary needs: a single-level ragged nesting of
+# CONFORMABLE, array-backed leaves, with EVERY outer axis reduced. The harder shapes -- a KEPT outer axis,
+# record/tuple/doubly-ragged leaves, non-conformable leaves -- each throw BY NAME rather than answer a
+# partial or wrong pool (the never-silently-wrong discipline, decisions 16fwcnx / 1iy1r57).
+function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}) where want
+    alldims = TreeArrays.dims(X)
+    n_outer = ndims(parent(X))
+    outer   = ntuple(i -> alldims[i], n_outer)
+    all(d -> name(d) in want, outer) || throw(ArgumentError(
+        "cannot pool dims " * string(want) * " across a ragged boundary while KEEPING part of this node's " *
+        "outer axis " * string(map(name, outer)) * ": keeping one outer axis while pooling another across " *
+        "the nesting is not implemented. Reduce every outer axis, or split the tree."))
+    isempty(parent(X)) && _emptyreduce(parent(X))
+    els   = collect(parent(X))                            # one pass over the outer axis (references, no copy)
+    proto = first(els)
+    p     = parent(proto)
+    p isa AbstractArray || throw(ArgumentError(
+        "cannot pool dims " * string(want) * " across a ragged boundary: its leaves are " * string(typeof(proto)) *
+        ", not array-backed. Pooling across a record / tuple / doubly-ragged leaf is not implemented -- " *
+        "reduce the inner dim(s) first, then the outer axis."))
+    _assertconformable(els, size(p))                      # the KEPT inner axes must match across leaves
+    keepaxes, keptdims, trailing, _ = _splitdims(TreeArrays.dims(proto), Val(ndims(p)), Val(want))
+    ps     = map(parent, els)                             # the leaves' own backing arrays -- never stacked
+    ghosts = (trailing..., map(sliced, outer)..., alldims[n_outer+1:end]...)   # reduced inner + outer, sliced
+    if isempty(keepaxes)                                  # every inner axis reduced too: one fully-pooled leaf
+        _assemble(_leafreduce(f, reduce(vcat, (vec(P) for P in ps))), keptdims, ghosts)
+    else                                                  # keep the un-named inner axes; pool per kept index
+        sls  = map(P -> _eachslice(P, Val(keepaxes)), ps)
+        outs = map(i -> _leafreduce(f, reduce(vcat, (vec(sl[i]) for sl in sls))), CartesianIndices(first(sls)))
+        _assemble(outs, keptdims, ghosts)
+    end
 end
 
 # wrap `outs` (the raw per-slice kernel outputs -- already TreeData/record/scalar pieces,
