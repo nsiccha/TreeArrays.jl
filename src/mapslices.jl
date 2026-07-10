@@ -122,11 +122,31 @@ _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
     proto = first(els)
     p = parent(proto)
     p isa AbstractArray || return _leafreduce(f, map(parent, els))  # scalar leaf: reduce directly, no positions
-    ps = map(parent, els)
+    _assertconformable(els, size(p))   # `els`, never `sl`: re-walking a lazy outer axis is
+    ps = map(parent, els)              # exactly the cost `fcb3f9a` removed
     vals = map(i -> _leafreduce(f, map(P -> P[i], ps)), CartesianIndices(p))
     TreeData(vals, meta(proto))
 end
 _leafreduce(f, sl::AbstractArray) = f(sl)
+
+# The gather above indexes EVERY leaf with `CartesianIndices` of the FIRST leaf's parent. If
+# the leaves have different shapes -- a genuinely ragged nesting whose inner axis was never
+# collapsed -- that reads the wrong cells out of the longer leaves and drops their tail
+# entirely, returning a plausible-looking wrong answer with no error at all. Reducing a ragged
+# OUTER axis is only meaningful once the leaves are conformable (treearrays-use §8: collapse
+# the inner ragged axis FIRST, which is what makes the subsequent outer reduce dense). Say so.
+function _assertconformable(sl, sz)
+    for (j, el) in pairs(sl)
+        p = parent(el)
+        p isa AbstractArray && size(p) == sz && continue
+        got = p isa AbstractArray ? string(size(p)) : "a scalar leaf"
+        throw(DimensionMismatch(
+            "cannot reduce the outer axis of a ragged tree whose leaves are not conformable: " *
+            "leaf 1 has size " * string(sz) * " but leaf " * string(j) * " has " * got * ". " *
+            "Collapse the ragged inner axis first (e.g. `mapslices(f, X; dims=:time)`), then " *
+            "reduce the outer axis."))
+    end
+end
 
 Base.@constprop :aggressive Base.mapslices(f, X::TreeArray; dims) = _mapslices(f, X, Val(_dimnames(dims)))
 function _mapslices(f, X::TreeArray, valwant::Val{want}) where want
@@ -185,9 +205,33 @@ end
 
 Base.@constprop :aggressive Base.mapslices(f, X::TreeRaggedArray; dims) = _mapslices(f, X, Val(_dimnames(dims)))
 function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}) where want
+    _assertnostraddle(X, valwant)
     r = _reduceouter(f, X, valwant)
     isnothing(r) || return r
     TreeData(map(el -> mapslices(f, el; dims=want), parent(X)), meta(X))
+end
+
+# A multi-dim `dims=` that names BOTH this ragged node's outer axis AND a dim living inside
+# its leaves cannot be served by the gather-loop: the gather pools along the outer axis at
+# FIXED inner positions, so `_reduceouter` reduces the outer axis, returns, and the inner
+# names are never reduced at all -- the result claims the outer dim is sliced while the inner
+# one is still a live axis. That is `foundany`, not `foundall`: a silent under-reduction.
+# A genuine joint pooled reduce across a ragged nesting boundary is a real (unimplemented)
+# operation, not a bug in the caller's spelling -- so refuse it by name rather than answer
+# wrongly. Reducing purely-inner dims is unaffected (it never reaches `_reduceouter`).
+function _assertnostraddle(X::TreeRaggedArray, ::Val{want}) where want
+    alldims = TreeArrays.dims(X)
+    here    = map(name, alldims)
+    outer   = ntuple(i -> name(alldims[i]), ndims(parent(X)))
+    any(nm -> nm in outer, want) || return nothing      # purely-inner reduce: recursion handles it
+    straddle = filter(nm -> !(nm in here), want)
+    isempty(straddle) && return nothing
+    throw(ArgumentError(
+        "cannot jointly reduce dims " * string(want) * " across a ragged nesting boundary: " *
+        string(outer) * " is this node's outer axis, while " * string(straddle) * " lives " *
+        "inside its leaves. Reduce the inner dim(s) first, then the outer axis -- a chained " *
+        "reduction, not a pooled one (they differ: pooling is not the composition of two " *
+        "reductions). A pooled reduce that straddles a ragged boundary is not implemented."))
 end
 
 # wrap `outs` (the raw per-slice kernel outputs -- already TreeData/record/scalar pieces,

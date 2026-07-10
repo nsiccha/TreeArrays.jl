@@ -1223,4 +1223,94 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test parent(mapslices(sum, Xe; dims=:boot)) == parent(r)
     end
 
+    # Bruno asked whether `quantile`/`nanquantile`'s `dims=` takes a COLLECTION, to pool
+    # draws AND subjects in one pass (the `combine(groupby(df, [:dose, :study]), :qoi =>
+    # quantile)` shape). It always has -- `_dimnames(dims) = Tuple(dims)` -- but NOTHING
+    # pinned it, which is exactly why the capability's status was unknowable from outside.
+    # Pin the contract: a multi-dim reduce is JOINT/POOLED (one bag, one sorted pass), not
+    # the composition of two reductions.
+    @testset "dims= accepts a collection: joint pooled reduce over several axes" begin
+        ps = (0.025, 0.25, 0.5, 0.75, 0.975)
+        A  = randn(40, 6, 3)
+        X  = TreeData(A, :draw, :subject, :time => 1:3)
+
+        # the kernel sees the whole (draw x subject) block, not a vector
+        shp = mapslices(sl -> (ndims(sl), size(sl)), X; dims=(:draw, :subject))
+        @test parent(shp)[1] == (2, (40, 6))
+
+        # pooled == base-Julia quantile of the flattened block, EXACTLY
+        r = quantile(X, TreeDim(:ribbon, ps); dims=(:draw, :subject))
+        for t in 1:3
+            @test collect(parent(parent(r)[t])) == quantile(vec(A[:, :, t]), collect(ps))
+        end
+        # ... and pooling is NOT quantile-of-quantiles: the two genuinely differ
+        seq = [quantile([quantile(A[:, s, t], 0.5) for s in 1:6], 0.5) for t in 1:3]
+        @test seq != [quantile(vec(A[:, :, t]), 0.5) for t in 1:3]
+
+        @test all(parent(mean(X; dims=(:draw, :subject)))[t] ≈ mean(vec(A[:, :, t])) for t in 1:3)
+        @test all(parent(sum(X; dims=(:draw, :subject)))[t] ≈ sum(vec(A[:, :, t])) for t in 1:3)
+
+        # a Vector of names works as well as a Tuple; reducing EVERY axis yields one leaf
+        rv = quantile(X, TreeDim(:ribbon, ps); dims=[:draw, :subject])
+        @test collect(parent(parent(rv)[1])) == collect(parent(parent(r)[1]))
+        @test collect(parent(quantile(X, TreeDim(:ribbon, ps); dims=(:draw, :subject, :time)))) ==
+              quantile(vec(A), collect(ps))
+
+        # reduced dims survive as ghosts, in dim order; kept axes stay live
+        @test map(TreeArrays.name, TreeArrays.dims(r)) == (:time, :draw, :subject)
+
+        # NaN-safe twin: same pooling, NaNs dropped from the pooled bag
+        B = copy(A); B[1, 1, 1] = NaN
+        rn = nanquantile(TreeData(B, :draw, :subject, :time => 1:3), TreeDim(:ribbon, ps);
+                         dims=(:draw, :subject))
+        for t in 1:3
+            @test collect(parent(parent(rn)[t])) == quantile(filter(!isnan, vec(B[:, :, t])), collect(ps))
+        end
+
+        # both wide forms accept the collection too
+        rw = nanquantile(X, (median=0.5, lo=0.025); dims=(:draw, :subject))
+        @test parent(parent(rw)[1]).median ≈ quantile(vec(A[:, :, 1]), 0.5)
+        rp = quantile(X, :band => (lo=0.025, med=0.5); dims=(:draw, :subject))
+        @test parent(parent(rp)[1])[2] ≈ quantile(vec(A[:, :, 1]), 0.5)
+
+        # a multi-dim reduce composes with a prior reduction's ghost dims
+        C  = randn(12, 5, 4, 2)
+        Xc = TreeData(C, :draw, :subject, :time => 1:4, :dose => [1, 2])
+        r2 = quantile(mapslices(maximum, Xc; dims=:time), TreeDim(:ribbon, ps); dims=(:draw, :subject))
+        qoi = [maximum(C[d, s, :, k]) for d in 1:12, s in 1:5, k in 1:2]
+        for k in 1:2
+            @test collect(parent(parent(r2)[k])) == quantile(vec(qoi[:, :, k]), collect(ps))
+        end
+    end
+
+    # The gather-loop indexes every leaf with the FIRST leaf's CartesianIndices, and
+    # `_reduceouter` stops once it has reduced this node's outer axis. Both silently produced
+    # a wrong answer; both must now name the problem instead.
+    @testset "ragged reduces refuse the shapes they cannot serve (never silently wrong)" begin
+        mat  = reshape(collect(1.0:36.0), 3, 12)
+        idx  = [1:3, 4:8, 9:12]          # subject time-lengths 3, 5, 4 -- genuinely ragged
+        subj = TreeData(map(s -> TreeData(view(mat, :, idx[s]), :draw, :time), 1:3), :subject)
+
+        # (a) non-conformable leaves: the gather would read the wrong cells of leaves 2,3 and
+        #     drop their tails. Previously returned a plausible 3x3 matrix with no error.
+        @test_throws "not conformable" mean(subj; dims=:subject)
+
+        # (b) `dims=` straddling the ragged boundary: previously reduced ONLY :subject and
+        #     handed back a result whose :draw axis was still live.
+        @test_throws "ragged nesting boundary" mean(subj; dims=(:draw, :subject))
+        @test_throws "ragged nesting boundary" quantile(subj, TreeDim(:r, (0.5,)); dims=(:draw, :subject))
+
+        # the LEGAL flow (skill §8) is untouched: collapse the ragged inner axis, THEN the
+        # outer one -- and the straddle still refuses even once leaves are conformable,
+        # because pooling is not the composition of two reductions.
+        step1 = mapslices(maximum, subj; dims=:time)
+        @test collect(parent(mean(step1; dims=:subject))) ≈
+              [mean([maximum(mat[d, idx[s]]) for s in 1:3]) for d in 1:3]
+        @test_throws "ragged nesting boundary" mean(step1; dims=(:draw, :subject))
+
+        # a purely-inner multi-dim reduce never reaches the boundary check
+        wide = TreeData([TreeData(randn(3, 4, 2), :draw, :time, :chan) for _ in 1:3], :subject)
+        @test mapslices(mean, wide; dims=(:time, :chan)) isa TreeData
+    end
+
 end
