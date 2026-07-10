@@ -89,13 +89,22 @@ _leafmeta(proto::TreeNamedTuple) = (;dims = TreeArrays.dims(proto), outer_dim = 
 # record); if a future path builds a TreeTuple WITH one, this drops it silently -- widen
 # this method (not a bespoke special case) if that ever becomes real.
 _leafmeta(proto::TreeTuple)      = (;dims = TreeArrays.dims(proto))
+# Reducing an axis of length 0 whose elements are THEMSELVES TreeData: the gather has no
+# leaf to push `f` into, and no prototype to rebuild the node's structure from. Unlike a
+# zero-length NUMERIC slice (which `f` handles itself -- `nanquantile` of an empty slice is
+# NaN, by NaNStatistics' convention), there is no value to invent here without a design
+# call. Say so, instead of a bare `BoundsError` from `first` (snag: empty/zero-leaf).
+_emptyreduce(sl) = error("TreeArrays: cannot reduce a length-0 axis whose elements are TreeData (got a $(typeof(sl)) of $(length(sl))) -- there is no leaf to push the reduction into. Reduce a dim of the LEAVES instead, and keep the empty axis (it melts to zero rows).")
+
 _leafreduce(f, sl::AbstractArray{<:Union{TreeNamedTuple,TreeTuple}}) = begin
+    isempty(sl) && _emptyreduce(sl)
     proto = first(sl)
     ks = keys(parent(proto))
     fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl)), ks)
     TreeData(_reassemble(parent(proto), fields), _leafmeta(proto))
 end
 _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
+    isempty(sl) && _emptyreduce(sl)
     proto = first(sl)
     p = parent(proto)
     p isa AbstractArray || return _leafreduce(f, map(parent, sl))  # scalar leaf: reduce directly, no positions

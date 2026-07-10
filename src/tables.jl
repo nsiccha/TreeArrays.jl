@@ -96,7 +96,15 @@ end
 # abstract `NamedTuple` and the next line died with "type NamedTuple has no field dims" --
 # an internal error where this adapter promises a clear one everywhere else.
 function _schema(::Type{T}) where T<:TreeData
-    isconcretetype(T) || error("TreeArrays Tables adapter: sibling TreeData elements have inconsistent TYPES ($T) -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
+    # `T` non-concrete has exactly two causes, and consumers hit both. Name them, rather
+    # than letting the accessors below die with Base's "type NamedTuple has no field dims".
+    #   (a) RAGGED: siblings whose axis lengths differ AS TYPES (a `:dose_mg` axis of
+    #       `(10, 20)` beside one of `(20,)`) widen `[a, b]` to a non-concrete eltype.
+    #       Siblings differing only in SIZE share a type and are caught later, on the
+    #       instance, by `_rowdims` -- which is why this flavour hid for so long.
+    #   (b) EMPTY: `TreeData(TreeData[], ...)`, the natural-looking empty container, erases
+    #       the child structure this walk reads.
+    isconcretetype(T) || error("TreeArrays Tables adapter: `$T` is not a concrete TreeData type. Either sibling TreeData elements have inconsistent TYPES -- ragged trees are not a supported Tables shape yet (regular/rectangular only) -- or an empty container was spelled `TreeData(TreeData[], ...)` instead of carrying its element type (`TreeData(typeof(leafproto)[], :assay_name => String[])`)")
     P = fieldtype(T, :parent)
     alldims = Tuple(fieldtype(fieldtype(T, :meta), :dims).parameters)
     names, types = _ownschema(T, P, alldims)
@@ -353,6 +361,36 @@ _valueat_node(p, idx::Tuple, fieldpath::Tuple) = p                              
 _valueat_field(v::TreeData, idx::Tuple, fieldpath::Tuple) = _valueat(v, idx, fieldpath)
 _valueat_field(v, idx::Tuple, fieldpath::Tuple) = v
 
+# ---- zero-row trees: the empty ragged nesting. ----
+#      `_rowdims`, `_coordsig` and `_buildcolumns` each descend through ONE
+#      REPRESENTATIVE child (`first(p)`) at every array/tuple-of-TreeData
+#      boundary. An EMPTY such boundary -- what a product-mapped sweep must
+#      emit for a cell with no data, `TreeData(typeof(leaf)[], :assay => String[])`
+#      -- has no representative, so each of those `first` calls threw a bare
+#      `BoundsError`. TreeArrays PRODUCES this value itself: reducing the
+#      perfectly meltable `TreeData(Float64[], :assay => String[])` over any dim
+#      yields an empty ragged array its OWN melt then could not consume.
+#
+#      An empty node contributes ZERO rows, and zero rows need no coordinates at
+#      all -- only column NAMES and TYPES, which `_schema` already derives from
+#      the TYPE alone. So the instance walk only has to stay TOTAL and report the
+#      right row ARITY: `_zerodims` mirrors `_rowdims`'s recursion over the
+#      element TYPE, emitting a 0 for every row-varying slot. An empty node's
+#      child EXTENTS are genuinely unknowable (an array's size is not in its
+#      type) and also irrelevant -- `prod(rowdims) == 0` either way, so no row
+#      index is ever decoded through them. Only the arity matters, and that IS
+#      in the type.
+_zerodims(::Type{T}) where T<:TreeData = _zerodims_node(_parentof(T))
+_zerodims_node(::Type{P}) where P<:AbstractArray{<:TreeData} = (ntuple(_ -> 0, _nax(P))..., _zerodims(eltype(P))...)
+_zerodims_node(::Type{P}) where P<:Tuple{TreeData,Vararg{TreeData}} = (0, _zerodims(eltype(P))...)   # "at least one" -- see `_eltype` (types.jl)
+_zerodims_node(::Type{P}) where P<:AbstractArray = ntuple(_ -> 0, _nax(P))
+_zerodims_node(::Type{P}) where P<:Tuple = (0,)
+_zerodims_node(::Type{P}) where P<:NamedTuple = _zerodims_field(fieldtype(P, 1))   # wide emit: a record adds no row-dim
+_zerodims_node(::Type{P}) where P<:TreeData = _zerodims(P)                          # bookkeeping wrapper
+_zerodims_node(::Type{P}) where P = ()                                              # scalar leaf terminal
+_zerodims_field(::Type{F}) where F<:TreeData = _zerodims(F)
+_zerodims_field(::Type{F}) where F = ()
+
 # ---- rowdims: one integer per row-varying dim (real axes + record-key
 #      "axes"), in nesting order (outermost first). Row index i (1-based,
 #      1:prod(rowdims)) maps to a per-level position tuple via native
@@ -417,6 +455,8 @@ _rowdims_node(p::TreeData) = _rowdims(p)     # bookkeeping wrapper -- 0 own dims
 _rowdims_node(p) = ()                         # scalar leaf terminal
 
 function _rowdims_node(p::AbstractArray{<:TreeData})
+    # no representative, and none needed -- `size(p)` already carries a 0 (see `_zerodims`).
+    isempty(p) && return (size(p)..., _zerodims(eltype(p))...)
     reps = map(_rowdims, p)
     _allequal(reps) ||
         error("TreeArrays Tables adapter: sibling TreeData elements (among $(length(p))) have inconsistent shape -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
@@ -485,8 +525,11 @@ end
 _coordsig_node(X::TreeData, p::TreeData) = _coordsig(p)   # bookkeeping wrapper -- 0 own coords
 _coordsig_node(X::TreeData, p) = ()                        # scalar leaf terminal (incl. NamedTuple -- not reachable here, only `_fieldsig` walks records)
 
-_coordsig_child(p::AbstractArray{<:TreeData}) = _coordsig(first(p))   # ONE representative path down
-_coordsig_child(p::Tuple{Vararg{TreeData}}) = _coordsig(first(p))
+# an EMPTY child boundary has no representative to descend through, and no coordinates to
+# compare -- a sibling that is empty already differs from a non-empty one in `_rowdims`'s
+# SIZE check (0 vs n), which fires first and reports it as the ragged tree it is.
+_coordsig_child(p::AbstractArray{<:TreeData}) = isempty(p) ? () : _coordsig(first(p))   # ONE representative path down
+_coordsig_child(p::Tuple{Vararg{TreeData}}) = isempty(p) ? () : _coordsig(first(p))
 _coordsig_child(p::AbstractArray) = ()   # plain array leaf -- no deeper TreeData child
 _coordsig_child(p::Tuple) = ()
 
@@ -507,8 +550,8 @@ _fieldsig(x) = ()   # a non-TreeData record-field value (plain scalar) -- no coo
 
 _fieldsig_own(X::TreeData) = map(d -> name(d) => (_dimkind(d), meta(d).values), TreeArrays.dims(X))
 
-_fieldsig_child(p::AbstractArray{<:TreeData}) = _fieldsig(first(p))   # ONE representative path down
-_fieldsig_child(p::Tuple{Vararg{TreeData}}) = _fieldsig(first(p))
+_fieldsig_child(p::AbstractArray{<:TreeData}) = isempty(p) ? () : _fieldsig(first(p))   # ONE representative path down (empty -> nothing to compare, see `_coordsig_child`)
+_fieldsig_child(p::Tuple{Vararg{TreeData}}) = isempty(p) ? () : _fieldsig(first(p))
 _fieldsig_child(p::AbstractArray) = ()   # plain array leaf -- no deeper TreeData child
 _fieldsig_child(p::Tuple) = ()
 _fieldsig_child(p::NamedTuple) = _fieldsig(first(values(p)))
@@ -549,8 +592,22 @@ end
 function _buildcolumns(X::TreeData)
     rowdims = _rowdims(X)
     n = prod(rowdims; init=1)
+    n == 0 && return _emptycolumns(X)
     names, cols = _buildnode(X, X, parent(X), rowdims, 0, n)
     NamedTuple{names}(cols)
+end
+
+# Zero rows: SOME axis (or ragged nesting) below has length 0, so `_buildnode`'s
+# representative walk (`first(p)`, `first(values(fields))`) has nothing to descend into
+# at that level. It also has nothing to DO: no row index will ever be decoded. Emit the
+# type-derived schema as zero-length, concretely-typed vectors -- a lazy view column
+# carries no information at length 0, so this is not an eager densification (there is no
+# row DATA to densify), and it keeps `Tables.columns` TOTAL on every tree
+# `Tables.schema` accepts. `_schema` is type-only, so the names/types here are the exact
+# ones `Tables.schema` reports -- the two cannot drift.
+function _emptycolumns(X::TreeData)
+    names, types = _schema(typeof(X))
+    NamedTuple{names}(map(T -> T[], types))
 end
 
 function _buildnode(root::TreeData, X::TreeData, p::Union{AbstractArray,Tuple}, rowdims, offset, n, fieldpath::Tuple{Vararg{Symbol}}=())

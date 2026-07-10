@@ -1115,4 +1115,75 @@ end
         @test occursin("… 5 more", html(shortsyms))
     end
 
+    # ============ the empty / zero-leaf tree (snag: empty-zero-leaf) ============
+    # A product-mapped sweep MUST emit a leaf for every cell -- unlike a `reduce(vcat, dfs)`
+    # pool, which can simply omit an empty per-combo DataFrame. So "this cell has no data"
+    # needs a spelling that (a) reduces, and (b) melts to zero rows.
+    #
+    # Every structural walk here descends through ONE REPRESENTATIVE child (`first(p)`).
+    # An empty boundary has none, and every such site used to throw a bare `BoundsError`.
+    # The fix derives structure from the element TYPE instead, which is total.
+    @testset "empty / zero-leaf trees" begin
+        band = (; median=0.5, lower=0.05, upper=0.95)
+
+        # --- 1. a DENSE leaf with a zero-length labelled axis: already worked, pin it.
+        A = TreeData(Float64[], :assay_name => String[])
+        @test Tables.schema(A).names == (:assay_name, :value)
+        @test isempty(Tables.rowtable(A))
+
+        # --- 2. reduce that dense empty leaf -> TreeArrays produces an EMPTY RAGGED array.
+        # Its own melt must consume what its own reduce emits (this was the BoundsError).
+        B = nanquantile(TreeData(zeros(100, 0), :draw, :assay_name => String[]), :band => band; dims=:draw)
+        @test Tables.schema(B).names == (:assay_name, :band, :value)
+        @test isempty(Tables.rowtable(B))
+
+        # --- 3. a zero-length REDUCE dim is NOT a zero-row tree: no draws to summarize
+        # means NaN at every band level (NaNStatistics' all-NaN convention), 3 time x 3 band
+        # rows -- not zero rows. The two "empties" are different things.
+        C = nanquantile(TreeData(zeros(0, 3), :draw, :time => 1:3), :band => band; dims=:draw)
+        @test length(Tables.rowtable(C)) == 9
+        @test all(isnan, Tables.columntable(C).value)
+
+        # --- 4. the empty ragged nesting, spelled with a CONCRETE element type.
+        leafproto = TreeData(zeros(100, 3), :draw, :time => 1:3)
+        E = TreeData(typeof(leafproto)[], :assay_name => String[])
+        @test TreeArrays._eltype(E) === Float64            # from the TYPE -- no `first` to read
+        @test isempty(Tables.rowtable(E))
+        @test isempty(Tables.rowtable(nanquantile(E, :band => band; dims=:draw)))
+
+        # --- 5. a product map where EVERY cell is empty -> zero rows, schema intact.
+        mkcell(n) = TreeData([TreeData(randn(100, 3), :draw, :time => 1:3) for _ in 1:n],
+                             :assay_name => ["a$i" for i in 1:n])
+        G = TreeData([mkcell(0), mkcell(0)], :subject => ["s1", "s2"])
+        @test Tables.schema(G).names == (:subject, :assay_name, :draw, :time, :value)
+        @test isempty(Tables.rowtable(G))
+        @test isempty(Tables.rowtable(nanquantile(G, :band => band; dims=:draw)))
+
+        # --- 6. a DENSE zero-row tree reduces and melts to zero rows too (0-length axis
+        # in the middle of an otherwise dense array).
+        H = nanquantile(TreeData(randn(100, 0, 3), :draw, :subject => String[], :time => 1:3),
+                        :band => band; dims=:draw)
+        @test Tables.schema(H).names == (:subject, :time, :band, :value)
+        @test isempty(Tables.rowtable(H))
+
+        # --- 7. THE BOUNDARY. A cell with 0 assays beside a cell with 3 is a RAGGED tree,
+        # not a zero-row one: its siblings disagree on shape. No "empty spelling" can make a
+        # hole in a rectangular melt -- that is ragged melt support, a separate fast-follow.
+        # It must say so CLEARLY (it used to BoundsError).
+        F = TreeData([mkcell(3), mkcell(0)], :subject => ["s1", "s2"])
+        @test Tables.schema(F).names == (:subject, :assay_name, :draw, :time, :value)   # type-only: cannot see raggedness
+        @test_throws "ragged trees are not a supported Tables shape" Tables.columns(F)
+        @test_throws "ragged trees are not a supported Tables shape" Tables.columns(nanquantile(F, :band => band; dims=:draw))
+
+        # --- 8. reducing the length-0 axis ITSELF has no leaf to push `f` into. Unlike a
+        # zero-length NUMERIC slice (case 3), there is no value to invent -- say so.
+        @test_throws "cannot reduce a length-0 axis" mapslices(sum, E; dims=:assay_name)
+
+        # --- 9. the abstract spelling the snag reported. It erases the child structure the
+        # type walk reads, so BOTH the reduce path and the melt path must reject it by name.
+        D = TreeData(TreeData[], :assay_name => String[])
+        @test_throws "not a concrete TreeData type" Tables.schema(D)
+        @test_throws "not a concrete TreeData type" TreeArrays._eltype(D)
+    end
+
 end
