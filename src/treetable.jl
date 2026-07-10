@@ -115,11 +115,13 @@ _sanitize(v) = replace(string(v), '.' => '_')
 _levelname(::Symbol, v::Symbol) = v
 _levelname(wname::Symbol, v) = Symbol(wname, '_', _sanitize(v))
 
-# NOTE (deliberate, decision 1x7bmqd): unlike the long melt, wide-mode column
-# names come from the axis's coordinate VALUES, which live in `meta(d).values` --
-# they are not recoverable from the type. So `Tables.columns`/`schema` here read
-# the instance and are not type-inferable in their NAMES. The columns themselves
-# are still concretely-typed lazy views, which is what a Tables consumer's
+# NOTE (deliberate; awaiting user decision 1krjg6l): unlike the long melt, wide-mode
+# column names come from the axis's coordinate VALUES, which live in `meta(d).values`
+# -- they are not recoverable from the type. So `Tables.columns`/`schema` here read
+# the instance and are not type-inferable in their NAMES, relaxing the "schema from
+# the TYPE alone" invariant this file's header states. That relaxation is confined to
+# wide mode; both `wide=()` methods above stay fully type-stable. The columns
+# themselves are still concretely-typed lazy views, which is what a Tables consumer's
 # contract actually requires (aov-use §2).
 function _pivotcolumns(tt::TreeTable)
     w = _widedims(tt)
