@@ -127,10 +127,12 @@ _htmlchild(io::IO, ::MIME"text/html", v) = _predump(io, v)             # raw fie
 
 # ---- TreeTable: the tabular view renders as an actual table -------------------
 # Columns stay the lazy melt views (`ConstColumn`/`AxisColumn`/`ValueColumn`); only
-# the `_MAX_ROWS` previewed cells are ever read. A `wide=` pivot that isn't built
-# yet throws out of `Tables.columns` here exactly as it does everywhere else --
-# a display method must not be the one place a known gap renders as a silent long
-# table (htmxo-use §3.5: let errors bubble).
+# the `_MAX_ROWS` previewed cells are ever read. Orientation is whatever the view
+# was built with: a `wide=` pivot (7465185) renders its levels as columns, exactly
+# as `Tables.columns` hands them over. Nothing here special-cases a shape -- a
+# shape `Tables.columns` rejects (a ragged tree) throws straight through this
+# method too, because display must not be the one place a known gap renders as a
+# silently-wrong table (htmxo-use §3.5: let errors bubble).
 function Base.show(io::IO, ::MIME"text/html", tt::TreeTable)
     cols = Tables.columns(tt)
     nms = keys(cols)

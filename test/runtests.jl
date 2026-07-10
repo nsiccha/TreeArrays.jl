@@ -635,6 +635,14 @@ end
         # display is not where a bad shape gets to render as if it were fine
         fixedX = TreeData(randn(4), TreeDim(:draw, 1:4), TreeDim(:tag, :fixedtag))
         @test_throws "not a real axis" html(TreeTable(fixedX; wide=:tag))
+
+        # same contract for the other unsupported shape: a RAGGED tree is not a table,
+        # so `TreeTable`'s display throws rather than render a plausible-looking one.
+        # The ragged `TreeData` itself displays fine -- only the tabular VIEW rejects it.
+        ragged = TreeData([TreeData(randn(n), :time => sort(randn(n))) for n in (2, 5, 9)], :subject)
+        @test_throws "inconsistent shape" html(TreeTable(ragged))
+        @test occursin("more leaves", html(ragged)) == false     # 3 leaves, none skipped
+        @test count("<details>", html(ragged)) == 3
     end
 
     # `wide=:band` spreads an axis's levels into columns. It is a pure RE-INDEXING of
