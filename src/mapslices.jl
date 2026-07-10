@@ -103,12 +103,27 @@ _leafreduce(f, sl::AbstractArray{<:Union{TreeNamedTuple,TreeTuple}}) = begin
     fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl)), ks)
     TreeData(_reassemble(parent(proto), fields), _leafmeta(proto))
 end
+# `sl` is indexed once per ELEMENT here, never once per element per inner position. The
+# distinction is invisible for an `Array` parent (`sl[j]` is a load) but decides the cost of a
+# LAZY parent -- `TreeRaggedArray`'s `P<:AbstractArray{<:TreeData}` admits an index-backed array
+# that BUILDS each leaf on `getindex`, and the earlier inner-major form (`map(el -> parent(el)[i],
+# sl)` under `map(i -> ..., CartesianIndices(p))`) re-walked `sl` for every inner position, so it
+# rebuilt each leaf `length(p)` times. A leaf's byte size is proportional to `length(p)`, so that
+# made a lazy outer axis pathological in exactly the regime that motivates one (measured:
+# n_inner=20_000, n_boot=8 -> 160_001 leaf builds / 4.99 s, vs 8 / 0.003 s here).
+# TRADEOFF, deliberate: `ps` pins every leaf's backing array for the duration, so peak memory is
+# the whole outer axis. Holding one leaf live at a time instead is only possible when `f` is an
+# incremental accumulator; a slice kernel like `quantile` needs the full gathered slice per inner
+# position, so its peak is irreducible. Nothing is stacked or pivoted -- `ps` holds the parents'
+# own arrays, not a combined copy -- so the no-eager-restructuring invariant is intact.
 _leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
-    isempty(sl) && _emptyreduce(sl)
-    proto = first(sl)
+    isempty(sl) && _emptyreduce(sl)   # BEFORE `collect`: there is no `proto` to read
+    els = collect(sl)   # the one and only pass over `sl`
+    proto = first(els)
     p = parent(proto)
-    p isa AbstractArray || return _leafreduce(f, map(parent, sl))  # scalar leaf: reduce directly, no positions
-    vals = map(i -> _leafreduce(f, map(el -> parent(el)[i], sl)), CartesianIndices(p))
+    p isa AbstractArray || return _leafreduce(f, map(parent, els))  # scalar leaf: reduce directly, no positions
+    ps = map(parent, els)
+    vals = map(i -> _leafreduce(f, map(P -> P[i], ps)), CartesianIndices(p))
     TreeData(vals, meta(proto))
 end
 _leafreduce(f, sl::AbstractArray) = f(sl)
