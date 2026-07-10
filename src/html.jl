@@ -24,27 +24,13 @@
 #   * the dim table is computed from the dims alone, never from the values;
 #   * array-backed leaves go through Base's `:limit => true` plain-text show, which
 #     only touches the array corners;
-#   * TUPLE-backed leaves and tuple coords are elided by US, up front -- see the
-#     `:limit` asymmetry below;
+#   * TUPLE-backed leaves and tuple coords are elided by US, up front -- Base honours
+#     `:limit` for arrays but NOT for `Tuple` (see `show.jl`, where the shared bounded
+#     helpers `_clamp` / `_showcoords` / `_coordpreview` / `_plaindump` live);
 #   * a ragged container previews `_MAX_LEAVES` leaves and then says how many it
 #     skipped -- never a silent truncation;
 #   * `TreeTable` pulls at most `_MAX_ROWS` rows out of the lazy melt columns;
 #   * `_clamp` is the final backstop on any single `<pre>` dump.
-#
-# THE `:limit` ASYMMETRY (the trap this file fell into once already). Base honours
-# `:limit => true` for AbstractArrays -- `show_vector` / `print_matrix` render only
-# the corners -- but NOT for `Tuple`, whose `show` renders every element regardless.
-# So `sprint(show, v)` on a 4000-name record axis built a ~128 MB string just to be
-# cut to `_MAX_COORDS` chars, and a 3000-element `TreeTuple` leaf emitted 23 KB of
-# HTML uncapped. Never hand a Tuple to `show` for a preview: elide it first, and
-# always MARK the elision -- a preview that reads as the complete value is exactly
-# the "valid-looking value" the reduction invariants forbid.
-
-const _MAX_ROWS = 20          # TreeTable preview rows
-const _MAX_LEAVES = 3         # ragged-container preview leaves
-const _MAX_COORDS = 60        # chars of a dim's coordinate preview
-const _MAX_TUPLE_ELEMS = 8    # Tuple elements rendered before eliding (`show` ignores `:limit`)
-const _MAX_DUMP_CHARS = 2000  # hard cap on any single <pre> value dump
 
 # HTMX splices a `showable` child's output into the document RAW -- `HTMX.jl:202`
 # takes `show(io, MIME"text/html"(), child)` and never escapes it (that same branch
@@ -62,36 +48,8 @@ _esc(s::AbstractString) = replace(s,
     '&' => "&amp;", '<' => "&lt;", '>' => "&gt;", '"' => "&quot;", '\'' => "&#39;")
 _esc(x) = _esc(string(x))
 
-# clamp on CHARACTERS, before escaping -- escaping last means an entity can never be
+# `_clamp` runs BEFORE `_esc` at every call site below, so an HTML entity can never be
 # cut in half.
-_clamp(s::AbstractString, n::Int, mark::AbstractString) =
-    length(s) > n ? first(s, n) * mark : s
-
-_rawshow(v) = sprint(show, v; context = (:limit => true, :compact => true))
-
-# compact one-liner for a dim's coordinate values (`1:1000`, `(:a, :b)`, `missing`, …)
-_coordpreview(v) = _clamp(_showcoords(v), _MAX_COORDS, "…")
-
-_showcoords(v) = _rawshow(v)                       # arrays/ranges: `show` honours `:limit`
-function _showcoords(v::Tuple)                     # tuples: it does not -- elide up front
-    n = length(v)
-    n <= _MAX_TUPLE_ELEMS && return _rawshow(v)
-    head = join((_rawshow(v[i]) for i in 1:_MAX_TUPLE_ELEMS), ", ")
-    string("(", head, ", … ", n - _MAX_TUPLE_ELEMS, " more)")
-end
-
-# the small displaysize keeps a 1000x100 backing array to a corner preview rather
-# than a megabyte of HTML; `_clamp` backstops any type Base declines to limit.
-_plaindump(v) = _clamp(sprint(show, MIME"text/plain"(), v;
-    context = (:limit => true, :displaysize => (12, 80))), _MAX_DUMP_CHARS, "\n… (truncated)")
-function _plaindump(v::Tuple)
-    n = length(v)
-    n <= _MAX_TUPLE_ELEMS && return _clamp(sprint(show, MIME"text/plain"(), v;
-        context = (:limit => true, :displaysize => (12, 80))), _MAX_DUMP_CHARS, "\n… (truncated)")
-    head = join((_rawshow(v[i]) for i in 1:_MAX_TUPLE_ELEMS), ", ")
-    _clamp(string("(", head, ", …)  # ", n, " elements"), _MAX_DUMP_CHARS, "\n… (truncated)")
-end
-
 _predump(io::IO, v) = print(io, "<pre>", _esc(_plaindump(v)), "</pre>")
 
 # `_dimkind` (tables.jl) classifies :axis/:ghost/:fixed; the record axis is the one

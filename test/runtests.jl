@@ -717,13 +717,39 @@ end
         # an explicit :limit=>false still gets the full dump: the escape hatch survives
         @test length(sprint(io -> print(IOContext(io, :limit => false), big))) > 100_000
 
+        # the array-backed leaf was only ONE of three unbounded holes on this path.
+        # `:limit` does not apply to Tuples, and `show(::TreeDim)` set no `:limit` at all,
+        # so a big coord list or a Tuple leaf still dumped tens of KB through `print_dims`.
+        bigtup = Tuple(Symbol("subject_", i) for i in 1:4000)
+        @test length(string(TreeData(randn(4000), TreeDim(:subject, bigtup)))) < 2000    # was 59_164
+        @test occursin("…", string(TreeData(randn(4000), TreeDim(:subject, bigtup))))    # elision marked
+        bigvec = [Symbol("s", i) for i in 1:4000]
+        @test length(string(TreeData(randn(4000), TreeDim(:subject, bigvec)))) < 2000    # was 31_161
+        tup = TreeData(Tuple(1.0*i for i in 1:3000), TreeDim(:k, 1:3000))
+        @test length(string(tup)) < 2000                                                 # was 22_950
+        @test occursin("…", string(tup))
+        # the compact path (`print_tree`'s `compact && return print_values(cio, X)`) too
+        @test length(sprint(io -> show(IOContext(io, :compact => true), big))) < 2000
+
         @test showable(MIME"text/markdown"(), big)
+        @test showable(MIME"text/markdown"(), TreeTable(big))
         m = md(big)
         @test length(m) < 2000
         @test occursin("**TreeArray**", m) && occursin("`draw`", m) && occursin("`param`", m)
 
         # a `|` in a coordinate closes a cell -- it must be escaped
         @test occursin("a\\|b", md(TreeData(randn(2), TreeDim(:tag, ("a|b", "c")))))
+
+        # ... and so does a newline, which closes the whole ROW. Cell values come from
+        # `print` (raw), unlike the show-derived coord previews, so they need their own
+        # escaper -- `| a⏎b |` split the table into two broken rows.
+        nl = md(TreeTable(TreeData(randn(2), TreeDim(:tag, ("a\nb", "c")))))
+        @test !occursin("a\nb", nl) && occursin("a\\nb", nl)
+        @test count("\n|", nl) == 2 + 2                     # header + separator + 2 rows, not 3
+        # a value ending in `\` would otherwise escape the cell delimiter emitted after it
+        @test occursin("ends\\\\ |", md(TreeTable(TreeData(randn(1), TreeDim(:tag, ("ends\\",))))))
+        # show-derived text must NOT be backslash-escaped again (`a\nb` -> `a\\nb`)
+        @test occursin("\"a\\nb\"", md(TreeData(randn(2), TreeDim(:tag, ["a\nb", "c"]))))
 
         Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
         @test occursin("**a**", md(Xnt)) && occursin("**b**", md(Xnt))

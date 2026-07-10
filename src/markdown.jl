@@ -21,10 +21,24 @@
 # never densify, and MARK every elision (an unmarked truncation reads as the whole
 # value, which is the "valid-looking value" the reduction invariants forbid).
 
-# A `|` closes a cell in a pipe table; a newline closes the row. `_coordpreview` and
-# the cell formatter are both single-line already, so the pipe is the only escape.
+# A `|` closes a cell in a pipe table and a newline closes the ROW, so both must be
+# neutralized -- but the two sources of cell text need different treatment:
+#
+#   `_md`     for SHOW-derived text (coord previews, Symbol names). `show` already
+#             escaped it to a single line and its backslashes are meaningful escape
+#             sequences, so touching them would double-escape (`a\nb` -> `a\\nb`).
+#             Only the pipe is left to handle.
+#
+#   `_mdcell` for PRINT-derived text (table cell VALUES). `print` emits a String raw,
+#             so a coordinate label like "a\nb" landed a literal newline mid-row and
+#             split the table. Backslash goes first (single-pass `replace`, so nothing
+#             is escaped twice), otherwise a value ending in `\` would escape the cell
+#             delimiter we emit right after it.
 _md(s::AbstractString) = replace(s, '|' => "\\|")
 _md(x) = _md(string(x))
+
+_mdcell(v) = replace(sprint(print, v; context = :compact => true),
+    '\\' => "\\\\", '|' => "\\|", '\n' => "\\n", '\r' => "\\r")
 
 function _mddimtable(io::IO, X::TreeData)
     print(io, "**", sprint(print_type, typeof(X)), "**\n\n")
@@ -82,7 +96,7 @@ function Base.show(io::IO, ::MIME"text/markdown", tt::TreeTable)
     for i in 1:shown
         print(io, "|")
         for nm in nms
-            print(io, " ", _md(sprint(print, cols[nm][i]; context = :compact => true)), " |")
+            print(io, " ", _mdcell(cols[nm][i]), " |")
         end
         print(io, "\n")
     end
