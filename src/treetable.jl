@@ -106,13 +106,18 @@ function Base.getindex(c::WideColumn{T,C,K,KR,POS}, i::Int) where {T,C,K,KR,POS}
 end
 
 # Vega-Lite reads a dot in a field name as nested property access (aov-use §9),
-# so a numeric level like `0.025` must not reach a column name verbatim.
+# so a level like `0.025` must not reach a column name verbatim. This applies to
+# EVERY level, Symbol ones included: `quantile(X, :band => (var"q0.025"=0.025, …))`
+# and `TreeDim(:band, Symbol.(["0.025", "0.975"]))` both put a dot in a Symbol, and
+# a `q0.025` column reads as `datum["q0"]["025"]` in VL -- a silent wrong-data plot,
+# never an error. Sanitizing only the non-Symbol path left that hole open on the
+# reducer's OWN primary path.
 _sanitize(v) = replace(string(v), '.' => '_')
 # A Symbol level (what the `:band => spec` reducer produces) is already a good
 # column name and is used bare -- that is exactly what makes the output drop into
 # `lineribbon(bands=[:lower => :upper])`. Anything else is prefixed by its dim, so
 # a widened `time` axis yields `time_0_1`, never a bare `0_1`.
-_levelname(::Symbol, v::Symbol) = v
+_levelname(::Symbol, v::Symbol) = Symbol(_sanitize(v))
 _levelname(wname::Symbol, v) = Symbol(wname, '_', _sanitize(v))
 
 # NOTE (deliberate; awaiting user decision 1krjg6l): unlike the long melt, wide-mode
@@ -153,8 +158,15 @@ function _pivotcolumns(tt::TreeTable)
             push!(cols, WideColumn(c, rowdims, pos, 1))
         end
     end
+    # A level label can also collide with an ID column (`wide=:band` with a `:lower`
+    # level, on a tree that already has a `:lower` dim) or with another field's
+    # prefixed name. `NamedTuple` would catch it, but only as "duplicate field name
+    # in NamedTuple" -- which names neither the pivot nor the culprit.
+    allunique(names) || error("TreeTable: wide=$(wname) produced duplicate column names $(_dups(names)) -- a level label collides with another column of the melt")
     NamedTuple{Tuple(names)}(Tuple(cols))
 end
+
+_dups(names) = unique(nm for nm in names if count(==(nm), names) > 1)
 
 Tables.columns(tt::TreeTable)     = _pivotcolumns(tt)
 Tables.columnnames(tt::TreeTable) = keys(_pivotcolumns(tt))

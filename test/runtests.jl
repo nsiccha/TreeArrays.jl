@@ -693,6 +693,52 @@ end
         dotted = TreeData(randn(2, 2), :draw, :time => [0.1, 0.25])
         @test Set(Tables.columnnames(Tables.columns(TreeTable(dotted; wide=:time)))) ==
               Set((:draw, :time_0_1, :time_0_25))
+
+        # ... and a SYMBOL level carrying a dot must be sanitized too. This is the
+        # reducer's own primary path (`:band => (var"q0.025"=…,)`), and it used to slip
+        # through unsanitized -- a `q0.025` column is `datum["q0"]["025"]` to VL, i.e. a
+        # silently wrong plot rather than an error.
+        symdot = TreeData(randn(2, 2), :draw, :band => (Symbol("q0.025"), Symbol("q0.975")))
+        symnames = Tables.columnnames(Tables.columns(TreeTable(symdot; wide=:band)))
+        @test Set(symnames) == Set((:draw, :q0_025, :q0_975))
+        @test !any(nm -> occursin('.', String(nm)), symnames)
+
+        # a level colliding with an existing column names the pivot AND the culprit,
+        # rather than surfacing as Base's bare "duplicate field name in NamedTuple"
+        collide = TreeData(randn(2, 2), :lower, :band => (:lower, :upper))
+        @test_throws "duplicate column names" Tables.columns(TreeTable(collide; wide=:band))
+
+        # a single row-dim collapses to redrowdims == () -- one row, no axis columns
+        solo = TreeData([10.0, 20.0, 30.0], :band => (:lo, :mid, :hi))
+        scols = Tables.columns(TreeTable(solo; wide=:band))
+        @test Set(Tables.columnnames(scols)) == Set((:lo, :mid, :hi))
+        @test length(Tables.getcolumn(scols, :mid)) == 1
+        @test only(Tables.getcolumn(scols, :mid)) == 20.0
+
+        # record fields sharing a band axis fan out prefixed, sharing the id column once
+        rec = TreeData(:rec => (; a=TreeData(reshape(1.0:6.0, 2, 3), :draw, :band=>(:lo,:mid,:hi)),
+                                   b=TreeData(reshape(7.0:12.0, 2, 3), :draw, :band=>(:lo,:mid,:hi))))
+        @test Tables.columnnames(Tables.columns(TreeTable(rec; wide=:band))) ==
+              (:draw, :a_lo, :a_mid, :a_hi, :b_lo, :b_mid, :b_hi)
+
+        # multi-dim wide is not built; it must say so, not silently widen just one
+        @test_throws "exactly one wide dim" Tables.columns(TreeTable(r; wide=(:band, :param)))
+
+        # a ragged source stays loud under wide, exactly as it is under long
+        rag = TreeData([TreeData(randn(n), :time) for n in (2, 3)], :subject)
+        @test_throws "ragged trees are not a supported Tables shape" Tables.columns(TreeTable(rag; wide=:time))
+
+        # THE headline claim: the pivot re-indexes the long melt's lazy columns, so
+        # `columns()` is O(structure), never O(rows). A 1000x row increase must not
+        # move the allocation. (Mirrors the Delta A gate above; rtol absorbs call noise.)
+        wsmall = TreeTable(TreeData(randn(50,    3), :draw, :band=>(:lo,:mid,:hi)); wide=:band)
+        wbig   = TreeTable(TreeData(randn(50000, 3), :draw, :band=>(:lo,:mid,:hi)); wide=:band)
+        Tables.columns(wsmall); Tables.columns(wbig)          # warm up
+        a_wsmall = @allocated Tables.columns(wsmall)
+        a_wbig   = @allocated Tables.columns(wbig)
+        @info "wide pivot acceptance gate: Tables.columns @allocated (50 vs 50000 draws)" a_wsmall a_wbig
+        @test isapprox(a_wbig, a_wsmall; rtol=0.3)
+        @test length(Tables.getcolumn(Tables.columns(wbig), :mid)) == 50000
     end
 
     # Base honours `:limit` for AbstractArrays but NOT for `Tuple` (`show` renders
