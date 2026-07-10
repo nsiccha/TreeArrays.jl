@@ -86,6 +86,57 @@ end
         @test size(parent(inner)) == (2, 3)
     end
 
+    # The product-`map` override is N-generic, but was only ever exercised at arity 2
+    # (treearrays-use §7, the QT twin) and at arity 4 by `_tt_stats_percentiles` -- whose
+    # `f` IGNORES its coordinates, so only the SHAPE was covered, never the value mapping.
+    # Bruno sweeps 6 / 8 / 10 (`db_profile_plot`). Decision 1qex8lj: pin it.
+    @testset "map over Iterators.product of TreeDims is arity-generic (1qex8lj)" begin
+        # heterogeneous label types, mirroring Bruno's db_profile_plot
+        alldims = [
+            TreeDim(:fit, (:a, :b)),           TreeDim(:health, ("hi", "lo")),
+            TreeDim(:source, 1:2),             TreeDim(:outcome, (:x, :y)),
+            TreeDim(:draw_selection, (:all,)), TreeDim(:vessel, ("v1", "v2")),
+            TreeDim(:diet, (:std,)),           TreeDim(:schedule, ("s",)),
+            TreeDim(:dose, (20, 200)),         TreeDim(:subject, 1:3),
+        ]
+        for n in (1, 3, 6, 8, 10)
+            ds = alldims[1:n]
+            r = map(Iterators.product(ds...)) do lvals
+                join(string.(lvals), "|")           # f receives the coordinate tuple, in order
+            end
+            @test r isa TreeData
+            @test size(parent(r)) == Tuple(length.(ds))
+            @test map(TreeArrays.name, TreeArrays.dims(r)) == Tuple(TreeArrays.name.(ds))
+            # cell [i,j,…] is the coords at those positions, in dim order -- not just the shape
+            @test parent(r) == [join(string.(c), "|") for c in
+                Iterators.product((TreeArrays.meta(d).values for d in ds)...)]
+        end
+
+        # Bruno's real shape: every cell is a reduced TreeData leaf, nothing densified
+        sweep = map(Iterators.product(alldims...)) do lvals
+            quantile(TreeData(randn(8, 4), :draw, :time), TreeDim(:q, (0.1, 0.5, 0.9)); dims=:draw)
+        end
+        @test size(parent(sweep)) == Tuple(length.(alldims))
+        @test parent(sweep)[1] isa TreeData
+
+        # the `_reduceouter` positional-axis assertion must not fire on a product-map result
+        plain = map(Iterators.product(alldims[1:3]...)) do lvals; float(length(string(lvals))); end
+        @test mapslices(sum, plain; dims=:fit) isa TreeData
+
+        # a SCALAR dim is a fixed position, not an axis: it contributes no array axis and
+        # lands as a trailing fixed dim (`oni1bc`). Wrap in a 1-tuple to sweep it.
+        sc = map(Iterators.product(TreeDim(:fit, (:a, :b)), TreeDim(:dose, 20))) do lvals; string(lvals); end
+        @test size(parent(sc)) == (2,)                              # :dose adds no axis
+        @test !TreeArrays._isaxis(TreeArrays.dims(sc)[2])           # ... it is fixed
+        @test TreeArrays._isaxis(TreeArrays.dims(sc)[1])
+
+        # an UNLABELLED dim has no coordinates to sweep -- say so, don't surface Base's
+        # `MethodError: no method matching length(::Missing)` from inside Iterators.product
+        @test_throws "no coordinates to sweep" map(
+            Iterators.product(TreeDim(:fit, (:a, :b)), TreeDim(:dose))) do lvals; lvals; end
+        @test_throws "no coordinates to sweep" map(identity, TreeDim(:dose))
+    end
+
     @testset "setdim stubs throw instead of silently no-oping" begin
         X = TreeData(randn(4,3), :draw, :param)
         @test (try; setdim(X; foo=:bar); false; catch; true; end)                # was: silently returned X unchanged
