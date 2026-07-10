@@ -667,7 +667,13 @@ end
         tt = TreeTable(r; wide=:band)
         cols = Tables.columns(tt)
         @test Set(Tables.columnnames(cols)) == Set((:param, :lower, :median, :upper))
-        @test Tables.schema(tt).names == Tables.columnnames(cols)
+        # wide mode returns a STORED (runtime) schema -- names are coordinate values,
+        # not type parameters, so `.names` is a Vector here and a Tuple in long mode.
+        # Both are valid `Tables.Schema`s (decision 1krjg6l).
+        sch = Tables.schema(tt)
+        @test Tuple(sch.names) == Tables.columnnames(cols)
+        @test sch.names isa Vector{Symbol}
+        @test Tables.schema(TreeTable(r)).names isa Tuple      # long mode: type-level, unchanged
         @test all(isconcretetype ∘ eltype, values(cols))     # aov-use §2 column contract
 
         # the band axis leaves the row space: 3*3 long rows collapse to 3 wide rows

@@ -120,14 +120,28 @@ _sanitize(v) = replace(string(v), '.' => '_')
 _levelname(::Symbol, v::Symbol) = Symbol(_sanitize(v))
 _levelname(wname::Symbol, v) = Symbol(wname, '_', _sanitize(v))
 
-# NOTE (deliberate; awaiting user decision 1krjg6l): unlike the long melt, wide-mode
-# column names come from the axis's coordinate VALUES, which live in `meta(d).values`
-# -- they are not recoverable from the type. So `Tables.columns`/`schema` here read
-# the instance and are not type-inferable in their NAMES, relaxing the "schema from
-# the TYPE alone" invariant this file's header states. That relaxation is confined to
-# wide mode; both `wide=()` methods above stay fully type-stable. The columns
-# themselves are still concretely-typed lazy views, which is what a Tables consumer's
-# contract actually requires (aov-use §2).
+# WIDE-MODE SCHEMA IS A RUNTIME SCHEMA, BY DESIGN (decision 1krjg6l, resolved).
+#
+# Wide-mode column names ARE the widened axis's coordinate values -- they live in
+# `meta(d).values` and are not recoverable from the type. So unlike the long melt,
+# `Tables.columns`/`schema` here read the instance and are not inferable in their
+# NAMES. That is fine, and Tables.jl says so itself: `schema` is documented to
+# return `Union{Nothing, Tables.Schema}`, and `Schema{nothing,nothing}` stores its
+# names in a plain `Vector{Symbol}` field precisely because "encoding the names/
+# types as type parameters becomes prohibitive to the compiler" for wide tables
+# (Tables.jl `src/Tables.jl:454-464`). Type-level names were never a Tables.jl
+# requirement -- only a property the LONG melt gets for free, since there the names
+# are dim names, which ARE type parameters.
+#
+# Hence `stored=true`: baking runtime-derived names into a type parameter would
+# construct a fresh type per label set for a schema nothing can specialize on
+# anyway (the call is not inferable). Measured on a widened 2000-level axis:
+# 189 µs / 81 KB typed vs 7 µs / 32 KB stored. Note `sch.names` is therefore a
+# `Vector{Symbol}` in wide mode and a `Tuple` in long mode -- both are valid
+# `Tables.Schema`s and `.names` reads through either.
+#
+# The columns themselves stay concretely-typed lazy views, which is what a Tables
+# consumer's contract actually requires (aov-use §2).
 function _pivotcolumns(tt::TreeTable)
     w = _widedims(tt)
     length(w) == 1 || error("TreeTable: wide=$(w) -- exactly one wide dim is supported (got $(length(w)))")
@@ -170,7 +184,7 @@ _dups(names) = unique(nm for nm in names if count(==(nm), names) > 1)
 
 Tables.columns(tt::TreeTable)     = _pivotcolumns(tt)
 Tables.columnnames(tt::TreeTable) = keys(_pivotcolumns(tt))
-Tables.schema(tt::TreeTable)      = (c = _pivotcolumns(tt); Tables.Schema(keys(c), map(eltype, values(c))))
+Tables.schema(tt::TreeTable)      = (c = _pivotcolumns(tt); Tables.Schema(keys(c), map(eltype, values(c)); stored=true))
 
 Tables.getcolumn(tt::TreeTable, i::Union{Int,Symbol}) = Tables.getcolumn(Tables.columns(tt), i)
 Tables.rows(tt::TreeTable)                            = Tables.rows(Tables.columns(tt))
