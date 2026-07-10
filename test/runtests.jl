@@ -964,6 +964,84 @@ end
         baseline = alloc(randn(4000))
         @test alloc(wcol(4)) == baseline
         @test alloc(wcol(40_000)) == baseline               # flat in the row count
+
+        # THE headline claim, at k > 1: the pivot re-indexes the long melt's lazy columns,
+        # so `columns()` is O(structure), never O(rows). The k=1 gate above did not cover
+        # the multi-slot path (`_slotplan` / `_deletemany` / the shared `Val{PLAN}`).
+        mk(n) = TreeData(randn(n, 3, 2), :draw, :param=>(:p1,:p2,:p3), :arm=>(:lo,:hi))
+        wsmall2 = TreeTable(mk(50);     wide=(:param, :arm))
+        wbig2   = TreeTable(mk(50_000); wide=(:param, :arm))
+        Tables.columns(wsmall2); Tables.columns(wbig2)      # warm up
+        a_small2 = @allocated Tables.columns(wsmall2)
+        a_big2   = @allocated Tables.columns(wbig2)
+        @info "multi-wide acceptance gate: Tables.columns @allocated (50 vs 50000 draws)" a_small2 a_big2
+        @test isapprox(a_big2, a_small2; rtol=0.3)
+
+        # naming at k>1 inherits `_levelname`'s per-dim rule: SYMBOL levels join bare
+        # (`p2_hi`), while unlabelled/positional axes stay dim-prefixed (`param_1_arm_2`,
+        # asserted above). Mixed dims mix accordingly -- the prefix is per level, not per combo.
+        @test length(Tables.getcolumn(Tables.columns(wbig2), :p2_hi)) == 50_000
+        @test Set(Tables.columnnames(Tables.columns(wsmall2))) ==
+              Set((:draw, :p1_lo, :p2_lo, :p3_lo, :p1_hi, :p2_hi, :p3_hi))
+    end
+
+    # Edges of the multi-slot pivot that `35db7ec` left unpinned. `_slotplan` maps each
+    # widened slot to its entry of `levels`, so a `wide` order whose slots are NOT
+    # ascending is the case most likely to silently transpose data.
+    @testset "multi-wide edges: unsorted slots, records, collisions, reps (1e3figi)" begin
+        # `wide=(:arm,:param)` => poss = (3,2), non-monotonic. Every cell must still land.
+        X3 = TreeData(reshape(1.0:24.0, 4, 3, 2), :draw, :param, :arm)
+        lt = Tables.rowtable(TreeTable(X3))
+        for row in Tables.rowtable(TreeTable(X3; wide=(:arm, :param))), p in 1:3, a in 1:2
+            @test getproperty(row, Symbol("arm_", a, "_param_", p)) ==
+                  only(filter(l -> l.draw == row.draw && l.param == p && l.arm == a, lt)).value
+        end
+        # and the plan really is (reduced, levels[2], levels[1]) -- not (…, 1, 2)
+        c = Tables.getcolumn(Tables.columns(TreeTable(X3; wide=(:arm,:param))), :arm_2_param_1)
+        @test typeof(c).parameters[end] == (1, -2, -1)
+
+        # a record fans out over BOTH widened axes, each field keeping its own prefix
+        rec = TreeData(:rec => (
+            a = TreeData(randn(2,2), :band=>(:lo,:hi), :arm=>(:l,:r)),
+            b = TreeData(randn(2,2), :band=>(:lo,:hi), :arm=>(:l,:r)),
+        ))
+        rcols = Tables.columns(TreeTable(rec; wide=(:band, :arm)))
+        @test Set(Tables.columnnames(rcols)) == Set((:a_lo_l,:a_hi_l,:a_lo_r,:a_hi_r,
+                                                     :b_lo_l,:b_hi_l,:b_lo_r,:b_hi_r))
+        rlong = Tables.rowtable(TreeTable(rec))
+        rrow  = only(Tables.rowtable(TreeTable(rec; wide=(:band,:arm))))
+        rm    = only(filter(l -> l.band === :hi && l.arm === :r, rlong))
+        @test rrow.a_hi_r == rm.a && rrow.b_hi_r == rm.b
+
+        # two DISTINCT levels of one dim that sanitize to the same label: blame the DIM,
+        # not "another column of the melt" (the per-dim guard the generalization dropped)
+        clash = TreeData(randn(4, 2), :draw, :band => (Symbol("q0.025"), :q0_025))
+        @test_throws "wide=band has levels that collide" Tables.columns(TreeTable(clash; wide=:band))
+
+        # `_` is not an injective separator: (:x, :x_y) x (:y_z, :z) yields `x_y_z` twice.
+        # Loud, never a silently mislabelled column.
+        amb = TreeData(randn(2,2,2), :draw, :a => (:x, Symbol("x_y")), :b => (Symbol("y_z"), :z))
+        @test_throws "two level combinations join to the same name" Tables.columns(TreeTable(amb; wide=(:a,:b)))
+
+        # a ragged source stays loud under multi-wide, exactly as under long and k=1
+        rag = TreeData([TreeData(randn(n), :time) for n in (2, 3)], :subject)
+        @test_throws "inconsistent shape" Tables.columns(TreeTable(rag; wide=(:time,)))
+
+        # the schema stays a STORED (runtime) schema at k>1, with concrete column eltypes
+        spec = (lower=0.25, median=0.5, upper=0.75)
+        r = quantile(TreeData(reshape(1.0:12.0,4,3), :draw, :param), :band=>spec; dims=:draw)
+        sch = Tables.schema(TreeTable(r; wide=(:band,:param)))
+        @test sch.names isa Vector{Symbol} && length(sch.names) == 9
+        @test all(isconcretetype, sch.types)
+
+        # getindex is fully inferred through the multi-slot reconstruction
+        wc = Tables.getcolumn(Tables.columns(TreeTable(r; wide=(:band,:param))), :lower_param_1)
+        @test Base.return_types(getindex, (typeof(wc), Int)) == [Float64]
+
+        # both display reps render a multi-wide table (they call `Tables.columns`)
+        for m in (MIME"text/html"(), MIME"text/markdown"())
+            @test occursin("lower_param_1", sprint(show, m, TreeTable(r; wide=(:band,:param))))
+        end
     end
 
     # Base honours `:limit` for AbstractArrays but NOT for `Tuple` (`show` renders

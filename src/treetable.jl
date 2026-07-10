@@ -185,6 +185,15 @@ function _pivotcolumns(tt::TreeTable)
     nlevels = map(p -> rowdims[p], poss)
     labels  = map((nm, c, L) -> ntuple(l -> _levelname(nm, _dimvalue(c.values, l)), L), w, wcols, nlevels)
 
+    # Two DISTINCT levels of one dim can sanitize to the same label -- `Symbol("q0.025")`
+    # and `:q0_025` both become `:q0_025`. Checked PER DIM: across dims a repeat is fine,
+    # since `_combolabel` joins one label from each (`:lo` under both `:band` and `:arm`
+    # gives `lo_lo`). The later `allunique(names)` would also trip on this, but would
+    # blame a melt column rather than the dim whose levels actually collided.
+    for (nm, labs) in zip(w, labels)
+        allunique(labs) || error("TreeTable: wide=$(nm) has levels that collide as column names after sanitizing: $(_dups(labs)) (from $(labs))")
+    end
+
     # k wide dims -> the cartesian product of their levels. Column count multiplies, which
     # is inherent to a pivot (and why no consumer has wanted k > 1); rows divide by the
     # same factor. Nothing densifies either way -- `WideColumn` still wraps the same lazy
@@ -213,11 +222,14 @@ function _pivotcolumns(tt::TreeTable)
             push!(cols, _widecolumn(c, rowdims, red, plan, map(_ -> 1, poss), len))
         end
     end
-    # A level label can also collide with an ID column (`wide=:band` with a `:lower`
-    # level, on a tree that already has a `:lower` dim) or with another field's
-    # prefixed name. `NamedTuple` would catch it, but only as "duplicate field name
-    # in NamedTuple" -- which names neither the pivot nor the culprit.
-    allunique(names) || error("TreeTable: wide=$(w) produced duplicate column names $(_dups(names)) -- a level label collides with another column of the melt")
+    # Per-dim levels are unique by now, so a duplicate here means one of two other things:
+    #   * a level label collides with an ID column (`wide=:band` with a `:lower` level, on
+    #     a tree that already has a `:lower` dim) or with another field's prefixed name;
+    #   * two level COMBINATIONS join to the same name -- `_` is not an injective separator,
+    #     so levels (`:x`, `:x_y`) x (`:y_z`, `:z`) give `x_y_z` twice.
+    # `NamedTuple` would catch both, but only as "duplicate field name in NamedTuple",
+    # which names neither the pivot nor the culprit.
+    allunique(names) || error("TreeTable: wide=$(w) produced duplicate column names $(_dups(names)) -- a level label collides with another column of the melt, or two level combinations join to the same name")
     NamedTuple{Tuple(names)}(Tuple(cols))
 end
 
