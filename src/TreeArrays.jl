@@ -5,6 +5,7 @@ using Statistics
 include("types.jl")
 include("dim_helpers.jl")
 include("array_interface.jl")
+include("actualarray.jl")
 include("show.jl")
 include("mapslices.jl")
 include("properties.jl")
@@ -18,6 +19,7 @@ include("html.jl")
 include("markdown.jl")
 
 export TreeDim, TreeData, TreeArray, TreeNamedTuple, TreeRaggedArray, TreeTuple
+export TreeActualArray
 export TreeTable
 export dims, outerdim
 export mapslices, mean, sum, quantile, quantile!

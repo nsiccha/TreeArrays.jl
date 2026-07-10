@@ -1402,4 +1402,47 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test TreeArrays.meta(TreeDim(:draw)).values === missing
     end
 
+    @testset "TreeActualArray — opt-in lazy AbstractArray view (a967zd)" begin
+        nd, nc, np = 50, 4, 3
+        arr = reshape(collect(1.0:(nd*nc*np)), nd, nc, np)
+        pnames = (:alpha, :beta, :gamma)
+
+        # rep 1 — dense leaf (parent IS the array); rep 2 — RECORD of per-param (draw,chain)
+        # matrices (parent is a NamedTuple, NOT an array) — same underlying data.
+        X1 = TreeData(arr, :draw, :chain, :param => collect(pnames))
+        A1 = TreeActualArray(X1)
+        fields = NamedTuple{pnames}(ntuple(k -> arr[:, :, k], np))
+        X2 = TreeData(:param => fields, :draw, :chain)
+        A2 = TreeActualArray(X2)
+
+        @test A1 isa AbstractArray{Float64,3}
+        @test A2 isa AbstractArray{Float64,3}
+        @test !(X1 isa AbstractArray)                # the TreeData itself stays not-an-AbstractArray
+        @test size(A1) == (nd, nc, np) == size(A2)
+        @test collect(A1) == arr                     # both representations reconstruct the SAME array
+        @test collect(A2) == arr
+        @test A1 == A2
+        @test sum(A2; dims = 1) == sum(arr; dims = 1) # acts like any other AbstractArray
+        @test @inferred(A1[1, 1, 1]) === arr[1, 1, 1] # type-stable getindex
+        @test @inferred(A2[1, 1, 1]) === arr[1, 1, 1]
+        @test TreeArrays.name.(dims(A1)) == (:draw, :chain, :param)   # labels retained into array-land
+        @test parent(A2) === X2
+
+        # zero-copy: a record of VIEWS reflects source mutation (nothing materialized)
+        A2v = TreeActualArray(TreeData(:param => NamedTuple{pnames}(ntuple(k -> view(arr, :, :, k), np)), :draw, :chain))
+        arr[2, 2, 2] = -777.0
+        @test A1[2, 2, 2] == -777.0
+        @test A2v[2, 2, 2] == -777.0
+
+        # ess/rhat signature (real MCMCDiagnosticTools: `AbstractArray{<:Union{Missing,Real}}`)
+        ess_like(x::AbstractArray{<:Union{Missing,Real}}) = size(x)
+        @test ess_like(A1) == (nd, nc, np)
+        @test ess_like(A2) == (nd, nc, np)
+
+        # rectangular only — ragged / heterogeneous shape / heterogeneous eltype each error
+        @test_throws ErrorException TreeActualArray(TreeData([TreeData(randn(3), :t), TreeData(randn(4), :t)], :s))
+        @test_throws ErrorException TreeActualArray(TreeData(:param => (a = randn(5, 4), b = randn(6, 4)), :draw, :chain))
+        @test_throws ErrorException TreeActualArray(TreeData(:param => (a = randn(5, 4), b = rand(1:9, 5, 4)), :draw, :chain))
+    end
+
 end
