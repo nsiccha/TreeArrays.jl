@@ -687,4 +687,37 @@ end
               Set((:draw, :time_0_1, :time_0_25))
     end
 
+    # Base honours `:limit` for AbstractArrays but NOT for `Tuple` (`show` renders
+    # every element). The first cut of html.jl handed tuples straight to `show`, so a
+    # 4000-name record axis built a ~128 MB string only to cut it to 60 chars, and a
+    # 3000-element TreeTuple leaf emitted 23 KB of uncapped HTML -- both under a
+    # header claiming "bounded by construction".
+    @testset "display stays bounded on Tuple coords + Tuple leaves" begin
+        html(x) = sprint(show, MIME"text/html"(), x)
+
+        tupcoords = TreeData(randn(2), TreeDim(:param, ntuple(i -> Symbol("p", i), 4000)))
+        tupleaf   = TreeData(ntuple(i -> Float64(i), 3000), TreeDim(:q, missing))
+        arr       = TreeData(randn(1000, 100), :draw, :param)
+        html(tupcoords); html(tupleaf); html(arr)        # warm before measuring
+
+        # allocation: was ~128 MB / ~74 MB. A 2 MB bar is ~60x under, so this fails
+        # loudly if anyone hands a Tuple to `show` again, without being flaky.
+        @test @allocated(html(tupcoords)) < 2_000_000
+        @test @allocated(html(tupleaf))   < 2_000_000
+        @test @allocated(html(arr))       < 2_000_000
+
+        # emitted HTML is bounded, and every elision is MARKED (never valid-looking)
+        @test length(html(tupcoords)) < 1_000 && occursin("…", html(tupcoords))
+        @test length(html(tupleaf))   < 1_000 && occursin("3000 elements", html(tupleaf))
+
+        # a short tuple renders in full -- no bogus elision marker
+        small = TreeData((1.0, 2.0), TreeDim(:q, (0.1, 0.9)))
+        @test occursin("(0.1, 0.9)", html(small)) && !occursin("more)", html(small))
+
+        # the trap the char-clamp alone would miss: 13 SHORT symbols fit under
+        # _MAX_COORDS chars, so only the ELEMENT elision can mark the drop.
+        shortsyms = TreeData(randn(2), TreeDim(:p, ntuple(i -> Symbol('a' + i - 1), 13)))
+        @test occursin("… 5 more", html(shortsyms))
+    end
+
 end
