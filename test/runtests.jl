@@ -99,6 +99,33 @@ end
         Z = mapslices(mean, Y; dims=:draw)                      # was: errors calling outerdim(Y) inside mapslices
     end
 
+    # `post.beta` reads a record field. Same descent as `_mapslices(::TreeNamedTuple)`:
+    # the record axis is split off, the field gets the container's inner axes, nothing
+    # densifies. Inference is checked through a function barrier (how it's really used).
+    @testset "getproperty reads record fields, zero-copy + type-stable" begin
+        geta(X) = X.a
+        getbeta(X) = X.beta
+
+        Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
+        @test Xnt.a === parent(Xnt).a                     # already a TreeData -> returned as is
+        @test propertynames(Xnt) == (:a, :b)
+        @test (@inferred geta(Xnt)) === parent(Xnt).a
+
+        # a RAW field is wrapped with the inner axes: :draw survives, record axis drops
+        raw = (;beta=randn(4), sigma=randn(4))
+        Xr = TreeData(:param => raw, TreeDim(:draw, 1:4))
+        @test parent(Xr.beta) === raw.beta                # zero-copy: the same backing array
+        @test map(TreeArrays.name, TreeArrays.dims(Xr.beta)) == (:draw,)
+        @test (@inferred getbeta(Xr)) isa TreeData
+
+        # a ghost dim stays on the container, never on the child
+        @test TreeData(Xnt, TreeDim(:extra, nothing)).a === parent(Xnt).a
+
+        @test_throws ArgumentError Xnt.nope               # never a silent `missing`/`nothing`
+        @test parent(Xnt) isa NamedTuple                  # internals still reach fields via getfield
+        @test TreeArrays.meta(Xnt) isa NamedTuple
+    end
+
     # The unified quantile no longer coerces p at all -- Base's quantile!(scratch, p)
     # preserves p's container as-is (scalar -> scalar leaf, Vector -> Vector leaf, Tuple ->
     # Tuple leaf), matching decision xxmv6c (option 2). _leafreduce gather-reduces
