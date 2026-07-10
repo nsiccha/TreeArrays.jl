@@ -87,7 +87,16 @@ function _splitmelt(alldims::Tuple, nax::Int)
 end
 
 # ---- schema: (names, types) from the TYPE alone, no instance access. ----
+# There are two flavours of raggedness, and only one of them is an instance property.
+# Siblings that differ only in SIZE (`randn(2)` beside `randn(3)`, both `:time`) share a
+# type, so the type-level walk below succeeds and `_rowdims` catches them on the instance.
+# But siblings that differ in axis LENGTH-AS-TYPE -- a `:dose_mg` axis of `(10, 20)` beside
+# one of `(20,)` -- have different `TreeDim` types, so `[a, b]` widens to a non-concrete
+# eltype and the type walk itself hits the ragged tree. `fieldtype(T, :meta)` is then the
+# abstract `NamedTuple` and the next line died with "type NamedTuple has no field dims" --
+# an internal error where this adapter promises a clear one everywhere else.
 function _schema(::Type{T}) where T<:TreeData
+    isconcretetype(T) || error("TreeArrays Tables adapter: sibling TreeData elements have inconsistent TYPES ($T) -- ragged trees are not a supported Tables shape yet (regular/rectangular only)")
     P = fieldtype(T, :parent)
     alldims = Tuple(fieldtype(fieldtype(T, :meta), :dims).parameters)
     names, types = _ownschema(T, P, alldims)

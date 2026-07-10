@@ -869,6 +869,49 @@ end
         @test length(Tables.getcolumn(Tables.columns(wbig), :mid)) == 50000
     end
 
+    # The TA-native spelling of a groupby on a NON-axis, per-item key (decision 17y9dpd):
+    # make the key STRUCTURE. Group the items into a rectangular grid of ragged cells --
+    # each cell a zero-copy `view` into the backing array -- then reduce the pooled axes
+    # away. Cells may hold different item counts; after the reduction the tree is regular,
+    # so it melts. This is what Bruno's `aggregate_ribbon` groupby becomes.
+    @testset "groupby on a per-item key = a grid of ragged cells (17y9dpd)" begin
+        P = reshape(1.0:42.0, 6, 7)                      # (draw x subject)
+        dose  = [10, 10, 20, 20, 20, 10, 20]             # per-SUBJECT attributes, not axes
+        study = [:A, :A, :A, :B, :B, :B, :B]
+        spec  = (lower=0.25, median=0.5, upper=0.75)
+
+        # `dims=(:draw, :subject)` pools BOTH axes into one quantile per cell
+        one = quantile(TreeData(view(P, :, [1,2,6]), :draw, :subject), :band => spec; dims=(:draw, :subject))
+        @test collect(parent(one)) ≈ Statistics.quantile(vec(P[:, [1,2,6]]), collect(values(spec)))
+
+        doses, studies = [10, 20], [:A, :B]
+        cells = [TreeData(view(P, :, findall((study .== s) .& (dose .== d))), :draw, :subject)
+                 for d in doses, s in studies]
+        @test [size(parent(c), 2) for c in cells] == [2 1; 1 3]        # ragged cell widths
+        tree = TreeData(cells, TreeDim(:dose_mg, Tuple(doses)), TreeDim(:study, Tuple(studies)))
+
+        tt = TreeTable(quantile(tree, :band => spec; dims=(:draw, :subject)); wide=:band)
+        @test Set(Tables.columnnames(Tables.columns(tt))) == Set((:dose_mg, :study, :lower, :median, :upper))
+        rows = Tables.rowtable(tt)
+        @test length(rows) == 4
+        for row in rows      # each cell pools its subjects' draws, exactly as a groupby would
+            ref = Statistics.quantile(vec(P[:, findall((study .== row.study) .& (dose .== row.dose_mg))]),
+                                      collect(values(spec)))
+            @test collect((row.lower, row.median, row.upper)) ≈ ref
+        end
+
+        # A truly ragged GRID (study :B lacks a dose :A has) gives sibling TreeDatas whose
+        # axis lengths differ AS TYPES, so `[a, b]` widens to a non-concrete eltype and the
+        # type-only `_schema` walk hits the ragged tree itself. It used to die with Base's
+        # "type NamedTuple has no field dims"; it must name the real problem.
+        inner_A = TreeData([TreeData(view(P,:,[1,2]), :draw, :subject), TreeData(view(P,:,[3]), :draw, :subject)],
+                           TreeDim(:dose_mg, (10, 20)))
+        inner_B = TreeData([TreeData(view(P,:,[4,5,6,7]), :draw, :subject)], TreeDim(:dose_mg, (20,)))
+        jagged = quantile(TreeData([inner_A, inner_B], TreeDim(:study, (:A, :B))), :band => spec; dims=(:draw, :subject))
+        @test_throws "ragged trees are not a supported Tables shape" TreeTable(jagged; wide=:band)
+        @test_throws "ragged trees are not a supported Tables shape" Tables.columns(TreeTable(jagged))
+    end
+
     # `wide=(:a,:b)` widens several axes at once: the cartesian product of their levels
     # names the columns. Same re-indexing as one dim -- `WideColumn` pins a SET of slots
     # and k == 1 is just NP == 1, not a special case. (1e3figi: treetable.jl's header had
