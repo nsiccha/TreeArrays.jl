@@ -13,3 +13,12 @@ Base.axes(X::TreeArray, args...) = axes(parent(X), args...)
 Base.getindex(X::TreeArray, i...) = getindex(parent(X), i...)
 Base.iterate(X::TreeArray, args...) = iterate(parent(X), args...)
 Base.collect(X::TreeArray) = collect(parent(X))
+# `Array(X)` extracts the dense backing as a plain `Array` -- the habitual spelling a
+# consumer reaches for to feed an external numeric-array API (`MCMCDiagnosticTools.ess`/
+# `rhat`, anything typed on `AbstractArray{<:Real,N}`). This does NOT make TreeData an
+# array (it stays not-an-AbstractArray): it is a one-way EXTRACTION, exactly like
+# `collect`/`parent`. Scoped to the array-backed leaf, it "works if it can" (parent ->
+# dense Array) "and fails otherwise" (any other shape has no method -> a MethodError)
+# -- user steer on snag treedata-array-o-f8d7994d. Zero-copy stays `parent(X)`; this and
+# `collect` mirror each other (a copy), incl. the ragged outer-level semantics above.
+Base.Array(X::TreeArray) = Array(parent(X))
