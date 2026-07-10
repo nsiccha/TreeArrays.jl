@@ -14,6 +14,7 @@ include("setdim.jl")
 include("tables.jl")
 include("treetable.jl")
 include("html.jl")
+include("markdown.jl")
 
 export TreeDim, TreeData, TreeArray, TreeNamedTuple, TreeRaggedArray, TreeTuple
 export TreeTable

@@ -703,6 +703,43 @@ end
         @test count("<details>", html(ragged)) == 3
     end
 
+    # HTMX's markdown rep has a `show(io, ::MIME"text/markdown", val) = print(io, string(val))`
+    # CATCH-ALL and no `showable` guard, so `?plain` rendered a TreeData as `string(td)`.
+    # Two bugs, not one: no markdown method here, AND `print_tree` set no `:limit`, so
+    # `string`/`@info` dumped the whole backing array. The REPL sets `:limit` itself,
+    # which is why display always looked fine.
+    @testset "markdown display + print_tree is bounded at the root" begin
+        md(x) = sprint(show, MIME"text/markdown"(), x)
+        big = TreeData(randn(1000, 100), :draw, :param)
+
+        @test length(string(big)) < 2000          # was 916_987 chars
+        @test occursin("…", string(big))          # Base marks its own elision -- never silent
+        # an explicit :limit=>false still gets the full dump: the escape hatch survives
+        @test length(sprint(io -> print(IOContext(io, :limit => false), big))) > 100_000
+
+        @test showable(MIME"text/markdown"(), big)
+        m = md(big)
+        @test length(m) < 2000
+        @test occursin("**TreeArray**", m) && occursin("`draw`", m) && occursin("`param`", m)
+
+        # a `|` in a coordinate closes a cell -- it must be escaped
+        @test occursin("a\\|b", md(TreeData(randn(2), TreeDim(:tag, ("a|b", "c")))))
+
+        Xnt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
+        @test occursin("**a**", md(Xnt)) && occursin("**b**", md(Xnt))
+        @test occursin("2 more leaves", md(TreeData([TreeData(randn(2,3), :time, :chan) for _ in 1:5], :subject)))
+
+        spec = (lower=0.25, median=0.5, upper=0.75)
+        r = quantile(TreeData(reshape(1.0:12.0, 4, 3), :draw, :param), :band => spec; dims=:draw)
+        t = md(TreeTable(r; wide=:band))
+        @test occursin("**TreeTable** — 3 rows", t)
+        @test occursin("`lower`", t) && occursin("`upper`", t)
+        @test count("\n|", t) == 2 + 3            # header + separator + 3 body rows
+
+        tbig = md(TreeTable(TreeData(reshape(1.0:150.0, 50, 3), :draw, :param)))
+        @test occursin("150 rows", tbig) && occursin("showing the first 20", tbig)
+    end
+
     # `wide=:band` spreads an axis's levels into columns. It is a pure RE-INDEXING of
     # the columns the long melt already built -- same lazy column objects, one slot
     # deleted from the shared row space -- so nothing recomputes and nothing densifies.
