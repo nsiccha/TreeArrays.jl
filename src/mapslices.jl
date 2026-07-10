@@ -1,7 +1,13 @@
 # ===================== mapslices =====================
 # Reduce the named `dims`: apply `f` to each leftover-index slice, keep everything.
 # `f` returns a TreeData (or a scalar). Reduced dims stay but become `sliced` (aggregated).
-# A requested dim that is absent from a leaf -> `missing` (fixed sentinel).
+#
+# `dims=` is foundALL (decision 1iy1r57): every requested name must exist somewhere in the tree
+# (a typo throws -- from the TYPE where that proves it, falling back to an instance walk on a
+# jagged tree, never standing down), and every branch reached must carry it (a heterogeneous-dims
+# shape throws). The `missing` sentinel this used to return for an absent reduce-dim is RETIRED.
+# Note `missing` still marks an UNLABELLED AXIS in `TreeDim(:draw)` -- an unrelated job that
+# keeps the name (types.jl, dim_helpers.jl).
 
 # Type-stable partition of `alldims` against the (type-level) reduce-dim set `want`, given
 # the axis/ghost boundary `nax` (= ndims(parent(X))). Plain recursive tuple-peeling proved
@@ -148,12 +154,106 @@ function _assertconformable(sl, sz)
     end
 end
 
-Base.@constprop :aggressive Base.mapslices(f, X::TreeArray; dims) = _mapslices(f, X, Val(_dimnames(dims)))
+# ===================== `dims=` is foundALL, not foundany (decision 1iy1r57) =====================
+# `dims=` used to mean "reduce whichever of these names I find here" -- `_splitdims`'s flag is
+# literally `foundany`. So a name that resolved NOWHERE reduced nothing and yielded the `missing`
+# sentinel: a typo'd dim produced a plausible-looking result rather than an error. A single
+# Symbol hid it behind `missing`; a collection made it observable, since the typo's siblings
+# reduced normally and the result *looked* reduced. That is precisely what decision 16fwcnx
+# forbids -- "under no circumstances silently return a potentially-valid-looking value".
+#
+# Decidable from the TYPE alone: every dim name is a `TreeDim{N}` type parameter. The walk
+# reports `complete = false` at a non-concrete boundary (a JAGGED nesting hides its children's
+# names), because absence cannot be PROVEN there -- and rejecting a reduce TreeArrays exists to
+# serve would be far worse than missing one typo. So the assert stands down, never guesses.
+_alldimnames(::Type{T}) where T<:TreeData = begin
+    isconcretetype(T) || return ((), false)          # jagged: cannot see through, cannot prove absence
+    own = map(name, Tuple(fieldtype(fieldtype(T, :meta), :dims).parameters))
+    cnames, complete = _childdimnames(fieldtype(T, :parent))
+    ((own..., cnames...), complete)
+end
+_childdimnames(::Type{P}) where P<:AbstractArray{<:TreeData}        = _alldimnames(eltype(P))
+_childdimnames(::Type{P}) where P<:Tuple{TreeData,Vararg{TreeData}} = _alldimnames(eltype(P))
+_childdimnames(::Type{P}) where P<:TreeData                         = _alldimnames(P)   # bookkeeping wrapper
+_childdimnames(::Type{P}) where P<:NamedTuple = begin               # a record: union over its fields
+    acc, complete = (), true
+    for i in 1:fieldcount(P)
+        F = fieldtype(P, i)
+        nms, ok = F <: TreeData ? _alldimnames(F) : ((), true)
+        acc = (acc..., nms...)
+        complete &= ok
+    end
+    (acc, complete)
+end
+_childdimnames(::Type{P}) where P<:AbstractArray = ((), true)       # dense leaf
+_childdimnames(::Type{P}) where P<:Tuple         = ((), true)
+_childdimnames(::Type{P}) where P                = ((), true)       # scalar leaf
+
+# The INSTANCE always knows its own dims, even where the type does not. Only walked when the
+# type walk came back incomplete AND a name looked absent -- i.e. a jagged tree with a
+# suspected typo. Never on the hot path.
+_instancedimnames(X::TreeData) = (acc = Symbol[]; _collectdimnames!(acc, X); acc)
+function _collectdimnames!(acc, X::TreeData)
+    for d in TreeArrays.dims(X); push!(acc, name(d)); end
+    _collectchildnames!(acc, parent(X))
+end
+_collectchildnames!(acc, p::AbstractArray{<:TreeData}) = (for el in p; _collectdimnames!(acc, el); end; acc)
+_collectchildnames!(acc, p::Tuple{Vararg{TreeData}})   = (for el in p; _collectdimnames!(acc, el); end; acc)
+_collectchildnames!(acc, p::NamedTuple) = (for v in values(p); v isa TreeData && _collectdimnames!(acc, v); end; acc)
+_collectchildnames!(acc, p::TreeData)   = _collectdimnames!(acc, p)   # bookkeeping wrapper
+_collectchildnames!(acc, p::AbstractArray) = acc                      # dense leaf
+_collectchildnames!(acc, p::Tuple)         = acc
+_collectchildnames!(acc, p)                = acc                      # scalar leaf
+
+# `@generated`, so the common case folds away at compile time: a correct `dims=` on a concrete
+# tree costs nothing at runtime.
+@generated function _absentnames(::Type{T}, ::Val{want}) where {T<:TreeData, want}
+    names, complete = _alldimnames(T)
+    absent = Tuple(filter(nm -> !(nm in names), collect(want)))
+    :(($(absent), $(complete), $(Tuple(unique(names)))))
+end
+
+# The assert NEVER stands down. An earlier cut skipped the check whenever the type walk was
+# incomplete, reasoning that absence could not be *proven* through a jagged boundary. That left
+# a silent wrong answer: `dims=(:draw, :drwa)` on a jagged tree reduced `:draw`, dropped the
+# typo, and returned a plausible result. Absence is always provable -- just not always from the
+# type. Fall back to the instance rather than let a typo through (user, 2026-07-10: "always fail
+# loudly instead of doing something unexpected").
+@noinline function _assertdimsexist(X::TreeData, ::Val{want}) where want
+    absent, complete, have = _absentnames(typeof(X), Val(want))
+    isempty(absent) && return nothing
+    if !complete                                   # jagged: the type hid some names, the tree has them
+        seen = Tuple(unique(_instancedimnames(X)))
+        still = Tuple(filter(nm -> !(nm in seen), collect(want)))
+        isempty(still) && return nothing
+        absent, have = still, seen
+    end
+    error("TreeArrays: dims=$(want) names " *
+          (length(absent) == 1 ? "a dim that exists" : "dims that exist") *
+          " nowhere in this tree: $(absent). Available dims: $(have). " *
+          "`dims=` is foundALL -- a name that resolves nowhere is a typo, not an empty reduction.")
+end
+
+# The PUBLIC entry points assert; the recursion below calls `_mapslices` directly, so a branch
+# that legitimately lacks the dim is never mistaken for a typo.
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims)
+    valwant = Val(_dimnames(dims))
+    _assertdimsexist(X, valwant)
+    _mapslices(f, X, valwant)
+end
 function _mapslices(f, X::TreeArray, valwant::Val{want}) where want
     r = _reduceouter(f, X, valwant)
     isnothing(r) || return r
     alldims = TreeArrays.dims(X)
-    any(nm -> nm in map(name, alldims), want) || return missing   # dim absent here -> sentinel
+    # The name exists SOMEWHERE (the public entry proved it) but not on this branch. There is no
+    # value to return that is not either a lie or a sentinel, and the sentinel is what 1iy1r57
+    # retires: the Tables adapter already declares a heterogeneous-dims shape a non-goal, so a
+    # `missing` here could only ever travel to a melt that refuses it. Say so at the source.
+    any(nm -> nm in map(name, alldims), want) || error(
+        "TreeArrays: cannot reduce dims=$(want) on this branch -- it carries $(map(name, alldims)) " *
+        "and none of the requested dims, though they exist elsewhere in the tree. A dim present on " *
+        "some branches and absent on others is a heterogeneous-dims shape, which the Tables adapter " *
+        "already refuses; reduce a dim the whole branch carries, or split the tree.")
     TreeData(parent(X), (;dims = map(d -> name(d) in want ? sliced(d) : d, alldims)))
 end
 
@@ -184,31 +284,34 @@ end
     :(($(keep...),))
 end
 
-# Find the first non-missing field. Missing-ness is decidable from the TYPE alone (`Missing`
-# vs not) -- ordinary multiple dispatch, not a `Val`/`@generated` problem (dev #4.5: dispatch
-# instead of a value-level if/elseif).
-@inline _firstsample() = missing
-@inline _firstsample(v::Missing, rest...) = _firstsample(rest...)
-@inline _firstsample(v, rest...) = v
-
-Base.@constprop :aggressive Base.mapslices(f, X::TreeNamedTuple; dims) = _mapslices(f, X, Val(_dimnames(dims)))
+# `_firstsample` (find the first non-`missing` field) is GONE with 1iy1r57: a field that lacks
+# the dim now throws in `_mapslices(::TreeArray)` rather than yielding `missing`, so no field of
+# `newfields` can be `missing` and every field is a valid sample.
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeNamedTuple; dims)
+    valwant = Val(_dimnames(dims))
+    _assertdimsexist(X, valwant)
+    _mapslices(f, X, valwant)
+end
 function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}) where want
     rec  = outerdim(X)
     inner, ghosts = _splitrecord(TreeArrays.dims(X), Val(name(rec)))   # rec enumerates the fields, not an inner axis
-    newfields = map(v -> mapslices(f, _aschild(v, inner); dims=want), parent(X))
-    any(!ismissing, newfields) || return missing        # no child carried the dim -> sentinel
-    sample = _firstsample(newfields...)
+    newfields = map(v -> _mapslices(f, _aschild(v, inner), valwant), parent(X))   # `_mapslices`: children never re-assert
+    sample = first(newfields)
     have   = map(name, TreeArrays.dims(sample))
     extra  = _exclude(ghosts, Val(have))
     TreeData(newfields, (;dims = (TreeArrays.dims(sample)..., extra...), outer_dim = rec))
 end
 
-Base.@constprop :aggressive Base.mapslices(f, X::TreeRaggedArray; dims) = _mapslices(f, X, Val(_dimnames(dims)))
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims)
+    valwant = Val(_dimnames(dims))
+    _assertdimsexist(X, valwant)   # a typo, before any structural check can mistake it for a shape
+    _mapslices(f, X, valwant)
+end
 function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}) where want
     _assertnostraddle(X, valwant)
     r = _reduceouter(f, X, valwant)
     isnothing(r) || return r
-    TreeData(map(el -> mapslices(f, el; dims=want), parent(X)), meta(X))
+    TreeData(map(el -> _mapslices(f, el, valwant), parent(X)), meta(X))   # `_mapslices`: children never re-assert
 end
 
 # A multi-dim `dims=` that names BOTH this ragged node's outer axis AND a dim living inside

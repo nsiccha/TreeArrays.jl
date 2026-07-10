@@ -1313,4 +1313,56 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test mapslices(mean, wide; dims=(:time, :chan)) isa TreeData
     end
 
+
+    # `dims=` is foundALL, not foundany (decision 1iy1r57, user-directed). A name that resolves
+    # NOWHERE used to reduce nothing and yield the `missing` sentinel -- a typo'd dim produced a
+    # plausible-looking result rather than an error, which is exactly what 16fwcnx forbids. The
+    # check is type-level and `@generated`, so a correct `dims=` costs nothing at runtime.
+    @testset "dims= is foundALL: a name that resolves nowhere throws (1iy1r57)" begin
+        X = TreeData(reshape(1.0:12.0, 4, 3), :draw, :param)
+
+        @test_throws "exists nowhere in this tree" mapslices(sum, X; dims=:drwa)
+        # a typo INSIDE a collection: its siblings used to reduce, so the result looked reduced
+        @test_throws "exists nowhere in this tree" mapslices(sum, X; dims=(:draw, :prm))
+        @test_throws "Available dims: (:draw, :param)" mapslices(sum, X; dims=:nope)
+
+        # legitimate reduces are untouched
+        @test parent(mapslices(sum, X; dims=:draw)) == [10.0, 26.0, 42.0]
+        @test mapslices(sum, X; dims=(:draw, :param)) |> parent == 78.0
+
+        # a dim living on a LEAF is found from the root -- not mistaken for a typo
+        rag = TreeData([TreeData(randn(4, 3), :draw, :param) for _ in 1:3], :subject)
+        @test mapslices(mean, rag; dims=:draw) isa TreeData
+        nt = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(4), :draw)))
+        @test keys(parent(mapslices(mean, nt; dims=:draw))) == (:a, :b)
+
+        # A JAGGED tree hides its children's names behind a non-concrete eltype. A legitimate
+        # reduce must still work...
+        P = reshape(1.0:42.0, 6, 7)
+        iA = TreeData([TreeData(view(P,:,[1,2]), :draw, :subject), TreeData(view(P,:,[3]), :draw, :subject)],
+                      TreeDim(:dose, (10, 20)))
+        iB = TreeData([TreeData(view(P,:,[4,5]), :draw, :subject)], TreeDim(:dose, (20,)))
+        jag = TreeData([iA, iB], TreeDim(:study, (:A, :B)))
+        @test quantile(jag, :band => (lo=0.25, hi=0.75); dims=(:draw, :subject)) isa TreeData
+
+        # ...and the assert must NOT stand down there. An earlier cut skipped the check whenever
+        # the type walk was incomplete, on the reasoning that absence could not be *proven*. That
+        # left a silent wrong answer: `dims=(:draw,:drwa)` reduced `:draw`, dropped the typo, and
+        # returned a plausible result. Absence is always provable -- just not always from the type.
+        @test_throws "exists nowhere in this tree" mapslices(sum, jag; dims=(:draw, :drwa))
+        @test_throws "exists nowhere in this tree" mapslices(sum, jag; dims=:drwa)
+        # and a dim that lives BELOW the jagged boundary is still found, not called a typo
+        @test mapslices(sum, jag; dims=:subject) isa TreeData
+
+        # the `missing` sentinel is RETIRED as a reduction output: a branch that lacks a dim the
+        # tree has elsewhere is a heterogeneous-dims shape, which the Tables adapter already
+        # refuses. It now says so at the source instead of travelling to a melt that rejects it.
+        het = TreeData(:rec=>(;a=TreeData(randn(4), :draw), b=TreeData(randn(3), :other)))
+        @test_throws "heterogeneous-dims shape" mapslices(mean, het; dims=:draw)
+
+        # `missing` is still the UNLABELLED-AXIS marker -- a different job, untouched (see below)
+        @test TreeArrays._isaxis(TreeDim(:draw))
+        @test TreeArrays.meta(TreeDim(:draw)).values === missing
+    end
+
 end
