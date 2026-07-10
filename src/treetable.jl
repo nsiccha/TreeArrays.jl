@@ -69,40 +69,62 @@ Tables.columns(tt::TreeTable{TX, ()}) where TX   = _buildcolumns(_source(tt))
 Tables.schema(::TreeTable{TX, ()}) where TX      = Tables.Schema(_schema(TX)...)
 Tables.columnnames(::TreeTable{TX, ()}) where TX = _schema(TX)[1]
 
-# --- wide=(dim,) : spread ONE axis's levels into columns.
+# --- wide=(dims...) : spread the named AXES' levels into columns.
 #
 # The melt already lays every column out over a single shared `rowdims` tuple,
-# and every column decodes its row index through that same tuple. So widening an
-# axis is a pure RE-INDEXING of the columns the long melt already built: delete
-# the wide axis's slot from the row space, and for each of its levels re-present
-# each value column as a view that pins that slot. Nothing is recomputed, nothing
-# is materialized -- `WideColumn` wraps the very same lazy `ValueColumn` /
-# `AxisColumn` / `ConstColumn` objects (decision 1uzarfr).
+# and every column decodes its row index through that same tuple. So widening a
+# set of axes is a pure RE-INDEXING of the columns the long melt already built:
+# delete their slots from the row space, and for each combination of their levels
+# re-present each value column as a view that pins those slots. Nothing is
+# recomputed, nothing is materialized -- `WideColumn` wraps the very same lazy
+# `ValueColumn` / `AxisColumn` / `ConstColumn` objects (decision 1uzarfr).
 #
 # This is why the pivot needs no new melt path and no new leaf walk: one column
-# type, reused for all three.
+# type, reused for all three, at any number of wide dims.
+#
+# `wide=:band` (one dim) is the case consumers actually want -- AoV's
+# `lineribbon(bands=[:lower => :upper])` takes exactly one widened axis, and a
+# single dim's combo label is the bare level name. k > 1 multiplies the column
+# count by each further axis's level count (and divides the row count by the
+# same), which is inherent to a pivot rather than a defect.
 
-# `pos` lives in the TYPE so the tuple splice below stays allocation-free -- the
-# same reason `_taken`/`_dropn` (tables.jl) exist.
-struct WideColumn{T, C<:AbstractVector{T}, K, KR, POS} <: AbstractVector{T}
+# `PLAN` lives in the TYPE so the full-index reconstruction below unrolls and
+# constant-folds -- the same reason `_taken`/`_dropn` (tables.jl) exist. For slot `j`
+# of the long row space: `PLAN[j] > 0` reads reduced index `PLAN[j]`, `PLAN[j] < 0`
+# reads pinned level `-PLAN[j]`. A single wide dim is just `NP == 1`; nothing about
+# the re-indexing is special-cased for it.
+struct WideColumn{T, C<:AbstractVector{T}, K, KR, NP, PLAN} <: AbstractVector{T}
     col::C                       # a column of the LONG melt, indexed over `rowdims`
     rowdims::NTuple{K,Int}       # the long row space
-    redrowdims::NTuple{KR,Int}   # `rowdims` minus the widened slot
-    level::Int                   # the position this column pins along that slot
+    redrowdims::NTuple{KR,Int}   # `rowdims` minus every widened slot
+    levels::NTuple{NP,Int}       # the level this column pins along each widened slot
     len::Int                     # prod(redrowdims) -- the wide row count
 end
-_deleteat(t::Tuple, pos::Int) = (t[1:pos-1]..., t[pos+1:end]...)   # construction-time only
-_insertat(t::Tuple, ::Val{P}, v) where P = (_taken(t, Val(P-1))..., v, _dropn(t, Val(P-1))...)
 
-function WideColumn(col::AbstractVector, rowdims::NTuple{K,Int}, pos::Int, level::Int) where K
-    red = _deleteat(rowdims, pos)
-    WideColumn{eltype(col), typeof(col), K, K-1, pos}(col, rowdims, red, level, prod(red; init=1))
+# The reduced row space and the slot plan depend only on (rowdims, poss) -- they are the
+# SAME for every column of one pivot, so `_pivotcolumns` computes them once and hands
+# them down. Only `levels` varies per column. (Recomputing them per column cost ~57% more
+# allocation in `Tables.columns`, which the O(structure) acceptance gate caught.)
+_deletemany(t::NTuple{K,Int}, poss) where K = Tuple(t[j] for j in 1:K if !(j in poss))
+function _slotplan(K::Int, poss::NTuple{NP,Int}) where NP
+    plan, r = Vector{Int}(undef, K), 0
+    for j in 1:K
+        m = findfirst(==(j), poss)
+        plan[j] = m === nothing ? (r += 1) : -m
+    end
+    Tuple(plan)
 end
+
+# `PLAN` arrives as a `Val` so it lands in the type without a per-column recomputation.
+_widecolumn(col::AbstractVector, rowdims::NTuple{K,Int}, red::NTuple{KR,Int}, ::Val{PLAN},
+            levels::NTuple{NP,Int}, len::Int) where {K,KR,PLAN,NP} =
+    WideColumn{eltype(col), typeof(col), K, KR, NP, PLAN}(col, rowdims, red, levels, len)
 Base.size(c::WideColumn) = (c.len,)
 Base.IndexStyle(::Type{<:WideColumn}) = IndexLinear()
-function Base.getindex(c::WideColumn{T,C,K,KR,POS}, i::Int) where {T,C,K,KR,POS}
+function Base.getindex(c::WideColumn{T,C,K,KR,NP,PLAN}, i::Int) where {T,C,K,KR,NP,PLAN}
     ridx = Tuple(CartesianIndices(c.redrowdims)[i])
-    c.col[LinearIndices(c.rowdims)[_insertat(ridx, Val(POS), c.level)...]]
+    full = ntuple(j -> (p = PLAN[j]; p > 0 ? ridx[p] : c.levels[-p]), Val(K))
+    c.col[LinearIndices(c.rowdims)[full...]]
 end
 
 # Vega-Lite reads a dot in a field name as nested property access (aov-use §9),
@@ -142,41 +164,60 @@ _levelname(wname::Symbol, v) = Symbol(wname, '_', _sanitize(v))
 #
 # The columns themselves stay concretely-typed lazy views, which is what a Tables
 # consumer's contract actually requires (aov-use §2).
+# A combo's column name joins one level label per widened dim, in `wide` order. With a
+# single wide dim that is the bare level label (`:lower`) -- which is what makes the
+# output drop into `lineribbon(bands=[:lower => :upper])`.
+_combolabel(labels, ls) = Symbol(join((labels[m][ls[m]] for m in eachindex(ls)), '_'))
+
 function _pivotcolumns(tt::TreeTable)
     w = _widedims(tt)
-    length(w) == 1 || error("TreeTable: wide=$(w) -- exactly one wide dim is supported (got $(length(w)))")
-    wname = only(w)
+    allunique(w) || error("TreeTable: wide=$(w) names the same dim more than once")
     long = _buildcolumns(_source(tt))
-    wcol = long[wname]   # `_validatewide` already proved the name exists in the melt
-    wcol isa AxisColumn || error("TreeTable: wide=$(wname) is a fixed/ghost dim, not a real axis -- it has no levels to spread into columns")
+    wcols = map(nm -> long[nm], w)   # `_validatewide` already proved each name is in the melt
+    for (nm, c) in zip(w, wcols)
+        c isa AxisColumn || error("TreeTable: wide=$(nm) is a fixed/ghost dim, not a real axis -- it has no levels to spread into columns")
+    end
 
-    rowdims, pos = wcol.rowdims, wcol.pos
-    nlevels = rowdims[pos]
-    labels = ntuple(l -> _levelname(wname, _dimvalue(wcol.values, l)), nlevels)
-    allunique(labels) || error("TreeTable: wide=$(wname) levels collide as column names after sanitizing: $(labels)")
+    # every melt column decodes through the SAME `rowdims`, so one widened dim's view of
+    # it is every widened dim's view of it
+    rowdims = first(wcols).rowdims
+    poss    = map(c -> c.pos, wcols)
+    nlevels = map(p -> rowdims[p], poss)
+    labels  = map((nm, c, L) -> ntuple(l -> _levelname(nm, _dimvalue(c.values, l)), L), w, wcols, nlevels)
+
+    # k wide dims -> the cartesian product of their levels. Column count multiplies, which
+    # is inherent to a pivot (and why no consumer has wanted k > 1); rows divide by the
+    # same factor. Nothing densifies either way -- `WideColumn` still wraps the same lazy
+    # melt columns.
+    combos = Iterators.product(map(L -> 1:L, nlevels)...)
+    red  = _deletemany(rowdims, poss)                # shared by every output column
+    plan = Val(_slotplan(length(rowdims), poss))
+    len  = prod(red; init=1)
 
     names, cols = Symbol[], Any[]
     for (nm, c) in pairs(long)
-        nm === wname && continue                     # its levels BECOME the columns
+        nm in w && continue                          # their levels BECOME the columns
         if c isa ValueColumn
-            for l in 1:nlevels
+            for ls in combos
                 # `:value` is the long melt's placeholder name for an unnamed leaf and
                 # carries no information; a record field's name does, and is kept.
-                push!(names, nm === :value ? labels[l] : Symbol(nm, '_', labels[l]))
-                push!(cols, WideColumn(c, rowdims, pos, l))
+                suffix = _combolabel(labels, ls)
+                push!(names, nm === :value ? suffix : Symbol(nm, '_', suffix))
+                push!(cols, _widecolumn(c, rowdims, red, plan, Tuple(ls), len))
             end
         else
-            # an id column (axis coord / fixed value) reads its own slot only, so the
-            # level it is pinned at cannot change what it returns -- pin level 1.
+            # an id column (axis coord / fixed value) reads only its OWN slot, which is
+            # never a widened one, so the levels it is pinned at cannot change what it
+            # returns -- pin level 1 everywhere.
             push!(names, nm)
-            push!(cols, WideColumn(c, rowdims, pos, 1))
+            push!(cols, _widecolumn(c, rowdims, red, plan, map(_ -> 1, poss), len))
         end
     end
     # A level label can also collide with an ID column (`wide=:band` with a `:lower`
     # level, on a tree that already has a `:lower` dim) or with another field's
     # prefixed name. `NamedTuple` would catch it, but only as "duplicate field name
     # in NamedTuple" -- which names neither the pivot nor the culprit.
-    allunique(names) || error("TreeTable: wide=$(wname) produced duplicate column names $(_dups(names)) -- a level label collides with another column of the melt")
+    allunique(names) || error("TreeTable: wide=$(w) produced duplicate column names $(_dups(names)) -- a level label collides with another column of the melt")
     NamedTuple{Tuple(names)}(Tuple(cols))
 end
 

@@ -823,7 +823,8 @@ end
               (:draw, :a_lo, :a_mid, :a_hi, :b_lo, :b_mid, :b_hi)
 
         # multi-dim wide is not built; it must say so, not silently widen just one
-        @test_throws "exactly one wide dim" Tables.columns(TreeTable(r; wide=(:band, :param)))
+        # multi-dim wide is built now (1e3figi) -- its own testset below
+        @test length(Tables.columnnames(Tables.columns(TreeTable(r; wide=(:band, :param))))) == 9
 
         # a ragged source stays loud under wide, exactly as it is under long
         rag = TreeData([TreeData(randn(n), :time) for n in (2, 3)], :subject)
@@ -840,6 +841,60 @@ end
         @info "wide pivot acceptance gate: Tables.columns @allocated (50 vs 50000 draws)" a_wsmall a_wbig
         @test isapprox(a_wbig, a_wsmall; rtol=0.3)
         @test length(Tables.getcolumn(Tables.columns(wbig), :mid)) == 50000
+    end
+
+    # `wide=(:a,:b)` widens several axes at once: the cartesian product of their levels
+    # names the columns. Same re-indexing as one dim -- `WideColumn` pins a SET of slots
+    # and k == 1 is just NP == 1, not a special case. (1e3figi: treetable.jl's header had
+    # promised plural since the pivot landed.)
+    @testset "TreeTable(wide=(:a,:b)) pivots several axes at once (1e3figi)" begin
+        spec = (lower=0.25, median=0.5, upper=0.75)
+        r = quantile(TreeData(reshape(1.0:12.0, 4, 3), :draw, :param), :band => spec; dims=:draw)
+
+        # k == 2 over a 2-dim melt: the row space empties out entirely
+        tt2 = TreeTable(r; wide=(:band, :param))
+        c2 = Tables.columns(tt2)
+        @test length(Tables.columnnames(c2)) == 9          # 3 bands x 3 params, no id columns left
+        @test length(Tables.rowtable(tt2)) == 1
+        @test :lower_param_1 in Tables.columnnames(c2) && :upper_param_3 in Tables.columnnames(c2)
+
+        # every wide cell still equals the long melt's corresponding cell
+        long = Tables.rowtable(TreeTable(r))
+        row = only(Tables.rowtable(tt2))
+        for lvl in keys(spec), j in 1:3
+            @test getproperty(row, Symbol(lvl, "_param_", j)) ==
+                  only(filter(l -> l.param == j && l.band === lvl, long)).value
+        end
+
+        # `wide` order names the columns; it never changes the DATA
+        c2b = Tables.columns(TreeTable(r; wide=(:param, :band)))
+        @test collect(Tables.getcolumn(c2b, :param_1_lower)) == collect(Tables.getcolumn(c2, :lower_param_1))
+
+        # widening 2 of 3 axes leaves the third as a real long row axis
+        X3 = TreeData(reshape(1.0:24.0, 4, 3, 2), :draw, :param, :arm)
+        c3 = Tables.columns(TreeTable(X3; wide=(:param, :arm)))
+        @test length(Tables.columnnames(c3)) == 1 + 3*2    # :draw + 6 value columns
+        @test length(Tables.getcolumn(c3, :draw)) == 4
+        lt = Tables.rowtable(TreeTable(X3))
+        for row in Tables.rowtable(TreeTable(X3; wide=(:param, :arm))), p in 1:3, a in 1:2
+            @test getproperty(row, Symbol("param_", p, "_arm_", a)) ==
+                  only(filter(l -> l.draw == row.draw && l.param == p && l.arm == a, lt)).value
+        end
+
+        @test_throws "the same dim more than once" Tables.columns(TreeTable(X3; wide=(:param, :param)))
+        @test_throws "not a real axis" Tables.columns(TreeTable(
+            TreeData(randn(4), TreeDim(:draw, 1:4), TreeDim(:tag, :fixedtag)); wide=(:tag,)))
+
+        # the multi-slot re-indexing stays allocation-free PER CELL: cost matches a plain
+        # Vector and does not grow with rows. (The residual is `@allocated` boxing its own
+        # return value -- a plain Vector{Float64} measures exactly the same.)
+        sumcol(c) = (t = zero(eltype(c)); for i in eachindex(c); t += c[i]; end; t)
+        wcol(n) = Tables.getcolumn(Tables.columns(TreeTable(
+            TreeData(reshape(1.0:(n*3*2), n, 3, 2), :draw, :param, :arm); wide=(:param, :arm))), :param_1_arm_2)
+        alloc(c) = (sumcol(c); @allocated sumcol(c))
+        baseline = alloc(randn(4000))
+        @test alloc(wcol(4)) == baseline
+        @test alloc(wcol(40_000)) == baseline               # flat in the row count
     end
 
     # Base honours `:limit` for AbstractArrays but NOT for `Tuple` (`show` renders
