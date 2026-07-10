@@ -386,6 +386,44 @@ end
         end
     end
 
+    # A reduction is NOT a precondition for table-ness, and a coordinate axis is not
+    # restricted to numeric levels -- `treearrays-use` §9 implied both. The spaghetti
+    # consumer (per-draw lines, `group=:draw`) needs an UNREDUCED tree whose `:draw`
+    # axis carries String ids that stay unique across product-sweep cells.
+    @testset "Tables.jl: an UNREDUCED tree melts long; String axis levels survive" begin
+        ndraw, ntime = 4, 3
+        vals     = reshape(collect(1.0:ndraw*ntime), ndraw, ntime)
+        draw_ids = ["comboA_$d" for d in 1:ndraw]
+        times    = [0.0, 0.5, 1.0]
+        td = TreeData(vals, :draw => draw_ids, :time_h => times)   # no reduction applied
+
+        @test Tables.istable(typeof(td))
+        sch = Tables.schema(td)
+        @test sch.names == (:draw, :time_h, :value)
+        @test sch.types == (String, Float64, Float64)
+
+        cols = Tables.columns(td)
+        @test Tables.columnnames(cols) == sch.names
+        # the String axis stays a lazy, concretely-typed view -- never materialized
+        @test Tables.getcolumn(cols, :draw) isa TreeArrays.AxisColumn{String}
+        @test Tables.getcolumn(cols, :value) isa TreeArrays.ValueColumn{Float64}
+        @test length(Tables.getcolumn(cols, :value)) == ndraw * ntime
+        # one row per (draw, time); every draw id recurs once per time point, so a
+        # `group=:draw` channel yields exactly `ndraw` lines and fuses none of them.
+        @test length(unique(Tables.getcolumn(cols, :draw))) == ndraw
+        @test collect(Tables.getcolumn(cols, :draw))[1:ndraw] == draw_ids
+        @test collect(Tables.getcolumn(cols, :value)) == vec(vals)
+
+        # wide-vs-long is decided by the BACKING CONTAINER, not by the label type:
+        # Symbol levels on an array-backed axis still melt LONG (a `:band` column)...
+        symaxis = TreeData([1.0, 2.0, 3.0], :band => (:lower, :median, :upper))
+        @test Tables.columnnames(Tables.columns(symaxis)) == (:band, :value)
+        @test Tables.getcolumn(Tables.columns(symaxis), :band) isa TreeArrays.AxisColumn{Symbol}
+        # ...while a NamedTuple *record* parent, same labels, goes WIDE.
+        rec = TreeData(:quantile => (lower=1.0, median=2.0, upper=3.0))
+        @test Tables.columnnames(Tables.columns(rec)) == (:lower, :median, :upper)
+    end
+
     @testset "Tables.jl: stats_percentiles schema + view columns (stat/population/posterior)" begin
         stats_percentiles = _tt_stats_percentiles()
         @test Tables.istable(typeof(stats_percentiles))
