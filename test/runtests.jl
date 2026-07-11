@@ -1381,6 +1381,16 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         # mean/sum + both wide spellings pool identically; reducing EVERY axis -> one leaf
         @test all(parent(mean(ragged; dims=(:draw, :chain)))[j] ≈ mean(vec(A[:, :, j])) for j in 1:nparam)
         @test all(parent(sum(ragged;  dims=(:draw, :chain)))[j] ≈ sum(vec(A[:, :, j]))  for j in 1:nparam)
+        # std/var pool the SAME bag (snag std-var-pooled-r, reporter Bruno:treearrays): byte-identical
+        # to the DENSE reduce AND to base-Julia over the flattened (draw x chain) block. `corrected`
+        # defaults to `true` => SAMPLE variance (÷(n-1)), matching `std(some_vector)`; `false` => ÷n.
+        for (r_ragged, base) in ((std(ragged; dims=(:draw,:chain)), std), (var(ragged; dims=(:draw,:chain)), var))
+            @test all(parent(r_ragged)[j] == base(vec(A[:, :, j])) for j in 1:nparam)                     # == base-Julia
+        end
+        @test all(parent(std(ragged; dims=(:draw,:chain)))[j] == parent(std(TreeData(A, :draw,:chain,:param=>(:a,:b,:c)); dims=(:draw,:chain)))[j] for j in 1:nparam)  # == dense
+        n = ndraw * nchain
+        @test all(parent(var(ragged; dims=(:draw,:chain), corrected=false))[j] == var(vec(A[:,:,j]); corrected=false) for j in 1:nparam)   # population (÷n)
+        @test parent(var(ragged; dims=(:draw,:chain)))[1] / parent(var(ragged; dims=(:draw,:chain), corrected=false))[1] ≈ n / (n - 1)      # Bessel factor
         rp = quantile(ragged, :band => (lo=0.025, med=0.5); dims=(:draw, :chain))
         @test parent(parent(rp)[1])[2] ≈ quantile(vec(A[:, :, 1]), 0.5)
         rw = nanquantile(ragged, (median=0.5, lo=0.025); dims=(:draw, :chain))

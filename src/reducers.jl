@@ -2,6 +2,22 @@
 Statistics.mean(X::TreeData; dims=nothing) = isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims)
 Base.sum(X::TreeData; dims=nothing) = isnothing(dims) ? sum(parent(X)) : mapslices(sum, X; dims)
 
+# std / var mirror mean/sum: delegate to mapslices, so they compose with the whole reduction
+# machinery -- a purely-inner reduce, a dense multi-axis pool, AND the ragged (:draw,:chain)
+# straddle (`_pooledstraddle`, mapslices.jl) all hand the kernel the WHOLE pooled slice, one bag.
+# So `std(coll; dims=(:draw,:chain))` on a `(chain -> (draw,param))` ragged tree is byte-identical
+# to the dense `std(TreeData(arr3d,:draw,:chain,:param); dims=(:draw,:chain))` -- a pooled variance
+# is one pass over the whole (draw x chain) bag, NOT the composition of two reductions.
+# `corrected` is forwarded: the default `true` gives the SAMPLE variance (÷(n-1)) -- Statistics'
+# own default, matching `std(some_vector)` -- and `corrected=false` gives the population (÷n) form.
+# `mean=` is intentionally NOT forwarded: one precomputed mean cannot apply across the per-slice
+# reductions. The closure `v -> var(v; corrected)` still specializes `mapslices` on its concrete
+# type (§5) -- it forwards a Bool, it does not dispatch per element.
+Statistics.var(X::TreeData; corrected::Bool=true, dims=nothing) =
+    isnothing(dims) ? var(parent(X); corrected) : mapslices(v -> var(v; corrected), X; dims)
+Statistics.std(X::TreeData; corrected::Bool=true, dims=nothing) =
+    isnothing(dims) ? std(parent(X); corrected) : mapslices(v -> std(v; corrected), X; dims)
+
 # quantile delegates to mapslices; pdim bundles the output axis name + values,
 # kept EXACTLY as given (Tuple stays Tuple, Vector stays Vector, Number stays
 # Number) -- fed RAW to quantile!, which mirrors the same container back into
