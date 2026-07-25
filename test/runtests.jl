@@ -629,64 +629,175 @@ end
         @info "Delta A acceptance gate: Tables.columns(X) @allocated (50 vs 5000 cols)" a_homog_small a_homog_big a_hetero_small a_hetero_big
     end
 
-    @testset "Tables.jl: ragged trees error clearly at Tables.columns (schema still succeeds -- type-only)" begin
+    # A ragged tree melts LONG: the row count is `sum(length, leaves)`, not a product
+    # of axis lengths, and each row's coordinate is read from the position it occupies
+    # in its OWN subtree. Long form never needed rectangularity -- only the `wide=`
+    # pivot does (a pivot needs ONE level set and ONE column length), and that stays
+    # refused below. This is the shape `treearrays-use` §8 names as the ragged case.
+    @testset "Tables.jl: ragged trees melt LONG (rows are a SUM, not a product)" begin
         # matches docs/pkpd_demo.jl's input_data shape: per-subject arrays of
         # genuinely differing length under an outer :subject axis.
         n_subjects = 4
         n_measurements = [3, 5, 3, 3]   # subject 2 differs -- ragged
-        measurement = map(n -> TreeData(randn(n), :time => sort(randn(n))), n_measurements)
-        ragged = TreeData(measurement, :subject)
+        times = [sort(randn(n)) for n in n_measurements]
+        vals  = [randn(n) for n in n_measurements]
+        ragged = TreeData(map(TreeData(:time), vals, times), :subject)
 
         @test Tables.schema(ragged) isa Tables.Schema   # type-only -- physically cannot see instance raggedness
-        @test_throws "ragged trees are not a supported Tables shape yet" Tables.columns(ragged)
+        @test Tables.schema(ragged).names == (:subject, :time, :value)
+        cols = Tables.columns(ragged)
 
-        # the regular (same length, identical coordinates) counterpart works fine
+        # THE point: 14 rows, not a 4 x ? product. Nothing was densified to get here.
+        @test length(Tables.getcolumn(cols, :value)) == sum(n_measurements) == 14
+        # each sibling's rows are contiguous, so every column is its per-leaf
+        # concatenation -- the melt a consumer would otherwise hand-roll with
+        # `reduce(vcat, ...)` + `fill(label, n)`.
+        @test Tables.getcolumn(cols, :value) == reduce(vcat, vals)
+        @test Tables.getcolumn(cols, :time)  == reduce(vcat, times)
+        # `:subject` is an UNLABELLED axis here, so its coordinate is the index --
+        # repeated exactly its own leaf's length, never smeared to a common width.
+        @test Tables.getcolumn(cols, :subject) ==
+              reduce(vcat, [fill(s, n) for (s, n) in enumerate(n_measurements)])
+
+        # a ragged boundary cannot read `:time` off one representative, so that column
+        # walks per row; the OUTER axis still reads its own plan slot directly.
+        @test Tables.getcolumn(cols, :time) isa TreeArrays.WalkAxisColumn
+        @test Tables.getcolumn(cols, :subject) isa TreeArrays.AxisColumn
+
+        # the regular (same length, identical coordinates) counterpart is UNCHANGED:
+        # same dense product row space, same O(1)-storage shared columns.
         shared_times = sort(randn(3))
         regular = TreeData(map(_ -> TreeData(randn(3), :time => shared_times), 1:n_subjects), :subject)
-        cols = Tables.columns(regular)
-        @test length(Tables.getcolumn(cols, :value)) == n_subjects * 3
+        rcols = Tables.columns(regular)
+        @test length(Tables.getcolumn(rcols, :value)) == n_subjects * 3
+        @test Tables.getcolumn(rcols, :time) isa TreeArrays.AxisColumn
     end
 
+    # The `===`-then-`isequal` coordinate signature no longer decides ACCEPT vs ERROR --
+    # it decides SHARED vs PER-ROW columns. Siblings that agree keep the O(1)-storage
+    # `AxisColumn`/`ConstColumn` this adapter has always built; siblings that diverge get
+    # `Walk*` columns that re-read the dim from the sibling each row lands in. So the two
+    # false-positive cases still matter exactly as much: a miss is now a silent storage
+    # and speed downgrade on a perfectly regular tree instead of a spurious error.
     @testset "Tables.jl: coordinate-value guard (===-fast-path + isequal fallback, Option A)" begin
         # false positive 1: siblings share the SAME coordinate object -- every
         # comparison is an `===` hit, O(1), zero `isequal` calls needed.
         shared_times = sort(randn(3))
         shared_obj = TreeData(map(_ -> TreeData(randn(3), :time => shared_times), 1:4), :subject)
         @test length(Tables.getcolumn(Tables.columns(shared_obj), :value)) == 12
+        @test Tables.getcolumn(Tables.columns(shared_obj), :time) isa TreeArrays.AxisColumn
 
         # false positive 2: siblings each get their OWN, independently-built but
-        # value-equal coordinate array -- `===` misses, `isequal` accepts, still
-        # NOT rejected as ragged.
+        # value-equal coordinate array -- `===` misses, `isequal` accepts, so this
+        # is still recognised as regular and still gets ONE shared column.
         distinct_but_equal = TreeData(map(_ -> TreeData(randn(3), :time => copy(shared_times)), 1:4), :subject)
         @test length(Tables.getcolumn(Tables.columns(distinct_but_equal), :value)) == 12
+        @test Tables.getcolumn(Tables.columns(distinct_but_equal), :time) isa TreeArrays.AxisColumn
 
-        # true positive, single-level: same lengths, genuinely different
-        # per-sibling coordinate VALUES -- rejected, message names the dim.
-        differing = TreeData([TreeData(randn(3), :time => sort(randn(3))) for _ in 1:4], :subject)
-        @test_throws "ragged trees are not a supported Tables shape yet" Tables.columns(differing)
-        @test_throws "time" Tables.columns(differing)
+        # divergence, single-level: same lengths, genuinely different per-sibling
+        # coordinate VALUES. The row space IS still a product (so the dense decode and
+        # the pre-existing row order are kept -- outermost varies FASTEST), but `:time`
+        # cannot be read off one representative, so it walks.
+        dtimes = [sort(randn(3)) for _ in 1:4]
+        dvals  = [randn(3) for _ in 1:4]
+        differing = TreeData(map(TreeData(:time), dvals, dtimes), :subject)
         @test Tables.schema(differing) isa Tables.Schema   # schema still succeeds -- type-only
+        dcols = Tables.columns(differing)
+        @test length(Tables.getcolumn(dcols, :value)) == 12
+        @test Tables.getcolumn(dcols, :time) isa TreeArrays.WalkAxisColumn
+        @test Tables.getcolumn(dcols, :time)  == vec([dtimes[s][k] for s in 1:4, k in 1:3])
+        @test Tables.getcolumn(dcols, :value) == vec([dvals[s][k]  for s in 1:4, k in 1:3])
 
-        # true positive, multi-level: TWO top-level siblings, each internally
-        # uniform (all of subject A's visits share ONE :time array, all of
-        # subject B's visits share a DIFFERENT one) -- an own-level-only check
-        # would miss this (each boundary's own siblings look consistent); the
-        # full recursive coordinate signature catches it via the representative
-        # (first-visit) path comparison at the TOP boundary.
+        # divergence, multi-level: TWO top-level siblings, each internally uniform (all of
+        # subject A's visits share ONE :time array, all of subject B's visits share a
+        # DIFFERENT one) -- an own-level-only check would miss this (each boundary's own
+        # siblings look consistent); the full recursive coordinate signature catches it via
+        # the representative (first-visit) path comparison at the TOP boundary. Checked
+        # per row rather than per column: a coordinate smeared from the representative
+        # would still produce 12 plausible rows, just ones whose `:time` and `:value` come
+        # from different leaves. Pinning them TOGETHER is what catches that.
         time_a, time_b = sort(randn(2)), sort(randn(2))
         subject_a = TreeData([TreeData(randn(2), :time => time_a) for _ in 1:3], :visit)
         subject_b = TreeData([TreeData(randn(2), :time => time_b) for _ in 1:3], :visit)
         nested_differing = TreeData([subject_a, subject_b], :subject)
-        @test_throws "ragged trees are not a supported Tables shape yet" Tables.columns(nested_differing)
-        @test_throws "time" Tables.columns(nested_differing)
+        nrt = Tables.rowtable(nested_differing)
+        @test length(nrt) == 2 * 3 * 2
+        @test all(nrt) do r
+            tv = r.subject == 1 ? time_a : time_b
+            k  = findfirst(==(r.time), tv)
+            leaf = parent(parent(nested_differing)[r.subject])[r.visit]
+            k !== nothing && r.value == parent(leaf)[k]
+        end
 
         # the multi-level REGULAR counterpart (both subjects share ONE :time
-        # object across all visits, all subjects) still works.
+        # object across all visits, all subjects) still gets shared columns.
         time_shared = sort(randn(2))
         subject_a2 = TreeData([TreeData(randn(2), :time => time_shared) for _ in 1:3], :visit)
         subject_b2 = TreeData([TreeData(randn(2), :time => time_shared) for _ in 1:3], :visit)
         nested_regular = TreeData([subject_a2, subject_b2], :subject)
         @test length(Tables.getcolumn(Tables.columns(nested_regular), :value)) == 2 * 3 * 2
+        @test Tables.getcolumn(Tables.columns(nested_regular), :time) isa TreeArrays.AxisColumn
+    end
+
+    # The correctness case the snag's ask does not itself name, but which the same
+    # boundary decides: once a boundary is KNOWN divergent, the FIXED dims below it must
+    # be read per-sibling too. Reading `dose` off the representative would print subject
+    # 1's dose on every subject's rows -- silently reintroducing the metadata smear (§6)
+    # that TreeArrays exists to retire, at exactly the boundary TreeArrays owns.
+    #
+    # Scope, precisely: divergence is detected from SHAPE or from AXIS coordinates, and
+    # the fixed dims then follow that verdict. A cohort agreeing on BOTH and differing
+    # only on a fixed value is still smeared -- decision 4b3vcd's beta case, unchanged
+    # and deliberate (detecting it needs a per-element walk, which is O(rows) -- see
+    # `_coordsig`). Pinned at the bottom so that boundary stays visible in the tests
+    # rather than reading like an oversight.
+    @testset "Tables.jl: per-sibling FIXED dims are read per row, never smeared (ragged)" begin
+        doses = [20, 200, 20]
+        vals  = [randn(n) for n in (2, 4, 3)]
+        times = [sort(randn(n)) for n in (2, 4, 3)]
+        cohort = TreeData([TreeData(vals[s], :time => times[s]; dose = doses[s]) for s in 1:3],
+                          :subject => ["s1", "s2", "s3"])
+
+        cols = Tables.columns(cohort)
+        @test Tables.schema(cohort).names == (:subject, :time, :dose, :value)
+        @test length(Tables.getcolumn(cols, :value)) == 9
+        # each subject's own dose, repeated exactly its own leaf's length
+        @test Tables.getcolumn(cols, :dose) == reduce(vcat, [fill(d, length(v)) for (d, v) in zip(doses, vals)])
+        @test Tables.getcolumn(cols, :dose) isa TreeArrays.WalkConstColumn
+        @test Tables.getcolumn(cols, :subject) == reduce(vcat, [fill("s$s", length(vals[s])) for s in 1:3])
+        @test Tables.getcolumn(cols, :value) == reduce(vcat, vals)
+        @test Tables.getcolumn(cols, :time)  == reduce(vcat, times)
+
+        # a cohort that AGREES on the fixed dim keeps the de-duplicated O(1) ConstColumn
+        agree = TreeData([TreeData(randn(3), :time => 1:3; dose = 20) for _ in 1:3],
+                         :subject => ["s1", "s2", "s3"])
+        @test Tables.getcolumn(Tables.columns(agree), :dose) isa TreeArrays.ConstColumn
+
+        # 4b3vcd beta, UNCHANGED: identical shape AND identical axis coords, differing
+        # fixed value only -> the divergence is not detected, and the representative's
+        # value is reported for every row. This is the documented boundary, not a
+        # regression of the above: express a per-sibling value as an AXIS coordinate.
+        smeared = TreeData([TreeData(randn(3), :time => 1:3; dose = 10d) for d in 1:3],
+                           :subject => ["s1", "s2", "s3"])
+        @test Tables.getcolumn(Tables.columns(smeared), :dose) == fill(10, 9)
+    end
+
+    # The lazy-column invariant (decision 1uzarfr) has to survive the ragged path too:
+    # a `Walk*` column is still a view-with-a-rule, so `Tables.columns` must stay
+    # O(structure) -- the ragged offset table is O(siblings), never O(rows).
+    @testset "Tables.jl: ragged melt keeps columns LAZY (rows scale, allocation does not)" begin
+        mkragged(n_rows) = TreeData([TreeData(randn(n_rows + s), :time => sort(randn(n_rows + s)))
+                                     for s in 1:4], :subject)
+        small, big = mkragged(10), mkragged(1000)
+        Tables.columns(small); Tables.columns(big)          # warm up / compile
+        a_small = @allocated Tables.columns(small)
+        a_big   = @allocated Tables.columns(big)
+        # 100x the rows, same structure: allocation must stay FLAT (not scale with rows)
+        @test a_big <= a_small * 4
+        @test length(Tables.getcolumn(Tables.columns(big), :value)) == sum(1001:1004)
+        # and it really is a view -- no row data was materialized to build it
+        @test Tables.getcolumn(Tables.columns(big), :value) isa TreeArrays.ValueColumn
+        @info "ragged melt laziness gate: Tables.columns(X) @allocated (10 vs 1000 rows/leaf)" a_small a_big
     end
 
     @testset "Tables.jl: unsupported shapes error clearly" begin
@@ -769,11 +880,14 @@ end
         fixedX = TreeData(randn(4), TreeDim(:draw, 1:4), TreeDim(:tag, :fixedtag))
         @test_throws "not a real axis" html(TreeTable(fixedX; wide=:tag))
 
-        # same contract for the other unsupported shape: a RAGGED tree is not a table,
-        # so `TreeTable`'s display throws rather than render a plausible-looking one.
-        # The ragged `TreeData` itself displays fine -- only the tabular VIEW rejects it.
+        # a RAGGED tree IS a table in long form, so its display renders -- 2+5+9 rows,
+        # each with its own `:time`. What still throws is the ragged tree under `wide=`
+        # (below): display is not where a bad shape gets to render as if it were fine,
+        # but a good shape must not be refused there either.
         ragged = TreeData([TreeData(randn(n), :time => sort(randn(n))) for n in (2, 5, 9)], :subject)
-        @test_throws "inconsistent shape" html(TreeTable(ragged))
+        rh = html(TreeTable(ragged))
+        @test occursin("16 rows", rh) && occursin("time", rh)
+        @test_throws "not a supported Tables shape under `wide=`" html(TreeTable(ragged; wide=:time))
         @test occursin("more leaves", html(ragged)) == false     # 3 leaves, none skipped
         @test count("<details>", html(ragged)) == 3
     end
@@ -1098,9 +1212,12 @@ end
         amb = TreeData(randn(2,2,2), :draw, :a => (:x, Symbol("x_y")), :b => (Symbol("y_z"), :z))
         @test_throws "two level combinations join to the same name" Tables.columns(TreeTable(amb; wide=(:a,:b)))
 
-        # a ragged source stays loud under multi-wide, exactly as under long and k=1
+        # a ragged source stays loud under multi-wide, exactly as under k=1 -- a pivot
+        # needs ONE level set and ONE column length, and neither survives raggedness.
+        # (Long mode melts this tree fine; that is the whole point of long.)
         rag = TreeData([TreeData(randn(n), :time) for n in (2, 3)], :subject)
-        @test_throws "inconsistent shape" Tables.columns(TreeTable(rag; wide=(:time,)))
+        @test_throws "not a supported Tables shape under `wide=`" Tables.columns(TreeTable(rag; wide=(:time,)))
+        @test length(Tables.rowtable(TreeTable(rag))) == 5
 
         # the schema stays a STORED (runtime) schema at k>1, with concrete column eltypes
         spec = (lower=0.25, median=0.5, upper=0.75)
@@ -1203,14 +1320,19 @@ end
         @test Tables.schema(H).names == (:subject, :time, :band, :value)
         @test isempty(Tables.rowtable(H))
 
-        # --- 7. THE BOUNDARY. A cell with 0 assays beside a cell with 3 is a RAGGED tree,
-        # not a zero-row one: its siblings disagree on shape. No "empty spelling" can make a
-        # hole in a rectangular melt -- that is ragged melt support, a separate fast-follow.
-        # It must say so CLEARLY (it used to BoundsError).
+        # --- 7. THE BOUNDARY, now MELTABLE. A cell with 0 assays beside a cell with 3 is a
+        # RAGGED tree, not a zero-row one: its siblings disagree on shape. No "empty
+        # spelling" can make a hole in a RECTANGULAR melt -- but the LONG melt does not need
+        # one: the empty sibling simply contributes zero rows, and the row count is the sum.
+        # (It used to BoundsError, then to refuse; both are gone.)
         F = TreeData([mkcell(3), mkcell(0)], :subject => ["s1", "s2"])
         @test Tables.schema(F).names == (:subject, :assay_name, :draw, :time, :value)   # type-only: cannot see raggedness
-        @test_throws "ragged trees are not a supported Tables shape" Tables.columns(F)
-        @test_throws "ragged trees are not a supported Tables shape" Tables.columns(nanquantile(F, :band => band; dims=:draw))
+        fcols = Tables.columns(F)
+        @test length(Tables.getcolumn(fcols, :value)) == 3 * 100 * 3        # s1's 3 assays; s2 adds nothing
+        @test all(==("s1"), Tables.getcolumn(fcols, :subject))             # the empty sibling emits no rows at all
+        @test length(Tables.rowtable(nanquantile(F, :band => band; dims=:draw))) == 3 * 3 * 3
+        # the same tree under `wide=` still cannot pivot -- one level set, one column length
+        @test_throws "not a supported Tables shape under `wide=`" Tables.columns(TreeTable(F; wide=:time))
 
         # --- 8. reducing the length-0 axis ITSELF has no leaf to push `f` into. Unlike a
         # zero-length NUMERIC slice (case 3), there is no value to invent -- say so.
