@@ -175,12 +175,20 @@ function _pivotcolumns(tt::TreeTable)
     long = _buildcolumns(_source(tt))
     wcols = map(nm -> long[nm], w)   # `_validatewide` already proved each name is in the melt
     for (nm, c) in zip(w, wcols)
+        # A `WalkAxisColumn` IS a real axis, but a RAGGED one: its levels differ from
+        # sibling to sibling, so there is no single level set to spread into columns
+        # and no single column length to spread them to. Long mode melts it fine
+        # (that is the whole point of long); a pivot inherently cannot.
+        c isa WalkAxisColumn && error("TreeArrays Tables adapter: wide=$(nm) names an axis whose levels differ per sibling -- ragged trees are not a supported Tables shape under `wide=` (a pivot needs ONE level set and ONE column length). The LONG melt of this tree works: drop `wide=`.")
         c isa AxisColumn || error("TreeTable: wide=$(nm) is a fixed/ghost dim, not a real axis -- it has no levels to spread into columns")
     end
 
-    # every melt column decodes through the SAME `rowdims`, so one widened dim's view of
-    # it is every widened dim's view of it
-    rowdims = first(wcols).rowdims
+    # every melt column decodes through the SAME plan, so one widened dim's view of
+    # it is every widened dim's view of it. A pivot re-indexes that plan's slots
+    # directly, which only a rectangular (product) row space supports.
+    rowplan = first(wcols).plan
+    rowplan isa DensePlan || error("TreeArrays Tables adapter: wide=$(w) over a tree whose sibling subtrees have different row counts -- ragged trees are not a supported Tables shape under `wide=` (a pivot needs ONE column length). The LONG melt of this tree works: drop `wide=`.")
+    rowdims = rowplan.dims
     poss    = map(c -> c.pos, wcols)
     nlevels = map(p -> rowdims[p], poss)
     labels  = map((nm, c, L) -> ntuple(l -> _levelname(nm, _dimvalue(c.values, l)), L), w, wcols, nlevels)
