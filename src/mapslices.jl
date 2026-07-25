@@ -59,6 +59,81 @@ end
 # lift (`ks` becomes `where`-bound) is enough for Base's own eachslice to see a literal.
 @inline _eachslice(A::AbstractArray, ::Val{ks}) where ks = eachslice(A; dims=ks)
 
+# ===================== coordinate-aware kernels (`coords=true`) =====================
+# A kernel sees the DATA slice by default. `mapslices(f, X; dims, coords=true)` additionally
+# hands it the COORDINATES of the axis being reduced -- what `trapz(t, y)` and `t[argmax(y)]`
+# (AUC and tmax, the two standard non-compartmental PK summaries) need, and what the positional
+# workarounds (`baseline = v[1]`, `Δ = v .- v[1]`) provably cannot express. Nothing here needs
+# rectangularity: on a RAGGED axis each sub-tree already carries its own coordinate vector, and
+# the binding below happens PER NODE, so every subject's kernel call sees ITS OWN grid -- which
+# is also why "close over a shared constant" was never an answer for the ragged case.
+#
+# Opt-in is EXPLICIT here, never arity-sniffed. `hasmethod(f, (slice, coords))` is TRUE for
+# generic Base functions that mean something else entirely with two arguments -- `maximum(f,
+# itr)` exists, so an arity probe would answer `mapslices(maximum, X; dims=:time)` by calling
+# `maximum(y, t)`, silently treating the data slice as a predicate. `@kernel` (kernel.jl) DOES
+# infer the opt-in, safely, because it reads the literal argument list at macro-expansion time
+# instead of guessing from a value.
+#
+# Mechanically the REQUEST travels as the kernel: `_NeedsCoords` marks it at the public entry
+# and rides the whole recursion untouched -- including the ragged descent, which is precisely
+# what gives each sub-tree its own coordinates -- and every node that actually reduces swaps it
+# for a `_WithCoords` closure carrying THAT node's coordinates. So `_leafreduce`'s base case
+# stays `f(sl)`: the gather loop, `_assemble` and the plain 1-arg path are unchanged and pay
+# nothing (no flag threaded through the hot path, no branch at the leaf).
+struct _NeedsCoords{F}
+    f::F
+end
+struct _WithCoords{F,C}
+    f::F
+    coords::C
+end
+(g::_WithCoords)(sl) = g.f(sl, g.coords)
+
+_wantcoords(f, ::Val{false}) = f
+_wantcoords(f, ::Val{true})  = _NeedsCoords(f)
+
+# The reduced AXIS dims at this node, in AXIS order -- which is exactly the order of the slice's
+# own dimensions (Base's `Slices` preserves the order of the sliced dims), so the coordinate
+# vectors line up positionally with what the kernel receives. `@generated` for the same reason
+# as `_splitdims`/`_splitrecord`/`_exclude`: a mixed axis/ghost dims tuple does not fold under
+# plain recursive peeling (see the note above `_splitdims`).
+@generated function _reducedaxes(alldims::Tuple, ::Val{nax}, ::Val{want}) where {nax,want}
+    keep = Expr[]
+    for (i, d) in _dimtypes(alldims)
+        i <= nax && name(d) in want && push!(keep, :(alldims[$i]))
+    end
+    :(($(keep...),))
+end
+
+# Coordinates come from the PUBLIC `coords` accessor (dim_helpers.jl), deliberately: a kernel
+# and a consumer then read them through ONE definition with ONE error message. So an UNLABELLED
+# axis refuses here for the same stated reason it refuses a direct `coords(d)` read -- passing
+# `missing` through would be the retired absent-dim sentinel in a new costume, with the kernel
+# computing `trapz(missing, y)` and returning a plausible-looking `missing`.
+#
+# ONE reduced axis -> the BARE coordinate vector, so the kernel is just `f(y, t)` (the
+# overwhelmingly common shape, and exactly what `trapz`/`argmax` want). SEVERAL -> one vector
+# per reduced axis, in slice-dim order: the slice is genuinely N-dimensional there, and a
+# single flat vector could only lie about which coordinate belongs to which position.
+_slicecoords(red::Tuple{<:TreeDim}) = coords(red[1])
+_slicecoords(red::Tuple)            = map(coords, red)
+
+_bindcoords(f, alldims, valnax, valwant) = f      # plain kernel: nothing to bind, no cost
+_bindcoords(f::_NeedsCoords, alldims, valnax, valwant) =
+    _WithCoords(f.f, _slicecoords(_reducedaxes(alldims, valnax, valwant)))
+
+# A POOLED straddle concatenates every leaf's slice into one bag (`_pooledstraddle` below), so
+# no single axis's coordinate vector lines up with it -- a pooled (draw x chain) bag has draw-
+# AND-chain positions, not one coordinate per element. Refuse by name rather than invent an
+# alignment (16fwcnx / 1iy1r57: never answer with a plausible-looking value).
+_refusecoords(f, want) = nothing
+_refusecoords(::_NeedsCoords, want) = throw(ArgumentError(
+    "cannot hand a kernel axis coordinates (`coords=true`) while POOLING dims " * string(want) *
+    " across a ragged boundary: the pooled bag concatenates every leaf's slice, so no single axis's " *
+    "coordinate vector lines up with it. Reduce the coordinate-bearing dim on its own first " *
+    "(`coords=true` works there), then pool the result."))
+
 # Shared "found the axis" bookkeeping for TreeArray/TreeRaggedArray: which parent-array
 # positions are being reduced vs kept, and the ghost dims left behind for the reduced ones.
 # Returns `nothing` when `want` doesn't hit a real axis here -> the caller decides what that
@@ -70,7 +145,10 @@ function _reduceouter(f, X, valwant::Val{want}) where want
     @assert all(_isaxis, alldims[1:n_ax]) "_reduceouter assumes the first $n_ax dims of $(typeof(X)) are exactly the parent array's axes, positionally, in order; got a non-axis dim at position $(findfirst(!_isaxis, alldims[1:n_ax])) (dims = $(map(name, alldims)))"
     keepaxes, keptdims, trailing, foundany = _splitdims(alldims, Val(n_ax), valwant)
     foundany || return nothing
-    outs = isempty(keepaxes) ? _leafreduce(f, parent(X)) : map(sl -> _leafreduce(f, sl), _eachslice(parent(X), Val(keepaxes)))
+    # AFTER `foundany`: a branch that reduces nothing here must not bind (and must not demand
+    # coordinates from) an axis it isn't touching -- the ragged recursion re-enters per element.
+    g = _bindcoords(f, alldims, Val(n_ax), valwant)
+    outs = isempty(keepaxes) ? _leafreduce(g, parent(X)) : map(sl -> _leafreduce(g, sl), _eachslice(parent(X), Val(keepaxes)))
     _assemble(outs, keptdims, trailing)
 end
 
@@ -236,10 +314,10 @@ end
 
 # The PUBLIC entry points assert; the recursion below calls `_mapslices` directly, so a branch
 # that legitimately lacks the dim is never mistaken for a typo.
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims, coords::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)
-    _mapslices(f, X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
 end
 function _mapslices(f, X::TreeArray, valwant::Val{want}) where want
     r = _reduceouter(f, X, valwant)
@@ -287,10 +365,10 @@ end
 # `_firstsample` (find the first non-`missing` field) is GONE with 1iy1r57: a field that lacks
 # the dim now throws in `_mapslices(::TreeArray)` rather than yielding `missing`, so no field of
 # `newfields` can be `missing` and every field is a valid sample.
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeNamedTuple; dims)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeNamedTuple; dims, coords::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)
-    _mapslices(f, X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
 end
 function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}) where want
     rec  = outerdim(X)
@@ -302,10 +380,10 @@ function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}) where want
     TreeData(newfields, (;dims = (TreeArrays.dims(sample)..., extra...), outer_dim = rec))
 end
 
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims, coords::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)   # a typo, before any structural check can mistake it for a shape
-    _mapslices(f, X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
 end
 function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}) where want
     _isstraddle(X, valwant) && return _pooledstraddle(f, X, valwant)   # outer axis + named leaf-inner dims: pool
@@ -339,6 +417,7 @@ end
 # record/tuple/doubly-ragged leaves, non-conformable leaves -- each throw BY NAME rather than answer a
 # partial or wrong pool (the never-silently-wrong discipline, decisions 16fwcnx / 1iy1r57).
 function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}) where want
+    _refusecoords(f, want)          # a pooled bag has no single aligned coordinate vector
     alldims = TreeArrays.dims(X)
     n_outer = ndims(parent(X))
     outer   = ntuple(i -> alldims[i], n_outer)

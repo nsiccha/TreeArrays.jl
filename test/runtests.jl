@@ -13,6 +13,26 @@ using Statistics
     (;trough, peak, baseline, dtrough, dpeak)
 end
 
+# the coords opt-in, in every `@kernel` shape (snag kernels-cannot-s). Top level, because a
+# macro-emitted `function` belongs where the methods it defines are visible to every testset.
+_tt_trapz(t, y) = sum(i -> (t[i+1] - t[i]) * (y[i+1] + y[i]) / 2, 1:length(t)-1)
+# TWO plain positional args -> the coordinate vector arrives as the second one.
+@kernel (:time => :stat) function _tt_nca(y, t)
+    (; cmax = maximum(y), tmax = t[argmax(y)], auc = _tt_trapz(t, y))
+end
+# a DEFAULT / a SPLAT: still 1-slice kernels, NOT coordinate consumers.
+@kernel (:time => :stat) function _tt_withdefault(L, scale = 2)
+    (; peak = maximum(L) * scale)
+end
+@kernel (:time => :stat) function _tt_withsplat(L, rest...)
+    (; peak = maximum(L))
+end
+# post hoc: no argument list to read, so 1-arg by default and an EXPLICIT coords opt-in.
+_tt_posthoc_plain(y) = (; peak = maximum(y))
+@kernel (:time => :stat) _tt_posthoc_plain
+_tt_posthoc_coords(y, t) = (; tmax = t[argmax(y)])
+@kernel (:time => :stat) coords=true _tt_posthoc_coords
+
 function _tt_stats_percentiles(; n_draws=6, n_subjects=4, n_dense=3, n_cols=5)
     dense_loc(args...) = TreeData(randn(n_draws, n_subjects, n_dense), :draw, :subject, :time=>range(0, 1, n_dense))
     input_draws = TreeData(randn(n_draws, n_cols), :draw, :param; random_effect=:in_sample, placebo=:on, space=:sampler)
@@ -1500,6 +1520,175 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test_throws ErrorException TreeActualArray(TreeData([TreeData(randn(3), :t), TreeData(randn(4), :t)], :s))
         @test_throws ErrorException TreeActualArray(TreeData(:param => (a = randn(5, 4), b = randn(6, 4)), :draw, :chain))
         @test_throws ErrorException TreeActualArray(TreeData(:param => (a = randn(5, 4), b = rand(1:9, 5, 4)), :draw, :chain))
+    end
+
+    @testset "coords=true — a kernel sees the axis it reduces (snag kernels-cannot-s)" begin
+        # AUC and tmax: the two standard non-compartmental PK summaries. Both need `t`, and the
+        # positional workarounds (`v[1]`, `v .- v[1]`) provably cannot express either.
+        trapz(t, y) = sum(i -> (t[i+1] - t[i]) * (y[i+1] + y[i]) / 2, 1:length(t)-1)
+        rec(r, i) = parent(parent(r)[i])   # a kept axis leaves `parent` an array of leaves
+
+        ts = [0.0, 0.5, 2.0, 6.0]
+        Y  = [1.0 2.0; 4.0 1.0; 2.0 3.0; 0.5 8.0]        # (time=4, subject=2)
+        X  = TreeData(Y, :time => ts, :subject => [:a, :b])
+
+        r = mapslices(X; dims = :time, coords = true) do y, t
+            TreeData(:stat => (; cmax = maximum(y), tmax = t[argmax(y)], auc = trapz(t, y)))
+        end
+        @test rec(r, 1).tmax == ts[argmax(Y[:, 1])] == 0.5
+        @test rec(r, 2).tmax == ts[argmax(Y[:, 2])] == 6.0
+        @test rec(r, 1).auc ≈ trapz(ts, Y[:, 1]) ≈ 10.75
+        @test rec(r, 2).auc ≈ trapz(ts, Y[:, 2]) ≈ 25.75
+        @test rec(r, 1).auc != rec(r, 2).auc              # the two subjects really do differ
+        # structure is byte-identical to the 1-arg path: the reduced dim stays as a ghost
+        @test TreeArrays.name.(dims(r)) == (:subject, :time)
+        @test TreeArrays.meta(dims(r)[2]).values === nothing
+        @test rec(mapslices(y -> TreeData(:stat => (; cmax = maximum(y))), X; dims = :time), 1).cmax ==
+              rec(r, 1).cmax
+
+        # the DEFAULT is unchanged, and coords=false is explicitly today's behaviour
+        @test parent(mapslices(maximum, X; dims = :time)) == [4.0, 8.0]
+        @test parent(mapslices(maximum, X; dims = :time, coords = false)) == [4.0, 8.0]
+
+        # RAGGED — the case the "close over a shared constant" escape provably cannot serve:
+        # the coordinates DIFFER per sub-tree, and each kernel call must see its OWN grid.
+        t1, t2 = [0.0, 1.0, 3.0], [0.0, 0.5, 2.0, 8.0]
+        y1, y2 = [1.0, 5.0, 2.0], [2.0, 3.0, 9.0, 1.0]
+        rag = TreeData([TreeData(y1, :time => t1), TreeData(y2, :time => t2)], :subject => [:s1, :s2])
+        rr = mapslices(rag; dims = :time, coords = true) do y, t
+            TreeData(:stat => (; tmax = t[argmax(y)], auc = trapz(t, y), n = length(t)))
+        end
+        @test parent(parent(rr)[1]).tmax == 1.0           # s1's grid
+        @test parent(parent(rr)[2]).tmax == 2.0           # s2's DIFFERENT grid
+        @test parent(parent(rr)[1]).auc ≈ trapz(t1, y1)
+        @test parent(parent(rr)[2]).auc ≈ trapz(t2, y2)
+        @test (parent(parent(rr)[1]).n, parent(parent(rr)[2]).n) == (3, 4)   # lengths really differ
+
+        # reducing the ragged OUTER axis hands the kernel THAT axis's labels
+        conf = TreeData([TreeData([1.0, 2.0, 3.0], :time => ts[1:3]),
+                         TreeData([4.0, 6.0, 8.0], :time => ts[1:3])], :subject => [:a, :b])
+        @test parent(parent(mapslices((y, c) -> (@test c == [:a, :b]; sum(y)), conf;
+                                      dims = :subject, coords = true))) == [5.0, 8.0, 11.0]
+
+        # SEVERAL reduced axes -> one coordinate vector per axis, in slice-dim order
+        A  = collect(reshape(1.0:24.0, 4, 3, 2))
+        X3 = TreeData(A, :draw => 1:4, :chain => [:c1, :c2, :c3], :param => [:p, :q])
+        r3 = mapslices(X3; dims = (:draw, :chain), coords = true) do s, c
+            @test c isa Tuple && length(c) == 2 && c[1] == 1:4 && c[2] == [:c1, :c2, :c3]
+            @test size(s) == (4, 3)
+            sum(s)
+        end
+        @test parent(r3) == [sum(A[:, :, 1]), sum(A[:, :, 2])]
+
+        # an UNLABELLED axis has no coordinates: error BY NAME, never pass `missing` through
+        # (that would be the retired absent-dim sentinel in a new costume).
+        Xu = TreeData(Y, :time, :subject => [:a, :b])
+        @test_throws "unlabelled" mapslices((y, t) -> maximum(y), Xu; dims = :time, coords = true)
+        @test_throws "no coordinates" mapslices((y, t) -> maximum(y), Xu; dims = :time, coords = true)
+        @test parent(mapslices(maximum, Xu; dims = :time)) == [4.0, 8.0]   # 1-arg still fine
+
+        # a POOLED straddle has no single aligned coordinate vector -> refuse by name
+        pooled = TreeData([TreeData(randn(5, 2), :draw => 1:5, :param => [:p, :q]) for _ in 1:3],
+                          :chain => 1:3)
+        @test mean(pooled; dims = (:draw, :chain)) isa TreeData            # the 1-arg pool works
+        @test_throws "POOLING" mapslices((s, c) -> mean(s), pooled; dims = (:draw, :chain), coords = true)
+
+        # type stability: the literal `coords=` kwarg folds, both dense and ragged
+        auc(y, t) = trapz(t, y)
+        f_dense(Z) = mapslices(auc, Z; dims = :time, coords = true)
+        g_dense(Z) = mapslices(maximum, Z; dims = :time)
+        f_rag(Z) = mapslices(auc, Z; dims = :time, coords = true)
+        @test @inferred(f_dense(X)) isa TreeData
+        @test @inferred(g_dense(X)) isa TreeData
+        @test @inferred(f_rag(rag)) isa TreeData
+        @test parent(@inferred(f_dense(X))) ≈ [trapz(ts, Y[:, 1]), trapz(ts, Y[:, 2])]
+    end
+
+    @testset "coords(d) / coords(X, :dim) — a CONSUMER can read an axis's labels too" begin
+        # Reported alongside the kernel case: the coordinates were unreachable from BOTH
+        # directions. `TreeDim`'s only field is `meta`, so `d.values` is a plain getfield
+        # failure, and `meta`/`name` are internal.
+        ts = [0.0, 0.5, 2.0]
+        X  = TreeData([1.0 2.0; 4.0 1.0; 2.0 3.0], :time => ts, :subject => [:a, :b]; dose = 20)
+        @test fieldnames(TreeDim) == (:meta,)                       # why `d.values` cannot work
+        @test_throws ErrorException coords(X, :nope)                # foundALL, like dims=
+
+        @test coords(dims(X)[1]) === ts                             # zero-copy, exact container
+        @test coords(X, :time) === ts
+        @test coords(X, :subject) == [:a, :b]
+        # inferrable — but note WHERE the literal has to be. A runtime `Symbol` would make the
+        # return type the UNION of every dim's coordinate type on a heterogeneous tree, so the
+        # name is staged (`Val`) behind `@constprop`; the literal must therefore sit in the
+        # CODE, exactly as for `dims=` (§5). `@inferred` works from argument TYPES, so it
+        # cannot see const-prop through its own call — hence the wrapper, not a bare @inferred.
+        _ctime(Z) = coords(Z, :time)
+        _csubj(Z) = coords(Z, :subject)
+        @test @inferred(_ctime(X)) === ts
+        @test @inferred(_csubj(X)) == [:a, :b]
+        @test @inferred(coords(dims(X)[1])) === ts                  # 1-arg form: always stable
+
+        # keep-as-provided, like quantile's levels / selectdim's labels
+        @test coords(TreeData(randn(3), :t => (1, 2, 3)), :t) === (1, 2, 3)
+        @test coords(TreeData(randn(3), :t => 1:3), :t) === 1:3
+
+        # `collect(d)` is the TRAP this accessor replaces: it runs (TreeDim has iterate/length)
+        # but yields Any-eltype, and answers a plausible-looking length-1 vector for the two
+        # kinds that have NO coordinates. Pin both halves so the contrast can't silently rot.
+        du = dims(TreeData(randn(3, 2), :time, :subject => [:a, :b]))[1]
+        # `isequal`, not `==`: `[missing] == [missing]` is itself `missing` (part of the trap)
+        @test isequal(collect(du), [missing]) && eltype(collect(du)) === Any
+        @test_throws "unlabelled" coords(du)                             # the accessor refuses
+        red = mapslices(maximum, X; dims = :time)
+        @test collect(dims(red)[2]) == [nothing]                         # the trap again
+        @test_throws "REDUCED away" coords(red, :time)                   # ghost: gone by construction
+        @test_throws "fixed single position" coords(X, :dose)            # scalar: not an axis
+        @test coords(X, :time) === ts                                    # ...and reducing didn't
+        @test coords(red, :subject) == [:a, :b]                          # touch the kept axis
+
+        # ragged: each child carries its OWN :time coords, and the message says where to look
+        rag = TreeData([TreeData(randn(3), :time => ts), TreeData(randn(4), :time => 1.0:4.0)],
+                       :subject => [:s1, :s2])
+        @test coords(rag, :subject) == [:s1, :s2]
+        @test_throws "on the child" coords(rag, :time)
+        @test coords(parent(rag)[1], :time) === ts
+        @test coords(parent(rag)[2], :time) === 1.0:4.0
+    end
+
+    @testset "@kernel infers the coords opt-in from arity (snag kernels-cannot-s)" begin
+        # arity-sniffing is safe HERE because the macro reads the literal argument list, not a
+        # value: at the `mapslices` boundary `hasmethod(maximum, (y, t))` is TRUE (`maximum(f,
+        # itr)`), so an arity probe there would treat the data slice as a predicate.
+        @test hasmethod(maximum, Tuple{Vector{Float64},Vector{Float64}})   # why not at mapslices
+
+        t1, t2 = [0.0, 1.0, 3.0], [0.0, 0.5, 2.0, 8.0]
+        rag = TreeData([TreeData([1.0, 5.0, 2.0], :time => t1),
+                        TreeData([2.0, 3.0, 9.0, 1.0], :time => t2)], :subject => [:s1, :s2])
+        X = TreeData([1.0 2.0; 4.0 1.0; 2.0 3.0], :time => t1, :subject => [:a, :b])
+        rec(r, i) = parent(parent(r)[i])
+
+        # 2 plain positional args -> coords threaded through automatically
+        @test parent(parent(_tt_nca(rag))[1]).tmax == 1.0     # s1's own grid
+        @test parent(parent(_tt_nca(rag))[2]).tmax == 2.0     # s2's own grid
+        @test _tt_nca([1.0, 5.0, 2.0], t1).tmax == 1.0        # plain-array kernel still emitted
+        @test rec(_tt_nca(X), 1).tmax == 1.0
+
+        # 1 plain positional arg -> today's behaviour, byte-identical
+        @test rec(_tt_compute_stats(X), 1).peak == 4.0
+
+        # a DEFAULT and a SPLAT are 1-slice kernels with extra machinery, NOT coordinate
+        # consumers -- auto-passing coordinates into their second slot would corrupt them.
+        @test rec(_tt_withdefault(X), 1).peak == 8.0
+        @test rec(_tt_withsplat(X), 1).peak == 4.0
+
+        # post hoc has no argument list to read: defaults to 1-arg, takes an explicit opt-in
+        @test rec(_tt_posthoc_plain(X), 1).peak == 4.0
+        @test parent(parent(_tt_posthoc_coords(rag))[1]).tmax == 1.0
+
+        # contradictions and unsupported arities are macro-expansion errors, by name
+        @test_throws Exception @eval @kernel (:time => :stat) coords=true _bad1(L) = maximum(L)
+        @test_throws Exception @eval @kernel (:time => :stat) coords=false _bad2(L, t) = maximum(L)
+        @test_throws Exception @eval @kernel (:time => :stat) coords=yes _bad3(L) = maximum(L)
+        @test_throws Exception @eval @kernel (:time => :stat) _bad4(L, t, z) = maximum(L)
     end
 
 end
