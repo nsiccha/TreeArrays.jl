@@ -1604,6 +1604,56 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test parent(@inferred(f_dense(X))) ≈ [trapz(ts, Y[:, 1]), trapz(ts, Y[:, 2])]
     end
 
+    @testset "coords(d) / coords(X, :dim) — a CONSUMER can read an axis's labels too" begin
+        # Reported alongside the kernel case: the coordinates were unreachable from BOTH
+        # directions. `TreeDim`'s only field is `meta`, so `d.values` is a plain getfield
+        # failure, and `meta`/`name` are internal.
+        ts = [0.0, 0.5, 2.0]
+        X  = TreeData([1.0 2.0; 4.0 1.0; 2.0 3.0], :time => ts, :subject => [:a, :b]; dose = 20)
+        @test fieldnames(TreeDim) == (:meta,)                       # why `d.values` cannot work
+        @test_throws ErrorException coords(X, :nope)                # foundALL, like dims=
+
+        @test coords(dims(X)[1]) === ts                             # zero-copy, exact container
+        @test coords(X, :time) === ts
+        @test coords(X, :subject) == [:a, :b]
+        # inferrable — but note WHERE the literal has to be. A runtime `Symbol` would make the
+        # return type the UNION of every dim's coordinate type on a heterogeneous tree, so the
+        # name is staged (`Val`) behind `@constprop`; the literal must therefore sit in the
+        # CODE, exactly as for `dims=` (§5). `@inferred` works from argument TYPES, so it
+        # cannot see const-prop through its own call — hence the wrapper, not a bare @inferred.
+        _ctime(Z) = coords(Z, :time)
+        _csubj(Z) = coords(Z, :subject)
+        @test @inferred(_ctime(X)) === ts
+        @test @inferred(_csubj(X)) == [:a, :b]
+        @test @inferred(coords(dims(X)[1])) === ts                  # 1-arg form: always stable
+
+        # keep-as-provided, like quantile's levels / selectdim's labels
+        @test coords(TreeData(randn(3), :t => (1, 2, 3)), :t) === (1, 2, 3)
+        @test coords(TreeData(randn(3), :t => 1:3), :t) === 1:3
+
+        # `collect(d)` is the TRAP this accessor replaces: it runs (TreeDim has iterate/length)
+        # but yields Any-eltype, and answers a plausible-looking length-1 vector for the two
+        # kinds that have NO coordinates. Pin both halves so the contrast can't silently rot.
+        du = dims(TreeData(randn(3, 2), :time, :subject => [:a, :b]))[1]
+        # `isequal`, not `==`: `[missing] == [missing]` is itself `missing` (part of the trap)
+        @test isequal(collect(du), [missing]) && eltype(collect(du)) === Any
+        @test_throws "unlabelled" coords(du)                             # the accessor refuses
+        red = mapslices(maximum, X; dims = :time)
+        @test collect(dims(red)[2]) == [nothing]                         # the trap again
+        @test_throws "REDUCED away" coords(red, :time)                   # ghost: gone by construction
+        @test_throws "fixed single position" coords(X, :dose)            # scalar: not an axis
+        @test coords(X, :time) === ts                                    # ...and reducing didn't
+        @test coords(red, :subject) == [:a, :b]                          # touch the kept axis
+
+        # ragged: each child carries its OWN :time coords, and the message says where to look
+        rag = TreeData([TreeData(randn(3), :time => ts), TreeData(randn(4), :time => 1.0:4.0)],
+                       :subject => [:s1, :s2])
+        @test coords(rag, :subject) == [:s1, :s2]
+        @test_throws "on the child" coords(rag, :time)
+        @test coords(parent(rag)[1], :time) === ts
+        @test coords(parent(rag)[2], :time) === 1.0:4.0
+    end
+
     @testset "@kernel infers the coords opt-in from arity (snag kernels-cannot-s)" begin
         # arity-sniffing is safe HERE because the macro reads the literal argument list, not a
         # value: at the `mapslices` boundary `hasmethod(maximum, (y, t))` is TRUE (`maximum(f,

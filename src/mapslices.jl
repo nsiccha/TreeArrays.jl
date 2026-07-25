@@ -106,25 +106,18 @@ _wantcoords(f, ::Val{true})  = _NeedsCoords(f)
     :(($(keep...),))
 end
 
-# An UNLABELLED axis (`values === missing`, §1) has no coordinates to hand over. Passing
-# `missing` through would be the retired absent-dim sentinel in a new costume: the kernel
-# would compute `trapz(missing, y)` and return a plausible-looking `missing`. Fail by name,
-# with the spelling that works -- same discipline and phrasing as `_sweepvalues` (setdim.jl)
-# and `selectdim`'s unlabelled-axis guard.
-_coordsof(d::TreeDim) = _coordsof(name(d), meta(d).values)
-_coordsof(n::Symbol, ::Missing) = error(
-    "TreeArrays: `coords=true` cannot hand the kernel coordinates for dim `$n` -- it is unlabelled " *
-    "(values === missing), so the axis has no coordinates. Give them at construction " *
-    "(`TreeData(x, :$n => ts)`), or drop `coords=true` and reduce positionally."
-)
-_coordsof(::Symbol, values) = values
-
+# Coordinates come from the PUBLIC `coords` accessor (dim_helpers.jl), deliberately: a kernel
+# and a consumer then read them through ONE definition with ONE error message. So an UNLABELLED
+# axis refuses here for the same stated reason it refuses a direct `coords(d)` read -- passing
+# `missing` through would be the retired absent-dim sentinel in a new costume, with the kernel
+# computing `trapz(missing, y)` and returning a plausible-looking `missing`.
+#
 # ONE reduced axis -> the BARE coordinate vector, so the kernel is just `f(y, t)` (the
 # overwhelmingly common shape, and exactly what `trapz`/`argmax` want). SEVERAL -> one vector
 # per reduced axis, in slice-dim order: the slice is genuinely N-dimensional there, and a
 # single flat vector could only lie about which coordinate belongs to which position.
-_slicecoords(red::Tuple{<:TreeDim}) = _coordsof(red[1])
-_slicecoords(red::Tuple)            = map(_coordsof, red)
+_slicecoords(red::Tuple{<:TreeDim}) = coords(red[1])
+_slicecoords(red::Tuple)            = map(coords, red)
 
 _bindcoords(f, alldims, valnax, valwant) = f      # plain kernel: nothing to bind, no cost
 _bindcoords(f::_NeedsCoords, alldims, valnax, valwant) =
