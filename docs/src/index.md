@@ -1,4 +1,10 @@
+```@raw html
 ---
+# https://vitepress.dev/reference/default-theme-home-page
+# NOTE: this frontmatter MUST stay inside a `@raw html` fence. Documenter parses
+# a bare `---` block as ordinary markdown (a thematic break plus paragraphs),
+# which collapses the YAML indentation and ships the keys to the page as visible
+# body text -- VitePress never sees frontmatter at all.
 layout: home
 
 hero:
@@ -29,6 +35,7 @@ features:
   - title: A Tables.jl source, for free
     details: Records melt wide, axes melt long, and the columns are lazy views — @allocated stays flat across 100× rows. Plot it without ever building a DataFrame.
 ---
+```
 
 ## What it is
 
