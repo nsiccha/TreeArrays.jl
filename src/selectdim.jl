@@ -65,6 +65,41 @@ _subsetcoords(vals, coordvec, idx)        = coordvec[idx]
 # `quantile(X, :band => (...))`) and a 3-arg form mirroring `Base.selectdim(A, d, i)` with a NAME
 # in place of the dimension number. Extends `Base.selectdim` (a method addition -- no export, no
 # name clash) because the spirit is identical: select along a dimension, return a view.
+"""
+    selectdim(X::TreeData, name => selector)
+    selectdim(X::TreeData, name::Symbol, selector)
+
+Restrict a named axis to the coordinates `selector` keeps, leaving every other
+axis intact — the **selection dual** of the `dims =` reductions, which collapse an
+axis instead.
+
+**No data is copied.** The backing array is sliced with a `view`, so a subset of a
+`(draw × chain × 600_000)` matrix never materializes; only the axis's own (tiny)
+coordinate labels are subset.
+
+```julia
+selectdim(X, :param => r"^unit_params_")      # Regex: keep labels it `contains`-matches
+selectdim(X, :param => startswith("beta"))    # a `label -> Bool` predicate
+selectdim(X, :param => boolmask)              # an explicit Bool mask (length == axis)
+selectdim(X, :param => [8, 1, 2])             # integer indices — subset and/or reorder
+selectdim(X, :param, sel)                     # 3-arg form, mirroring Base.selectdim(A, d, i)
+```
+
+The filtered axis carries exactly the matched labels, keep-as-provided (a `Tuple`
+stays a `Tuple`; a filtered range necessarily becomes a `Vector`). The result is
+a [`TreeData`](@ref), so it composes with the reductions:
+`mean(selectdim(X, :param => r"…"); dims = :draw)`.
+
+**Positional** selectors (a Bool mask, integer indices) also restrict an
+*unlabelled* axis — it stays unlabelled and merely gets shorter. A Regex or
+predicate on one errors: there are no labels to match.
+
+Like `dims =`, this is *foundALL* and never silently wrong. Each of these throws
+by name: a typo'd axis name; a bare `String` selector (ambiguous between exact
+and substring — use `==("x")`, `contains("x")` or a Regex); a predicate that does
+not return `Bool`; a wrong-length mask; and selecting an inner or record axis
+(only the outer array axes are selectable, a ragged tree's outer axis included).
+"""
 Base.selectdim(X::TreeArray, (nm, sel)::Pair{Symbol}) = _selectdim(X, nm, sel)
 Base.selectdim(X::TreeArray, nm::Symbol, sel)         = _selectdim(X, nm, sel)
 

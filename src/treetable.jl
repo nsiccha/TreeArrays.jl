@@ -21,6 +21,65 @@
 
 # `W` (a Tuple of Symbols -- the wide dim names) is baked into the type so the
 # melt stays type-stable.
+"""
+    TreeTable(X::TreeData; wide = ())
+
+A lazy **tabular view** of a tree: the Tables.jl source you hand to a plotting or
+data-frame layer.
+
+A [`TreeData`](@ref) is N-dimensional, possibly-ragged data — not itself a table.
+`TreeTable` assigns its dims to tabular *roles*. Records
+([`TreeNamedTuple`](@ref) fields) are **wide** by default, because distinct
+variables are the natural column shape; every other dim is **long**, contributing
+one coordinate column, alongside a single `:value` column. Orientation is a
+consumer choice imposed by this view, never a property of the data.
+
+Nothing materializes at construction, and nothing materializes on
+`Tables.columns` either: the columns handed back are lazy views over the
+eagerly-computed result, so allocation is flat as the row count grows and
+repeated metadata is never physically expanded. Rows materialize only at the
+`rowtable` / `DataFrame` / JSON boundary.
+
+```julia
+r = quantile(Y, :band => (; lower = 0.025, median = 0.5, upper = 0.975); dims = :draw)
+
+Tables.columnnames(Tables.columns(TreeTable(r)))               # (:time, :band, :value)  — long
+Tables.columnnames(Tables.columns(TreeTable(r; wide = :band))) # (:time, :lower, :median, :upper)
+```
+
+# `wide =` — pivot labelled axes into columns
+
+Name one dim (`wide = :band`) or several (`wide = (:band, :param)`, whose columns
+are the cartesian product of their levels, joined by `_` in `wide` order).
+
+Column naming: a `Symbol` level becomes a **bare** column (`:lower`), which is
+what drops straight into a ribbon plot's band pairs; any other level is prefixed
+by its dim (`:time` levels `[0.1, 0.25]` become `time_0_1`, `time_0_25`). Dots
+are rewritten to `_` in every level, `Symbol`s included, because a `.` in a
+column name is read as a nested field by Vega-Lite and would plot silently-wrong
+data rather than error.
+
+The rules, each erroring by name:
+
+  - a wide dim may sit **anywhere** in the melt, not just at the top level — the
+    band axis a chained reduction leaves on the leaf is the whole point;
+  - it must be a **real axis** — a fixed or ghost dim has no levels to spread;
+  - naming the same dim twice is an error;
+  - level labels colliding with another column, with each other after dot
+    rewriting, or (for several wide dims) whose `_`-joined combinations collide,
+    all error and name the culprit — `_` is not an injective separator;
+  - **ragged throws under `wide =`, and only there.** A pivot needs one level set
+    and one column length, and a ragged axis has neither. The long melt of the
+    same tree works.
+
+!!! note "Wide-mode column names are not inferable"
+    In wide mode the column *names* are the axis's coordinate values, which do
+    not live in the type, so `Tables.columns`/`Tables.schema` are not type-stable
+    in their names — call them at the presentation boundary, not inside a hot
+    kernel. The columns themselves are still concretely-typed lazy views, which
+    is all a Tables.jl consumer needs. Long mode is unaffected and fully
+    type-stable.
+"""
 struct TreeTable{TX<:TreeData, W}
     x::TX
 end

@@ -53,10 +53,13 @@ input_data = TreeData(
 )
 display(input_data)
 
-# Reducing over `:time` walks the heterogeneous, ragged tree: fields lacking
-# a `:time` axis (e.g. `healthy`, `weight`) come back `missing`; the ragged
-# `dose`/`measurement` series are reduced per-subject.
-display(mapslices(mean, input_data; dims=:time))
+# Reducing over `:time` is scoped to the branches that HAVE a `:time` axis.
+# `dims=` is foundALL: asking the whole record for `:time` throws, because the
+# per-subject covariates (`healthy`, `weight`, ...) carry no such axis and a
+# silently-skipped branch would be indistinguishable from a typo. Reach for the
+# ragged series directly -- each subject is reduced over its own grid.
+display(mapslices(mean, input_data.measurement; dims=:time))
+display(mapslices(mean, input_data.dose; dims=:time))
 
 # ## Posterior draws + a scenario sweep
 #

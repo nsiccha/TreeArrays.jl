@@ -20,6 +20,12 @@ print_type(io::IO, ::Type{<:TreeRaggedArray}) = print(io, "TreeRaggedArray")
 print_type(io::IO, ::Type{<:TreeArray}) = print(io, "TreeArray")
 print_dims(io::IO, T::Type{<:TreeData}) = begin
     M = fieldtype(T, :meta)
+    # A NON-concrete TreeData type carries no dim list to print. Julia reaches here on its
+    # own: a container whose leaves differ in their dim TYPES (ragged `:time` coords given as
+    # Tuples of different lengths, say) has a widened eltype, and `show`ing that container
+    # prints the eltype as a typeinfo prefix. Say "unknown" rather than throw from inside
+    # `show` -- a display method must never be the thing that errors.
+    isconcretetype(M) || return print(io, "(…)")
     ds = fieldtypes(fieldtype(M, :dims))
     ds = :outer_dim in fieldnames(M) ? (ds..., fieldtype(M, :outer_dim)) : ds
     print(io, "("); join(io, ds, ", "); print(io, ")")
