@@ -1,3 +1,15 @@
 [deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+DocumenterVitepress = "4710194d-e776-4893-9690-8d956a29c365"
+NaNStatistics = "b946abbf-3ea7-4610-9019-9858bfdeaf2d"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 TreeArrays = "5daaa025-ac78-4e9a-8805-78946e672e43"
+
+[sources.TreeArrays]
+path = ".."
+
+[compat]
+Documenter = "1"
+DocumenterVitepress = "0.2"

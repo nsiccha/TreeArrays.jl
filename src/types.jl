@@ -1,3 +1,37 @@
+"""
+    TreeDim(name::Symbol, values)
+    TreeDim(name::Symbol)
+    TreeDim(name => values)
+
+One named axis of a [`TreeData`](@ref). The axis *name* lives in the type, so
+reductions that name it (`dims = :time`) resolve statically; the *coordinates*
+live in the instance and are kept **exactly as provided**.
+
+`values` decides what kind of dim this is:
+
+| `values` | kind | meaning |
+|---|---|---|
+| a `Tuple` / `AbstractVector` / `AbstractRange` | **labelled axis** | a real axis; its elements are the coordinates |
+| `missing` (the 1-arg form) | **unlabelled axis** | a real axis with no coordinates |
+| any scalar (`dose = 20`) | **fixed position** | one coordinate, contributing *no* array axis |
+| `nothing` | **aggregated ghost** | what a reduction leaves behind in place of the axis it collapsed |
+
+A `Tuple` stays a `Tuple`, a `Vector` stays a `Vector`, a range stays a range —
+the same keep-as-provided convention `quantile`'s levels and [`selectdim`](@ref)'s
+subsets follow. Read the coordinates back with [`coords`](@ref); never with
+`collect`, which answers `Any[missing]` / `Any[nothing]` for the two kinds that
+have no coordinates at all.
+
+# Examples
+```julia
+TreeDim(:time, range(0, 1, 100))        # labelled axis
+TreeDim(:draw)                          # unlabelled axis
+TreeDim(:ribbon, (0.025, 0.5, 0.975))   # the output axis a `quantile` reduction writes into
+TreeDim(:dose, 20)                      # a fixed position, not an axis
+```
+
+See also [`TreeData`](@ref), [`coords`](@ref), [`dims`](@ref).
+"""
 struct TreeDim{N,M<:NamedTuple}
     meta::M
     TreeDim(N, meta::NamedTuple) = new{N,typeof(meta)}(meta)
@@ -15,6 +49,57 @@ _coords(v::Union{Tuple,AbstractArray,AbstractRange}) = v
 _coords(v) = (v,)
 Base.length(X::TreeDim) = length(_coords(meta(X).values))
 Base.iterate(X::TreeDim, args...) = iterate(_coords(meta(X).values), args...)
+"""
+    TreeData(backing, dims...; kwarg_dims...)
+    TreeData(name => namedtuple, dims...)
+    TreeData(dims::Symbol...)
+
+A named, hierarchical, possibly-ragged array over flat backing storage.
+
+A `TreeData` pairs a `parent` — the backing storage, never copied — with a tuple
+of named axes ([`TreeDim`](@ref)). Positional arguments become dims, in the order
+of the backing array's axes; a `name => values` pair gives that axis its
+coordinates, and keyword arguments become fixed dims.
+
+```julia
+X = TreeData(randn(1000, 179, 100), :draw, :subject, :time => range(0, 1, 100))
+D = TreeData(randn(1000, 8), :draw, :param; placebo = :on)   # `placebo` is a fixed dim
+```
+
+Four leaf shapes are distinguished by the *type* of `parent`. They are
+dispatch-only aliases — you always construct through `TreeData`:
+
+| Alias | `parent` is… | meaning |
+|---|---|---|
+| [`TreeArray`](@ref) | an `AbstractArray` of numbers | a dense leaf |
+| [`TreeNamedTuple`](@ref) | a `NamedTuple` | a record; carries a separate record axis, see [`outerdim`](@ref) |
+| [`TreeTuple`](@ref) | a `Tuple` | a positional record |
+| [`TreeRaggedArray`](@ref) | an `AbstractArray{<:TreeData}` | a ragged nesting of sub-trees of differing shape |
+
+Build a record with the `name => NamedTuple` form, which names the field axis:
+
+```julia
+TreeData(:param => (; alpha = a_matrix, beta = b_matrix), :draw, :chain)
+```
+
+!!! warning "Currying"
+    `TreeData(:time)` — dim names and **no** backing array — returns a *builder*
+    closure `(x, vals...) -> TreeData(x, :time => vals)`, meant for `map`:
+
+    ```julia
+    measurement = map(TreeData(:time), per_subject_values, per_subject_times)
+    ```
+
+    It is not a constructed tree; do not pass it where you meant one.
+
+A `TreeData` is deliberately **not** an `AbstractArray` (only the array-backed
+[`TreeArray`](@ref) leaf forwards `size`/`getindex`/`iterate` to its parent). To
+feed a numeric-array API, wrap it in [`TreeActualArray`](@ref); to feed a
+Tables.jl consumer, use [`TreeTable`](@ref).
+
+See also [`mapslices`](@ref), [`quantile`](@ref), [`selectdim`](@ref),
+[`dims`](@ref), [`coords`](@ref).
+"""
 struct TreeData{P,M<:NamedTuple}
     parent::P
     meta::M
@@ -33,14 +118,94 @@ TreeData((name, X)::Pair{Symbol,<:NamedTuple}, dims::TreeDim...) = begin
     TreeData(X, (;dims = (dims..., rec), outer_dim = rec))
 end
 TreeData(X::TreeData, dims::TreeDim...) = TreeData(parent(X), merge(meta(X), (;dims=(meta(X).dims..., dims...))))
+"""
+    TreeNamedTuple
+
+Dispatch alias for a [`TreeData`](@ref) whose `parent` is a `NamedTuple` — a
+**record**. Its fields are its record axis; read them with `X.fieldname`
+(zero-copy: a field that is already a `TreeData` comes back as is, a raw field is
+wrapped with the container's inner axes) and name that axis with
+[`outerdim`](@ref).
+
+Construct one with the pair form so the record axis is named:
+`TreeData(:param => (; alpha = …, beta = …), :draw, :chain)`.
+
+A record's fields melt to **wide** columns (one column per field) — see
+[`TreeTable`](@ref).
+"""
 TreeNamedTuple{P<:NamedTuple,M<:NamedTuple} = TreeData{P,M}
+
+"""
+    TreeRaggedArray
+
+Dispatch alias for a [`TreeData`](@ref) whose `parent` is an array of
+[`TreeData`](@ref) — a **ragged** nesting: one outer axis over sub-trees whose
+shapes need not agree.
+
+```julia
+subjects = TreeData(map(s -> TreeData(view(mat, :, idx[s]), :draw, :time), 1:n), :subject)
+```
+
+`mapslices(f, X; dims = :time)` reduces each sub-tree over *its own* `:time`
+axis; reducing the outer axis pushes it down to the leaves and recurses. Nothing
+is stacked or materialized at any point. A ragged tree also melts to a **long**
+table (row count `sum(length, leaves)`), so it need not be made rectangular
+before plotting — but [`TreeTable`](@ref)'s `wide=` pivot does require
+rectangularity and refuses a ragged axis by name.
+"""
 TreeRaggedArray{P<:AbstractArray{<:TreeData},M<:NamedTuple} = TreeData{P,M}
+
+"""
+    TreeArray
+
+Dispatch alias for a [`TreeData`](@ref) whose `parent` is an `AbstractArray` — a
+**dense leaf**. This is the only shape that forwards the basic array interface
+(`size`, `length`, `ndims`, `axes`, `getindex`, `iterate`, `collect`, `Array`) to
+its backing array; a `TreeData` is still not an `AbstractArray` subtype.
+
+Because `TreeRaggedArray{P<:AbstractArray{<:TreeData}}` is a strict
+subconstraint, those methods also apply to a ragged value at the **outer** level:
+`size` is the outer count and `getindex` returns a sub-tree.
+"""
 TreeArray{P<:AbstractArray,M<:NamedTuple} = TreeData{P,M}
+
+"""
+    TreeTuple
+
+Dispatch alias for a [`TreeData`](@ref) whose `parent` is a `Tuple` — a
+**positional record**. This is what a `quantile` reduction over a `Tuple` of
+levels leaves on the leaf.
+"""
 TreeTuple{P<:Tuple,M<:NamedTuple} = TreeData{P,M}
 # convenience accessors (avoid spelling out `meta(...).field` everywhere)
 # `dims` collides with the `dims=` kwarg used throughout mapslices/quantile, so inside
 # those method bodies it is self-qualified as `TreeArrays.dims(...)` (decision 2jzn6o).
+"""
+    dims(X::TreeData)
+    dims(A::TreeActualArray)
+
+The tree's axes, as a tuple of [`TreeDim`](@ref)s — including fixed dims and the
+aggregated ghosts reductions leave behind, in declaration order.
+
+!!! note "Self-qualify inside method bodies"
+    The bare name `dims` collides with the `dims =` keyword argument used
+    throughout [`mapslices`](@ref)/[`quantile`](@ref), so inside a function that
+    takes one, write `TreeArrays.dims(X)`.
+
+To read one axis's coordinates, prefer [`coords`](@ref).
+"""
 dims(X::TreeData) = meta(X).dims                 # the tree's (inner) axes
+
+"""
+    outerdim(X::TreeNamedTuple)
+
+The record axis of a [`TreeNamedTuple`](@ref) — the [`TreeDim`](@ref) whose
+coordinates are the record's field names.
+
+Only a tree built through the pair form (`TreeData(:param => (; a = …, b = …),
+…)`) carries one; handing a `NamedTuple` straight to `TreeData(x, dims...)` does
+not name a record axis, and this errors.
+"""
 outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axis
 
 # leaf numeric eltype: recurse through NamedTuple / ragged nesting down to the backing array.

@@ -312,8 +312,75 @@ end
           "`dims=` is foundALL -- a name that resolves nowhere is a typo, not an empty reduction.")
 end
 
-# The PUBLIC entry points assert; the recursion below calls `_mapslices` directly, so a branch
-# that legitimately lacks the dim is never mistaken for a typo.
+"""
+    mapslices(f, X::TreeData; dims, coords = false)
+
+Reduce the named `dims` of a tree with `f`, thread every remaining index
+recursively, and return a [`TreeData`](@ref).
+
+`dims` is a `Symbol` or a collection of them. `f` receives the slice along the
+reduced axis and returns either a **scalar** (which collapses the axis) or a
+**`TreeData`** (which introduces a new record or output axis). Nothing is
+stacked, pivoted or `vcat`ed: the result stays a tree of arrays, and a reduced
+axis is kept as an aggregated *ghost* dim so the provenance of the reduction
+survives it.
+
+```julia
+X   = TreeData(randn(1000, 179, 100), :draw, :subject, :time => range(0, 1, 100))
+qoi = mapslices(maximum, X; dims = :time)         # (draw × subject), still a TreeData
+```
+
+Returning a `TreeData` from `f` gives the reduction an output axis:
+
+```julia
+mapslices(X; dims = :time) do y
+    TreeData(:stat => (; trough = minimum(y), peak = maximum(y)))
+end
+```
+
+# `coords = true` — let the kernel see the axis it reduces
+
+By default `f` sees the data slice only. `coords = true` additionally hands it
+the **coordinates** of the reduced axis — what `trapz(t, y)` (AUC) and
+`t[argmax(y)]` (tmax) need:
+
+```julia
+mapslices(X; dims = :time, coords = true) do y, t
+    TreeData(:stat => (; cmax = maximum(y), tmax = t[argmax(y)], auc = trapz(t, y)))
+end
+```
+
+The binding happens **per node**, so on a ragged tree every sub-tree's kernel
+call sees *its own* grid — which is exactly why closing over one shared
+coordinate vector was never an answer there. One reduced axis hands `f` the bare
+coordinate vector; several hand it one vector per axis in slice-dim order.
+Reducing a ragged tree's outer axis hands the kernel that axis's labels.
+
+Two shapes throw rather than answer with a plausible value: an **unlabelled**
+axis has no coordinates to give, and a **pooled straddle** (reducing a ragged
+outer axis together with a leaf-inner one) concatenates every leaf's slice into
+one bag that no single axis's coordinates line up with.
+
+[`@kernel`](@ref) infers this opt-in from the kernel's arity; `mapslices` does
+not, deliberately — at this boundary a `hasmethod(f, (slice, coords))` probe is
+true for `maximum` (because `maximum(f, itr)` exists) and would silently treat
+your data slice as a predicate.
+
+# Rules
+
+  - Every name in `dims` must exist somewhere in the tree. A name that resolves
+    nowhere **throws**: `dims` is *foundALL*, not found-any. The check is made
+    from the type, so a correct call costs nothing at runtime; on a jagged tree
+    it falls back to an instance walk rather than let a typo through.
+  - A dim present on some branches and absent on others throws at the branch that
+    lacks it.
+  - Pass the kernel as a **concrete function value**. `mapslices` specializes on
+    `typeof(f)`, so a named function or a `do` block monomorphizes the inner
+    loop; a kernel that branches on a runtime value inside the slice loop does
+    not. Select the concrete kernel once, outside.
+
+See also [`quantile`](@ref), [`@kernel`](@ref), [`selectdim`](@ref).
+"""
 Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims, coords::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)

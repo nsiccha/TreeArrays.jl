@@ -19,6 +19,20 @@
 _recname(X::TreeNamedTuple) = haskey(meta(X), :outer_dim) ? name(outerdim(X)) : Symbol()
 _innerdims(X::TreeNamedTuple) = _splitrecord(TreeArrays.dims(X), Val(_recname(X)))[1]
 
+"""
+    X.fieldname
+
+Read one field of a [`TreeNamedTuple`](@ref) record — `post.beta` — zero-copy.
+
+A record's fields *are* its record axis, so `.` is the natural reader for them.
+The descent is exactly what a reduction over the record does: a field that is
+already a [`TreeData`](@ref) is returned **as is** (it knows its own dims), and a
+raw field is wrapped with its container's inner axes, so `:draw`/`:chain` survive
+either way and nothing densifies. Ghost dims stay on the container.
+
+`propertynames(X)` lists the fields; an unknown name errors and names the record
+axis and the fields it does have.
+"""
 Base.@constprop :aggressive function Base.getproperty(X::TreeNamedTuple, s::Symbol)
     P = parent(X)
     hasfield(typeof(P), s) || throw(ArgumentError(

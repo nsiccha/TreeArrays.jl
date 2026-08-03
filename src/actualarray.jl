@@ -17,6 +17,38 @@
 # heterogeneous / Tuple-record shapes error BY NAME (rectangular only — mirrors the Tables
 # adapter's contract). Nested records fall out of the recursion.
 
+"""
+    TreeActualArray(X::TreeData)
+
+A lazy, **zero-copy** `AbstractArray{T,N}` view of a rectangular tree — the way
+to feed a [`TreeData`](@ref) to a numeric N-D-array API (`ess`, `rhat`, anything
+typed on `AbstractArray`) without copying and without losing the dim labels.
+
+A `TreeData` is deliberately not an `AbstractArray`, and `parent(X)` is one only
+when the leaf *happens* to be array-backed. `TreeActualArray` is the explicit,
+one-way view that crosses the boundary: `getindex` walks the tree, nothing is
+materialized, and a [`TreeNamedTuple`](@ref)'s **record axis is promoted to a
+real array dimension**.
+
+```julia
+A = TreeActualArray(X)   # <: AbstractArray, zero-copy, labels kept, any backing
+ess(A); rhat(A)
+```
+
+Both draw representations therefore arrive at the *same* array — a dense leaf
+`TreeData(arr3d, :draw, :chain, :param => names)` and a record
+`TreeData(:param => per_param_matrices, :draw, :chain)`. The axes are `X`'s real
+axes in `dims` order, with the record axis trailing — exactly the
+`(draw, chain, param)` shape `ess`/`rhat` want.
+
+`parent(A)` recovers the tree and [`dims`](@ref)`(A)` its axes.
+
+Rectangular only: ragged, heterogeneous and `Tuple`-record shapes error by name.
+
+Two lower-level ways across the same boundary: `parent(X)` is the backing
+verbatim and zero-copy, but is an `AbstractArray` only for an array-backed leaf
+and drops the labels; `collect(X)` / `Array(X)` materialize a dense copy.
+"""
 struct TreeActualArray{T,N,X<:TreeData} <: AbstractArray{T,N}
     tree::X
     size::NTuple{N,Int}

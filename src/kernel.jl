@@ -36,6 +36,62 @@ _kernelcoordsopt(ex) =
     error("@kernel: expected `coords=true` or `coords=false` between the dim-signature and the " *
           "kernel, got `$ex`")
 
+"""
+    @kernel (:reduces => :into) function f(slice) ... end
+    @kernel (:reduces => :into) function f(slice, coords) ... end
+    @kernel (:reduces => :into) [coords=true] f
+
+Give a per-slice kernel a dim signature, so it also works on a
+[`TreeData`](@ref).
+
+Write the kernel once as plain array math and annotate it with the dim it
+consumes and the record axis it produces. The **defining** form emits both the
+plain-array kernel and a `TreeData` method that threads it through
+[`mapslices`](@ref); the **post-hoc** form (a bare function name) adds only the
+`TreeData` method to an existing function.
+
+```julia
+@kernel (:time => :stat) function compute_stats(L)
+    trough, peak = extrema(L)
+    baseline = L[1]
+    dtrough, dpeak = extrema(L .- baseline)
+    (; trough, peak, baseline, dtrough, dpeak)
+end
+
+compute_stats(some_vector)   # plain AbstractArray — unchanged
+compute_stats(X)             # TreeData — reduces :time into a :stat record
+```
+
+# Coordinates
+
+A kernel declaring **two** plain positional arguments additionally receives the
+reduced axis's coordinates — the AUC / tmax shape:
+
+```julia
+@kernel (:time => :stat) function nca(y, t)
+    (; cmax = maximum(y), tmax = t[argmax(y)], auc = trapz(t, y))
+end
+nca(ragged)   # every sub-tree's call sees ITS OWN grid
+```
+
+Inferring the opt-in from arity is safe here and only here: the macro reads the
+literal argument list at expansion time rather than probing a value, which at the
+[`mapslices`](@ref) boundary would be actively dangerous.
+
+Only **plain positional** arguments count — a default (`f(L, scale = 2)`),
+keywords and a splat (`f(L, rest...)`) are all one-slice kernels with extra
+machinery, so they keep the one-argument behaviour instead of having a coordinate
+vector pushed into their second slot. The post-hoc form has no argument list to
+read, so it defaults to one argument and takes an explicit opt-in:
+`@kernel (:time => :stat) coords=true nca`.
+
+Contradictions (`coords=true` on a one-argument kernel, and the converse) and
+unsupported arities are macro-expansion errors, by name.
+
+!!! note "Not for parameterized reducers"
+    `mean`/`sum`/`quantile` choose their dim and output per call, so they do not
+    fit this fixed-signature shape — use their `dims =` methods instead.
+"""
 macro kernel(spec, args...)
     1 <= length(args) <= 2 || error(
         "@kernel: expected `@kernel (:dim => :into) [coords=true] <function definition or name>`")
