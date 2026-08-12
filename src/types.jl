@@ -226,7 +226,16 @@ outerdim(X::TreeData) = meta(X).outer_dim        # a TreeNamedTuple's record axi
 # per-subject arrays without stacking), and a type-only walk turns it into an error. Nesting
 # makes that worse: an outer container's type walk cannot reach an inner instance to recover.
 _eltype(X::TreeArray)      = eltype(parent(X))
-_eltype(X::TreeTuple)      = eltype(parent(X))
+# A TreeTuple is EITHER a positional-record LEAF (a tuple of scalars -- a quantile band result)
+# OR a positional CONTAINER whose elements are themselves TreeData (what `map(f, ::TreeDim)`
+# builds -- the single-axis twin of a product-swept TreeRaggedArray). `eltype(parent(X))` answers
+# the leaf case but returns the CHILD TREE type for the container case, so a reducer's
+# `float(_eltype(X))` / `_eltype(X)[]` then chokes on a `TreeArray` type (snag nanquantile-tree).
+# Recurse through a representative child instead -- exactly as TreeNamedTuple/TreeRaggedArray do;
+# for a scalar-tuple leaf `_eltype(first(parent(X)))` is the first field's type, matching the
+# established "first field" convention above. The empty tuple has no representative, so the TYPE
+# walk answers (Union{} for a zero-field tuple, preserving the instance contract this replaces).
+_eltype(X::TreeTuple)      = isempty(parent(X)) ? _eltype(typeof(parent(X))) : _eltype(first(parent(X)))
 _eltype(X::TreeNamedTuple) = _eltype(first(parent(X)))
 _eltype(X::TreeRaggedArray) = isempty(parent(X)) ?
     _eltype(eltype(parent(X))) :      # no representative -- ask the element type

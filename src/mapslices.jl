@@ -459,6 +459,27 @@ function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}) where want
     TreeData(map(el -> _mapslices(f, el, valwant), parent(X)), meta(X))   # `_mapslices`: children never re-assert
 end
 
+# A TreeTuple is the POSITIONAL twin of TreeRaggedArray: a `map(f, ::TreeDim)` container (setdim.jl)
+# whose elements are themselves TreeData, with the swept axis stored in `dims`. It differs from the
+# ragged form only in the PARENT (a Tuple, not an Array) -- deliberate, so heterogeneously-shaped
+# children keep their concrete types. So reducing a dim that lives INSIDE the positional children
+# recurses per position and REBUILDS a Tuple (preserving that typing), exactly as the ragged form
+# rebuilds an Array. Reducing (or straddling) the OUTER positional axis -- pooling across positional
+# records -- is the same operation the ragged machinery already implements; collecting the Tuple to
+# a Vector (which references the children, never copies their backing) delegates to it rather than
+# duplicating `_reduceouter` / `_pooledstraddle` for a Tuple parent. A scalar-tuple LEAF has only
+# its outer axis, so that same delegation reduces it as a dense array. (snag nanquantile-tree.)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeTuple; dims, coords::Bool=false)
+    valwant = Val(_dimnames(dims))
+    _assertdimsexist(X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
+end
+function _mapslices(f, X::TreeTuple, valwant::Val{want}) where want
+    any(nm -> nm in map(name, TreeArrays.dims(X)), want) &&
+        return _mapslices(f, TreeData(collect(parent(X)), meta(X)), valwant)   # outer/straddle: reuse the ragged path
+    TreeData(map(el -> _mapslices(f, el, valwant), parent(X)), meta(X))   # inner-only: recurse per position, keep the Tuple
+end
+
 # A `dims=` that names BOTH this ragged node's outer axis AND a dim living inside its leaves is a
 # STRADDLE. The plain gather-loop cannot serve it directly -- it pools along the outer axis at FIXED
 # inner positions, so it would reduce the outer axis and leave the named inner one a LIVE axis
