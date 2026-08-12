@@ -157,6 +157,53 @@ end
         @test_throws "no coordinates to sweep" map(identity, TreeDim(:dose))
     end
 
+    @testset "reduce a TreeTuple container: map(f, ::TreeDim) reduces like its product twin (snag nanquantile-tree)" begin
+        # `map(f, ::TreeDim)` (setdim.jl) builds a TreeTuple whose ELEMENTS are TreeData -- the
+        # single-axis twin of the product-swept TreeRaggedArray above. It must reduce identically.
+        # Reporter's exact shape: an outer :covariate TreeTuple of aligned dense TreeArray leaves.
+        mk() = map(Iterators.product(TreeDim(:parameter, ("Vc",)), TreeDim(:draw, Base.OneTo(2)),
+                                     TreeDim(:cov_value, 1:2))) do (_, draw, value)
+            Float64(draw + value)
+        end
+        xt = map(TreeDim(:covariate, ("Age", "Weight"))) do _; mk(); end                   # Tuple parent -> TreeTuple
+        xr = map(Iterators.product(TreeDim(:covariate, ("Age", "Weight")))) do (_,); mk(); end  # Array parent -> ragged
+
+        @test parent(xt) isa Tuple && xt isa TreeArrays.TreeTuple
+        @test TreeArrays._eltype(xt) == Float64                                             # was: the TreeArray container type
+
+        rows(td) = sort(collect(Tables.rowtable(td)), by = string)
+        # reporter's literal call: nanquantile with NamedTuple probs over :draw. No throw; native.
+        rt = nanquantile(xt, (median = 0.5,); dims = :draw)
+        @test rt isa TreeData
+        @test Set(map(TreeArrays.name, TreeArrays.dims(rt))) ⊇ Set((:covariate,))           # outer axis preserved
+        @test Tables.columnnames(Tables.columns(rt)) == (:covariate, :parameter, :cov_value, :median)
+
+        # inner reduce keeps the Tuple parent (preserving the heterogeneity-typed container)...
+        @test parent(mean(xt; dims = :draw)) isa Tuple
+        # ...and is byte-for-byte the product-swept twin, for every reducer that hit the bug.
+        for (ft, fr) in (
+            (() -> nanquantile(xt, (median=0.5, q025=0.025, q975=0.975); dims=:draw),
+             () -> nanquantile(xr, (median=0.5, q025=0.025, q975=0.975); dims=:draw)),
+            (() -> nanquantile(xt, TreeDim(:pct, (0.25, 0.5, 0.75)); dims=:draw),
+             () -> nanquantile(xr, TreeDim(:pct, (0.25, 0.5, 0.75)); dims=:draw)),
+            (() -> quantile(xt, (median=0.5,); dims=:draw),
+             () -> quantile(xr, (median=0.5,); dims=:draw)),
+            (() -> mean(xt; dims=:draw), () -> mean(xr; dims=:draw)),
+            (() -> sum(xt; dims=:draw),  () -> sum(xr; dims=:draw)),
+            (() -> std(xt; dims=:draw),  () -> std(xr; dims=:draw)),
+            (() -> mapslices(maximum, xt; dims=:draw), () -> mapslices(maximum, xr; dims=:draw)),
+        )
+            @test rows(ft()) == rows(fr())
+        end
+
+        # reducing the OUTER positional axis delegates to the ragged machinery -> same answer.
+        @test rows(mean(xt; dims = :covariate)) == rows(mean(xr; dims = :covariate))
+
+        # a scalar-tuple LEAF (a quantile band result) still reduces its own positional axis.
+        band = quantile(TreeData(randn(50), :draw), TreeDim(:band, (0.1, 0.5, 0.9)); dims = :draw)
+        @test parent(band) isa Tuple && mean(band; dims = :band) isa TreeData
+    end
+
     @testset "setdim stubs throw instead of silently no-oping" begin
         X = TreeData(randn(4,3), :draw, :param)
         @test (try; setdim(X; foo=:bar); false; catch; true; end)                # was: silently returned X unchanged
