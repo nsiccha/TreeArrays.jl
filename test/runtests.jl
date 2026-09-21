@@ -1689,6 +1689,22 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test_throws ErrorException TreeActualArray(TreeData([TreeData(randn(3), :t), TreeData(randn(4), :t)], :s))
         @test_throws ErrorException TreeActualArray(TreeData(:param => (a = randn(5, 4), b = randn(6, 4)), :draw, :chain))
         @test_throws ErrorException TreeActualArray(TreeData(:param => (a = randn(5, 4), b = rand(1:9, 5, 4)), :draw, :chain))
+
+        # unequal per-chain :draw counts error BY NAME — outer axis + differing inner
+        # axis + lengths (snag treeactualarray-998ba536: TA must never hand back an
+        # array for ragged chains, and the refusal must say so precisely)
+        rag_uneq = TreeData([TreeData(randn(n, 2), :draw, :param => [:a, :b]) for n in (100, 87)], :chain)
+        msg_uneq = try TreeActualArray(rag_uneq); nothing catch e e.msg end
+        @test msg_uneq !== nothing
+        @test occursin("`:chain`", msg_uneq) && occursin("`:draw`", msg_uneq)
+        @test occursin("[100, 87]", msg_uneq)
+
+        # an outer axis of sub-trees is refused EVEN WHEN rectangular — slicing to a
+        # common length does not unblock TreeActualArray (no ragged→dense stacker exists)
+        rag_eq = TreeData([TreeData(randn(100, 2), :draw, :param => [:a, :b]) for _ in 1:2], :chain)
+        msg_eq = try TreeActualArray(rag_eq); nothing catch e e.msg end
+        @test msg_eq !== nothing
+        @test occursin("`:chain`", msg_eq) && occursin("even when rectangular", msg_eq)
     end
 
     @testset "coords=true — a kernel sees the axis it reduces (snag kernels-cannot-s)" begin

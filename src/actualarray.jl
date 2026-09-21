@@ -13,9 +13,11 @@
 # param) shape ess/rhat want. Both draw representations arrive at the SAME array: a dense leaf
 # `TreeData(arr3d, :draw,:chain,:param=>names)` (real axes ARE parent's axes) and a record
 # `TreeData(:param => per-param-matrices, :draw,:chain)` (fields assembled lazily). v1 supports
-# an array-backed leaf and a (possibly nested) HOMOGENEOUS NamedTuple record; ragged /
-# heterogeneous / Tuple-record shapes error BY NAME (rectangular only — mirrors the Tables
-# adapter's contract). Nested records fall out of the recursion.
+# an array-backed leaf and a (possibly nested) HOMOGENEOUS NamedTuple record. An outer axis
+# of sub-trees is refused EVEN WHEN rectangular, naming the outer axis; unequal leaves
+# additionally name the differing inner axis and lengths (heterogeneous / Tuple-record
+# shapes error BY NAME likewise — rectangular only, mirrors the Tables adapter's contract).
+# Nested records fall out of the recursion.
 
 """
     TreeActualArray(X::TreeData)
@@ -43,7 +45,9 @@ axes in `dims` order, with the record axis trailing — exactly the
 
 `parent(A)` recovers the tree and [`dims`](@ref)`(A)` its axes.
 
-Rectangular only: ragged, heterogeneous and `Tuple`-record shapes error by name.
+Rectangular only: an outer axis of sub-trees is refused even when rectangular —
+unequal leaves name the outer axis plus the differing inner axis and lengths —
+and heterogeneous / `Tuple`-record shapes error by name.
 
 Two lower-level ways across the same boundary: `parent(X)` is the backing
 verbatim and zero-copy, but is an `AbstractArray` only for an array-backed leaf
@@ -84,8 +88,34 @@ function _actualsize(X::TreeNamedTuple)
         "TreeActualArray: record `$(name(outerdim(X)))` fields have differing eltypes $(elts) — not a single-eltype array")
     (first(reps)..., length(p))                 # inner field axes ++ record axis (trailing)
 end
-_actualsize(X::TreeRaggedArray) = error(
-    "TreeActualArray: a ragged / array-of-TreeData tree is not supported yet — feed a dense leaf or a homogeneous NamedTuple record")
+# An outer axis of sub-trees is refused even when the leaves agree — but UNEQUAL
+# leaves get their exact words: which inner axis differs, and how (snag
+# treeactualarray-998ba536: unequal per-chain `:draw` counts must error BY NAME).
+_actualleafsig(l::TreeData) = (name.(dims(l)), _actualsize(l))
+function _actualsize(X::TreeRaggedArray)
+    outer = dims(X)
+    who = isempty(outer) ? "an outer array-of-trees" : "outer axis `:$(name(first(outer)))`"
+    leaves = parent(X)
+    n = length(leaves)
+    sigs = map(_actualleafsig, leaves)
+    allequal(sigs) && error(
+        "TreeActualArray: $who holds $n identically-shaped sub-trees — an array-of-trees " *
+        "is not a supported shape yet, even when rectangular (slicing to a common length does " *
+        "not unblock it) — feed a dense leaf (`TreeData(arr3d, :draw, :chain, :param)`) or a " *
+        "homogeneous NamedTuple record (`TreeData(:param => (; …), :draw, :chain)`)")
+    (names1, sizes1) = sigs[1]
+    k = findfirst(s -> s != sigs[1], sigs)
+    (namesk, sizesk) = sigs[k]
+    detail = if namesk != names1
+        "leaf $k carries axes $namesk where leaf 1 carries $names1"
+    else
+        j = findfirst(i -> sizes1[i] != sizesk[i], 1:min(length(sizes1), length(sizesk)))
+        j === nothing ? "leaf $k has rank $(length(sizesk)) where leaf 1 has rank $(length(sizes1))" :
+            "axis `:$(names1[j])` lengths differ $(map(s -> s[2][j], sigs))"
+    end
+    error("TreeActualArray: $who holds $n sub-trees with differing shapes — $detail — " *
+        "a rectangular array needs every leaf the same shape (feed a dense leaf or a homogeneous NamedTuple record)")
+end
 _actualsize(X::TreeTuple) = error(
     "TreeActualArray: a Tuple-backed record is not supported yet — use a NamedTuple record (`:param => (; a=…, b=…)`)")
 
