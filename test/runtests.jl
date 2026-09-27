@@ -1596,6 +1596,75 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test_throws "KEEPING part of this node's outer axis" mean(grid; dims=(:draw, :chain))
     end
 
+    # Pooled straddle over a NON-CONFORMABLE reduced inner axis (todo 1ynv0r4, reporter
+    # Bruno:long-df-scrub): `source -> (draw x subject)` with UNEQUAL subject counts, reducing
+    # (:source, :subject) and keeping the conformable :draw. v1 threw `DimensionMismatch` before
+    # recognizing the differing axis was itself being reduced; v2 pools it -- only the KEPT axes
+    # must match in length AND coordinates. Each pooled result is pinned against base-Julia over
+    # the hand-pooled bag (one bag per kept index), never against a second TreeArrays call.
+    @testset "pooled straddle over a non-conformable reduced inner axis (1ynv0r4)" begin
+        ndraw = 7
+        mats  = [reshape(collect(1.0:(ndraw*n)), ndraw, n) .+ 100*s for (s, n) in enumerate((5, 3, 8))]
+        X     = TreeData([TreeData(m, :draw, :subject) for m in mats], :source)
+        bags  = [vcat([m[d, :] for m in mats]...) for d in 1:ndraw]
+
+        r = mean(X; dims=(:source, :subject))
+        @test vec(collect(parent(r))) ≈ [mean(b) for b in bags]
+        @test map(TreeArrays.name, TreeArrays.dims(r)) == (:draw, :subject, :source)
+
+        rq = quantile(X, TreeDim(:ribbon, (0.5,)); dims=(:source, :subject))
+        @test [parent(parent(rq)[d])[1] for d in 1:ndraw] ≈ [quantile(b, 0.5) for b in bags]
+
+        # an ECDF-style TreeData-returning kernel: per-draw pooled bag -> values over an x grid
+        xs = (0.0, 250.0, 550.0, 900.0)
+        re = mapslices(X; dims=(:source, :subject)) do bag
+            TreeData([count(y -> y ≤ x, bag) / length(bag) for x in xs], TreeDim(:x, xs))
+        end
+        @test [collect(parent(parent(re)[d])) for d in 1:ndraw] ≈
+              [[count(y -> y ≤ x, b) / length(b) for x in xs] for b in bags]
+
+        # reducing EVERYTHING (incl. the kept-then-reduced :draw) -> one fully-pooled scalar leaf
+        @test parent(mean(X; dims=(:draw, :source, :subject))) ≈ mean(vcat(vec.(mats)...))
+
+        # unequal per-chain :draw counts -- a REDUCED axis the skill used to call unsupported --
+        # pool too (kept :param labels prove which positions the pools land on)
+        C  = TreeData([TreeData(reshape(collect(1.0:(n*2)), n, 2), :draw, :param => (:a, :b))
+                       for n in (10, 6, 8)], :chain)
+        rc = mean(C; dims=(:draw, :chain))
+        for j in 1:2
+            @test parent(rc)[j] ≈ mean(vcat([parent(parent(C)[k])[:, j] for k in 1:3]...))
+        end
+
+        # a KEPT axis that differs in LENGTH still refuses (the "not conformable" phrase the
+        # refusal testset above pins), naming the axis and the guilty leaves
+        @test_throws "KEPT inner axis `:time`" mean(
+            TreeData(map(s -> TreeData(reshape(collect(1.0:(3*(2+s))), 3, 2+s), :draw, :time), 1:3), :subject);
+            dims=(:draw, :subject))
+
+        # ...as does a kept axis of the same length with DIFFERENT coordinates ...
+        Y = TreeData([TreeData(randn(4, 3), :draw, :p => (:a, :b, :c)),
+                      TreeData(randn(4, 3), :draw, :p => (:a, :b, :X))], :chain)
+        @test_throws "KEPT inner axis `:p`" mean(Y; dims=(:draw, :chain))
+        # ... and an unlabelled-vs-labelled kept axis ...
+        Yu = TreeData([TreeData(randn(4, 3), :draw, :p => (:a, :b, :c)),
+                       TreeData(randn(4, 3), :draw, :p)], :chain)
+        @test_throws "KEPT inner axis `:p`" mean(Yu; dims=(:draw, :chain))
+        # ... while the SAME labels in different containers (Tuple beside Vector) pool
+        Y2 = TreeData([TreeData(randn(4, 3), :draw, :p => (:a, :b, :c)),
+                       TreeData(randn(4, 3), :draw, :p => [:a, :b, :c])], :chain)
+        @test mean(Y2; dims=(:draw, :chain)) isa TreeData
+
+        # divergent leaf dim structure (a leaf missing the named inner dim) refuses by name
+        Z = TreeData([TreeData(randn(4, 3), :draw, :subject),
+                      TreeData(randn(4), :draw)], :source)
+        @test_throws "same dim structure" mean(Z; dims=(:source, :subject))
+
+        # mixed provenance (a pre-reduced ghost where the prototype has a live axis) refuses
+        pre = mapslices(maximum, TreeData(randn(4, 3), :draw, :subject); dims=:subject)
+        Mx  = TreeData([TreeData(randn(4, 3), :draw, :subject), pre], :source)
+        @test_throws "same dim structure" mean(Mx; dims=(:source, :subject))
+    end
+
 
     # `dims=` is foundALL, not foundany (decision 1iy1r57, user-directed). A name that resolves
     # NOWHERE used to reduce nothing and yield the `missing` sentinel -- a typo'd dim produced a
