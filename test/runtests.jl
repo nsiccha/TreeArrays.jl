@@ -543,7 +543,13 @@ end
             nanquantile(X, pdim3; dims=:draw)
             a_base = @allocated quantile(X, pdim3; dims=:draw)
             a_nan  = @allocated nanquantile(X, pdim3; dims=:draw)
-            @test a_nan == a_base   # byte-identical per-slice profile to the untouched Statistics.quantile baseline
+            # Same per-slice profile as the untouched Statistics.quantile baseline, up to FIXED
+            # per-call noise: byte-`==` held on Julia 1.10/Linux but fails on Windows Julia 1/pre
+            # with sign-flipping ±48B deltas (red on 3 consecutive mains incl. before this gate's
+            # neighbors changed -- allocator/codegen noise, and the scaling check below stays green
+            # there, confirming no leak). 128B still catches the tripling-class per-slice leak this
+            # gate exists for (+20KB at this shape).
+            @test abs(a_nan - a_base) <= 128
 
             Xbig = TreeData(randn(n_draws, 100 * n_cols), :draw, :param)
             nanquantile(Xbig, pdim3; dims=:draw)
