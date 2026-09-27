@@ -22,7 +22,7 @@ export TreeDim, TreeData, TreeArray, TreeNamedTuple, TreeRaggedArray, TreeTuple
 export TreeActualArray
 export TreeTable
 export dims, outerdim, coords
-export mapslices, mean, sum, std, var, quantile, quantile!
+export mapslices, mean, sum, std, var, quantile, quantile!, hdi
 export @kernel
 export setdim
 

@@ -69,8 +69,9 @@ The rules, each erroring by name:
     rewriting, or (for several wide dims) whose `_`-joined combinations collide,
     all error and name the culprit — `_` is not an injective separator;
   - **ragged throws under `wide =`, and only there.** A pivot needs one level set
-    and one column length, and a ragged axis has neither. The long melt of the
-    same tree works.
+    and one column length, and a ragged tree has neither. The long melt of the
+    same tree works — and so does one `TreeTable` per sibling: multi-response
+    outputs melt each response on its own, and each rectangular sibling pivots.
 
 !!! note "Wide-mode column names are not inferable"
     In wide mode the column *names* are the axis's coordinate values, which do
@@ -238,7 +239,7 @@ function _pivotcolumns(tt::TreeTable)
         # sibling to sibling, so there is no single level set to spread into columns
         # and no single column length to spread them to. Long mode melts it fine
         # (that is the whole point of long); a pivot inherently cannot.
-        c isa WalkAxisColumn && error("TreeArrays Tables adapter: wide=$(nm) names an axis whose levels differ per sibling -- ragged trees are not a supported Tables shape under `wide=` (a pivot needs ONE level set and ONE column length). The LONG melt of this tree works: drop `wide=`.")
+        c isa WalkAxisColumn && error("TreeArrays Tables adapter: wide=$(nm) cannot pivot this ragged tree -- ragged trees are not a supported Tables shape under `wide=` (a pivot needs ONE level set and ONE column length, and this tree's siblings diverge at or above :$(nm) -- either its levels differ per sibling, or the siblings differ in shape elsewhere). Melt each sibling on its own (one `TreeTable` per sibling -- a rectangular sibling pivots), or drop `wide=` for the LONG melt, which handles ragged trees.")
         c isa AxisColumn || error("TreeTable: wide=$(nm) is a fixed/ghost dim, not a real axis -- it has no levels to spread into columns")
     end
 
@@ -246,7 +247,7 @@ function _pivotcolumns(tt::TreeTable)
     # it is every widened dim's view of it. A pivot re-indexes that plan's slots
     # directly, which only a rectangular (product) row space supports.
     rowplan = first(wcols).plan
-    rowplan isa DensePlan || error("TreeArrays Tables adapter: wide=$(w) over a tree whose sibling subtrees have different row counts -- ragged trees are not a supported Tables shape under `wide=` (a pivot needs ONE column length). The LONG melt of this tree works: drop `wide=`.")
+    rowplan isa DensePlan || error("TreeArrays Tables adapter: wide=$(w) over a tree whose sibling subtrees have different row counts -- ragged trees are not a supported Tables shape under `wide=` (a pivot needs ONE column length). Melt each sibling on its own (one `TreeTable` per sibling -- a rectangular sibling pivots), or drop `wide=` for the LONG melt, which handles ragged trees.")
     rowdims = rowplan.dims
     poss    = map(c -> c.pos, wcols)
     nlevels = map(p -> rowdims[p], poss)

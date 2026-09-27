@@ -500,10 +500,12 @@ _isstraddle(X::TreeRaggedArray, ::Val{want}) where want = begin
 end
 
 # Pool this ragged node's OUTER axis together with the named LEAF-INNER dims, keeping the un-named inner
-# axes. v1 serves the shape a pooled posterior summary needs: a single-level ragged nesting of
-# CONFORMABLE, array-backed leaves, with EVERY outer axis reduced. The harder shapes -- a KEPT outer axis,
-# record/tuple/doubly-ragged leaves, non-conformable leaves -- each throw BY NAME rather than answer a
-# partial or wrong pool (the never-silently-wrong discipline, decisions 16fwcnx / 1iy1r57).
+# axes. v1 served a single-level ragged nesting of CONFORMABLE, array-backed leaves, with EVERY outer
+# axis reduced; v2 (todo 1ynv0r4) drops the full-conformability demand -- a REDUCED inner axis may
+# differ in length per leaf (concatenating the per-leaf slices into one bag is exactly what pooling
+# means) -- and keeps the loud refusals for everything else: a KEPT outer axis, record/tuple/
+# doubly-ragged leaves, divergent leaf dim structure, and KEPT inner axes that differ in length or
+# coordinates (the never-silently-wrong discipline, decisions 16fwcnx / 1iy1r57).
 function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}) where want
     _refusecoords(f, want)          # a pooled bag has no single aligned coordinate vector
     alldims = TreeArrays.dims(X)
@@ -521,18 +523,96 @@ function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}) where want
         "cannot pool dims " * string(want) * " across a ragged boundary: its leaves are " * string(typeof(proto)) *
         ", not array-backed. Pooling across a record / tuple / doubly-ragged leaf is not implemented -- " *
         "reduce the inner dim(s) first, then the outer axis."))
-    _assertconformable(els, size(p))                      # the KEPT inner axes must match across leaves
     keepaxes, keptdims, trailing, _ = _splitdims(TreeArrays.dims(proto), Val(ndims(p)), Val(want))
+    _assertpoolable(els, proto, keepaxes, keptdims, want)  # same structure; kept axes match in length + coords
     ps     = map(parent, els)                             # the leaves' own backing arrays -- never stacked
     ghosts = (trailing..., map(sliced, outer)..., alldims[n_outer+1:end]...)   # reduced inner + outer, sliced
+    T      = mapreduce(eltype, promote_type, ps)         # the pooled bag's eltype (what `vcat` would give)
+    redaxes = Tuple(i for i in 1:ndims(p) if !(i in keepaxes))
+    baglen = sum(P -> _redlen(P, redaxes), ps)           # Σ over leaves; exact at every kept index
+    bag    = Vector{T}(undef, baglen)                     # ONE scratch bag, refilled IN FULL per kept index
     if isempty(keepaxes)                                  # every inner axis reduced too: one fully-pooled leaf
-        _assemble(_leafreduce(f, reduce(vcat, (vec(P) for P in ps))), keptdims, ghosts)
+        _assemble(_leafreduce(f, _fillbag!(bag, map(vec, ps))), keptdims, ghosts)
     else                                                  # keep the un-named inner axes; pool per kept index
         sls  = map(P -> _eachslice(P, Val(keepaxes)), ps)
-        outs = map(i -> _leafreduce(f, reduce(vcat, (vec(sl[i]) for sl in sls))), CartesianIndices(first(sls)))
+        inds = CartesianIndices(first(sls))
+        outs = map(inds) do i
+            _leafreduce(f, _fillbag!(bag, (vec(sl[i]) for sl in sls)))
+        end
         _assemble(outs, keptdims, ghosts)
     end
 end
+_redlen(P::AbstractArray, redaxes) = prod(ax -> size(P, ax), redaxes; init=1)
+
+# Fill the shared pooled bag from one contribution per leaf -- no per-leaf allocation, one copy per
+# element (the old `reduce(vcat, ...)` reallocated per kept index AND copied quadratically across
+# leaves). The bag is refilled IN FULL on every call, so a kernel that mutates its slice
+# (`quantile!` sorts in place) can never see a previous kept index's tail; a kernel that RETAINS
+# its slice without copying would alias the refill -- but the `mapslices` contract already
+# requires scalar-or-TreeData returns, and every in-repo kernel copies into its own scratch.
+function _fillbag!(bag::AbstractVector, contribs)
+    off = 1
+    for v in contribs
+        copyto!(bag, off, v)
+        off += length(v)
+    end
+    @assert off - 1 == length(bag) "_fillbag! under-filled the pooled bag ($(off - 1) of $(length(bag))): the kept-index slice lengths disagree with the reduced-axis sizes"
+    bag
+end
+
+# Pooling needs positional agreement, not full conformability (todo 1ynv0r4). Every leaf must be
+# array-backed at the same rank and carry the same (name, kind) dim STRUCTURE -- a leaf missing a
+# named inner dim, or carrying a pre-reduced ghost where the prototype has a live axis (mixed
+# provenance: stale parent data pooling beside live data), refuses rather than mis-pool. The KEPT
+# inner axes must match in LENGTH and COORDINATES (else one kept index pools positions that mean
+# different things); the REDUCED inner axes may differ freely. Fixed-dim VALUES are deliberately
+# NOT cross-checked: decision 4b3vcd's beta case assumes siblings agree on fixed values (the Tables
+# adapter documents + test-pins the same boundary) -- a per-sibling-varying value belongs in an
+# axis coordinate, not a fixed dim.
+function _assertpoolable(els, proto, keepaxes, keptdims, want)
+    p1  = parent(proto)
+    ref = map(d -> name(d) => _dimkind(d), TreeArrays.dims(proto))
+    for j in 2:length(els)
+        el = els[j]
+        q  = parent(el)
+        q isa AbstractArray || throw(ArgumentError(
+            "cannot pool dims " * string(want) * " across a ragged boundary: leaf " * string(j) *
+            " is " * string(typeof(el)) * ", not array-backed. Pooling across a record / tuple / " *
+            "doubly-ragged leaf is not implemented -- reduce the inner dim(s) first, then the outer axis."))
+        sig = map(d -> name(d) => _dimkind(d), TreeArrays.dims(el))
+        sig == ref || throw(ArgumentError(
+            "cannot pool dims " * string(want) * " across a ragged boundary: leaf " * string(j) *
+            " carries dims " * string(map(first, sig)) * " (kinds " * string(map(last, sig)) *
+            ") where leaf 1 carries " * string(map(first, ref)) * " (kinds " *
+            string(map(last, ref)) * "). Pooling needs every leaf to carry the same dim structure " *
+            "-- reduce the divergent leaves to a common shape first, or split the tree."))
+        ndims(q) == ndims(p1) || throw(ArgumentError(
+            "cannot pool dims " * string(want) * " across a ragged boundary: leaf " * string(j) *
+            " has a rank-" * string(ndims(q)) * " parent where leaf 1 has rank-" *
+            string(ndims(p1)) * ". Pooling needs every leaf at the same rank."))
+        for (ax, kd) in zip(keepaxes, keptdims)
+            n1, nj = size(p1, ax), size(q, ax)
+            n1 == nj || throw(ArgumentError(
+                "cannot pool dims " * string(want) * " across a ragged boundary: the KEPT inner axis " *
+                "`:$(name(kd))` is not conformable across leaves -- lengths differ (leaf 1: $n1, leaf " *
+                "$j: $nj). Only REDUCED axes may differ in length across pooled leaves: name " *
+                "`:$(name(kd))` in `dims=` too, or split the tree."))
+            _poolcoordsagree(meta(TreeArrays.dims(el)[ax]).values, meta(kd).values) || throw(ArgumentError(
+                "cannot pool dims " * string(want) * " across a ragged boundary: the KEPT inner axis " *
+                "`:$(name(kd))` is not conformable across leaves -- leaf $j carries different " *
+                "coordinates than leaf 1 (an unlabelled axis and a labelled one also differ). " *
+                "Pooling needs every kept axis to mean the same positions in every leaf."))
+        end
+    end
+end
+
+# Kept-axis coordinates agree under the codebase's `_sigmatch` notion (the `===` fast path plus an
+# `isequal` fallback -- missing-safe, NaN-safe), with a content fallback so the same labels in
+# different containers (a Tuple beside a Vector) still pool instead of falsely refusing.
+_poolcoordsagree(a, b) = _sigmatch(a, b) || _poolcoordsagree_content(a, b)
+_poolcoordsagree_content(a::Union{Tuple,AbstractArray,AbstractRange}, b::Union{Tuple,AbstractArray,AbstractRange}) =
+    collect(a) == collect(b)
+_poolcoordsagree_content(a, b) = false
 
 # wrap `outs` (the raw per-slice kernel outputs -- already TreeData/record/scalar pieces,
 # never stacked/pivoted) as one TreeData over the kept + reduced-as-ghost dims.

@@ -282,6 +282,49 @@ end
         @test TreeArrays.meta(Xnt) isa NamedTuple
     end
 
+    # ... and on a TreeRaggedArray OF records (todo 1h7ye2g): `X.beta` maps `.beta` over the
+    # leaves (eager outer vector of pointers, zero-copy children) under the container's own
+    # outer dims. foundALL: a non-record leaf, or a record missing the field, throws and names
+    # the leaf -- fields are never silently skipped.
+    @testset "getproperty on a ragged container of records maps over leaves (1h7ye2g)" begin
+        getbeta(X) = X.beta
+        mkrec(n) = TreeData(:param => (; beta=TreeData(randn(n), :draw),
+                                        sigma=TreeData(randn(n), :draw)))
+        X = TreeData([mkrec(n) for n in (5, 3, 8)], :subject)
+
+        B = X.beta
+        @test B isa TreeArrays.TreeRaggedArray
+        @test length(parent(B)) == 3
+        @test parent(B)[2] === parent(X)[2].beta      # zero-copy: the leaf's own child
+        @test map(TreeArrays.name, TreeArrays.dims(B)) == (:subject,)
+        @test propertynames(X) == (:beta, :sigma)     # the prototype leaf's fields
+        @test (@inferred getbeta(X)) isa TreeArrays.TreeRaggedArray
+
+        # a ghost dim stays on the container, never on the children
+        G = TreeData(X, TreeDim(:extra, nothing))
+        @test map(TreeArrays.name, TreeArrays.dims(G.beta)) == (:subject, :extra)
+
+        # a doubly-nested ragged container recurses leaf by leaf
+        N = TreeData([X, X], :group)
+        @test parent(N.beta)[1] isa TreeArrays.TreeRaggedArray
+        @test parent(parent(N.beta)[1])[2] === parent(parent(N)[1])[2].beta
+
+        # heterogeneous fields: leaf 2 lacks `beta` -> throws naming leaf + field
+        H = TreeData([mkrec(4), TreeData(:param => (; sigma=TreeData(randn(4), :draw)))], :subject)
+        @test_throws "leaf 2" H.beta
+        # a dense leaf among records refuses with its own words ...
+        D = TreeData([mkrec(4), TreeData(randn(4), :draw)], :subject)
+        @test_throws "TreeArray" D.beta
+        # ... as does an empty container (no leaf to read from)
+        E = TreeData(TreeData[], :subject)
+        @test_throws "empty TreeRaggedArray" E.beta
+
+        # propertynames is total: `()` where no fields are accessible, proto keys otherwise
+        @test propertynames(E) == ()
+        @test propertynames(TreeData([TreeData(randn(4), :draw)], :subject)) == ()
+        @test propertynames(D) == (:beta, :sigma)
+    end
+
     # The unified quantile no longer coerces p at all -- Base's quantile!(scratch, p)
     # preserves p's container as-is (scalar -> scalar leaf, Vector -> Vector leaf, Tuple ->
     # Tuple leaf), matching decision xxmv6c (option 2). _leafreduce gather-reduces
@@ -378,6 +421,67 @@ end
         cols = Tables.columns(r)
         @test Set(Tables.columnnames(cols)) == Set((:param, :band, :value))
         @test Set(Tables.getcolumn(cols, :band)) == Set(keys(spec))
+    end
+
+    # Highest-density intervals (brm-3): the SHORTEST interval holding at least `mass` of the
+    # draws, endpoints always draws. Pinned against an independent O(n^2) all-pairs reference
+    # (not a second call into the same window scan), on deterministic vectors.
+    @testset "hdi — highest-density intervals over named dims (brm-3)" begin
+        _brute_hdi(y, mass) = begin
+            s, n = sort(collect(y)), length(y)
+            best, bestw = (s[1], s[n]), s[n] - s[1]
+            for i in 1:n, j in i:n
+                (j - i + 1) / n >= mass || continue
+                w = s[j] - s[i]
+                w < bestw && ((best, bestw) = ((s[i], s[j]), w))
+            end
+            best
+        end
+
+        vecs = [[1.0, 1.1, 0.9, 1.05, 5.0, 5.2, 4.9, 5.1, 5.05, 1.0],
+                collect(1.0:20.0),
+                [0.5, -3.0, 2.2, 2.2, 2.2, -3.0, 10.0, 0.5, 0.5, 0.5, 0.5],
+                [7.0], [2.0, 2.0, 2.0, 2.0]]
+        for y in vecs, mass in (0.5, 0.9, 1.0)
+            got, exp = hdi(y, mass), _brute_hdi(y, mass)
+            @test (got.lower, got.upper) == exp
+        end
+        @test hdi(vecs[1]) == hdi(vecs[1], 0.9)   # default mass is 0.9
+
+        # endpoints are draws, never interpolations; ties resolve to the first window
+        @test hdi([1, 2, 3, 4], 0.5) == (; lower=1, upper=2)
+        @test hdi([1.0, 2.0, 3.0, 100.0], 0.5) == (; lower=1.0, upper=2.0)
+
+        # mass outside (0, 1], a non-Real mass, an empty slice, and NaN all throw LOUDLY
+        for bad in (0.0, -0.5, 1.5, NaN, Inf)
+            @test_throws ArgumentError hdi([1.0, 2.0], bad)
+        end
+        @test_throws ArgumentError hdi([1.0, 2.0], "0.9")
+        @test_throws "empty slice" hdi(Float64[])
+        @test_throws "throws on NaN" hdi([1.0, NaN, 2.0])
+
+        # the tree method: per-slice (; lower, upper) record over the kept dims
+        A = reshape(collect(1.0:60.0), 20, 3)
+        X = TreeData(A, :draw, :param => (:a, :b, :c))
+        r = hdi(X; dims=:draw)
+        @test map(TreeArrays.name, TreeArrays.dims(r)) == (:param, :draw)
+        for j in 1:3
+            @test (parent(parent(r)[j]).lower, parent(parent(r)[j]).upper) == _brute_hdi(A[:, j], 0.9)
+        end
+        r50 = hdi(X; dims=:draw, mass=0.5)
+        @test (parent(parent(r50)[2]).lower, parent(parent(r50)[2]).upper) == _brute_hdi(A[:, 2], 0.5)
+
+        # ... through the pooled straddle too (unequal leaves; the sort!-mutating kernel
+        # exercises the shared-bag refill path with a third kernel shape)
+        R  = TreeData([TreeData(A[1:n, :], :draw, :param => (:a, :b, :c)) for n in (20, 12, 17)], :chain)
+        r2 = hdi(R; dims=(:draw, :chain))
+        for j in 1:3
+            bag = vcat([A[1:n, j] for n in (20, 12, 17)]...)
+            @test (parent(parent(r2)[j]).lower, parent(parent(r2)[j]).upper) == _brute_hdi(bag, 0.9)
+        end
+
+        # the record melts straight to lower/upper columns (the AoV ribbon path)
+        @test Set(Tables.columnnames(Tables.columns(TreeTable(r)))) == Set((:param, :lower, :upper))
     end
 
     # NaN-aware quantile lives in a package extension (todo b1am3w), not a
@@ -894,6 +998,98 @@ end
 
         absentfield = TreeData(:rec => (;a=TreeData(randn(3), :t), b=missing))
         @test_throws "absent-dim `missing` sentinel" Tables.schema(absentfield)
+    end
+
+    # Multi-response outputs (brm-4): two conditional responses on DIFFERENT grids, each
+    # reduced over :draw to a :band axis. The blessed pattern is one `TreeTable` per response
+    # (long AND wide both work per field); the whole-record / whole-ragged pivots refuse and
+    # point at it. A ragged tree whose siblings AGREE still pivots -- the pivot refuses
+    # raggedness, not the ragged container.
+    @testset "Tables.jl: multi-response melts, one table per response (brm-4)" begin
+        draws1 = reshape(collect(1.0:50.0), 10, 5)
+        draws2 = reshape(collect(1.0:80.0), 10, 8)
+        r1 = quantile(TreeData(draws1, :draw, :grid => 1:5),
+                      :band => (; lo=0.1, med=0.5, hi=0.9); dims=:draw)
+        r2 = quantile(TreeData(draws2, :draw, :grid => 1:8),
+                      :band => (; lo=0.1, med=0.5, hi=0.9); dims=:draw)
+
+        # per-response: long AND wide both work, values pinned against base-Julia
+        cl = Tables.columns(TreeTable(r1))
+        @test Tables.columnnames(cl) == (:grid, :band, :value)
+        @test length(Tables.getcolumn(cl, :value)) == 15
+        cw = Tables.columns(TreeTable(r1; wide=:band))
+        @test Tables.columnnames(cw) == (:grid, :lo, :med, :hi)
+        @test length(Tables.getcolumn(cw, :lo)) == 5
+        @test Tables.getcolumn(cw, :med) == [Statistics.quantile(draws1[:, g], 0.5) for g in 1:5]
+        cw2 = Tables.columns(TreeTable(r2; wide=:band))
+        @test length(Tables.getcolumn(cw2, :hi)) == 8
+
+        # the whole-record melt refuses -- and points at the per-field pattern
+        rec = TreeData(:resp => (; r1, r2))
+        @test_throws "Melt each field on its own" Tables.columns(TreeTable(rec))
+
+        # ragged over :response: the LONG melt works (rows are a SUM) ...
+        rg = TreeData([r1, r2], :response)
+        cr = Tables.columns(TreeTable(rg))
+        @test Tables.columnnames(cr) == (:response, :grid, :band, :value)
+        @test length(Tables.getcolumn(cr, :value)) == 39
+        # ... while the pivot refuses -- WITHOUT blaming the :band axis, whose levels
+        # agree here (the tree is ragged in :grid, elsewhere), and pointing at the pattern
+        @test_throws "Melt each sibling on its own" Tables.columns(TreeTable(rg; wide=:band))
+
+        # same-shape siblings: the pivot works THROUGH the ragged container
+        rg2 = TreeData([r1, r1], :response)
+        cw3 = Tables.columns(TreeTable(rg2; wide=:band))
+        @test Tables.columnnames(cw3) == (:response, :grid, :lo, :med, :hi)
+        @test length(Tables.getcolumn(cw3, :lo)) == 10
+    end
+
+    # A REDUCED record melts (todo 1m5087w, reporter Bruno:long-df-scrub): reductions adopt
+    # the sample field's dims onto the record container, so the container parrots the fields'
+    # live axes -- those duplicate the fields' own axes, contribute no columns, and are
+    # VERIFIED against the representative field (never ignored). This also fixed the nested
+    # record fanout, which descended one plan level too many and crashed (`type Nothing has
+    # no field child`) on any record-of-arrays-of-records -- nested records never melted.
+    @testset "Tables.jl: reduced records + nested records melt (1m5087w)" begin
+        subjects = (:s1, :s2, :s3, :s4)
+        a = reshape(collect(1.0:24.0), 6, 4)
+        b = reshape(collect(101.0:124.0), 6, 4)
+        tree = TreeData(:metric => (
+            a = TreeData(a, :draw, :subject => subjects),
+            b = TreeData(b, :draw, :subject => subjects),
+        ), TreeDim(:draw), TreeDim(:subject, subjects))
+
+        summary = nanquantile(tree, (median=0.5, lo=0.1); dims=:draw)
+        c = Tables.columns(TreeTable(summary))
+        @test Tables.columnnames(c) == (:subject, :a_median, :a_lo, :b_median, :b_lo)
+        @test Tables.getcolumn(c, :subject) == collect(subjects)
+        @test Tables.getcolumn(c, :a_median) == [Statistics.quantile(a[:, s], 0.5) for s in 1:4]
+        @test Tables.getcolumn(c, :a_lo) == [Statistics.quantile(a[:, s], 0.1) for s in 1:4]
+        @test Tables.getcolumn(c, :b_median) == [Statistics.quantile(b[:, s], 0.5) for s in 1:4]
+        @test Tuple(Tables.schema(TreeTable(summary)).names) == Tables.columnnames(c)
+
+        # the natural record (no explicit parent dims) melts identically
+        tree2 = TreeData(:metric => (
+            a = TreeData(a, :draw, :subject => subjects),
+            b = TreeData(b, :draw, :subject => subjects)))
+        c2 = Tables.columns(TreeTable(nanquantile(tree2, (median=0.5, lo=0.1); dims=:draw)))
+        @test Tables.columnnames(c2) == Tables.columnnames(c)
+        @test Tables.getcolumn(c2, :b_lo) == [Statistics.quantile(b[:, s], 0.1) for s in 1:4]
+
+        # the minimal nested shape (no reduction involved): record -> array-of-flat-records
+        inner = TreeData([TreeData(:q => (; m=Float64(i), l=Float64(-i))) for i in 1:3], :subject)
+        cn = Tables.columns(TreeTable(TreeData(:metric => (; a=inner, b=inner))))
+        @test Tables.columnnames(cn) == (:subject, :a_m, :a_l, :b_m, :b_l)
+        @test Tables.getcolumn(cn, :a_m) == [1.0, 2.0, 3.0]
+
+        # ... but verification, not silent acceptance: divergent container labels refuse ...
+        bad = TreeData(parent(summary), (; dims=(TreeDim(:subject, (:x1, :x2, :x3, :x4)),
+            TreeDim(:draw, nothing)), outer_dim=TreeArrays.outerdim(summary)))
+        @test_throws "different coordinates" Tables.columns(TreeTable(bad))
+        # ... as does a container axis with no counterpart in the fields (caught at schema)
+        bad2 = TreeData(parent(summary), (; dims=(TreeDim(:phantom, (1, 2, 3, 4)),
+            TreeDim(:draw, nothing)), outer_dim=TreeArrays.outerdim(summary)))
+        @test_throws "no counterpart axis" Tables.schema(TreeTable(bad2))
     end
 
     # `showable(MIME"text/html"(), x)` is the branch HTMX's builder loop takes before
@@ -1597,6 +1793,75 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test_throws "KEEPING part of this node's outer axis" mean(grid; dims=(:draw, :chain))
     end
 
+    # Pooled straddle over a NON-CONFORMABLE reduced inner axis (todo 1ynv0r4, reporter
+    # Bruno:long-df-scrub): `source -> (draw x subject)` with UNEQUAL subject counts, reducing
+    # (:source, :subject) and keeping the conformable :draw. v1 threw `DimensionMismatch` before
+    # recognizing the differing axis was itself being reduced; v2 pools it -- only the KEPT axes
+    # must match in length AND coordinates. Each pooled result is pinned against base-Julia over
+    # the hand-pooled bag (one bag per kept index), never against a second TreeArrays call.
+    @testset "pooled straddle over a non-conformable reduced inner axis (1ynv0r4)" begin
+        ndraw = 7
+        mats  = [reshape(collect(1.0:(ndraw*n)), ndraw, n) .+ 100*s for (s, n) in enumerate((5, 3, 8))]
+        X     = TreeData([TreeData(m, :draw, :subject) for m in mats], :source)
+        bags  = [vcat([m[d, :] for m in mats]...) for d in 1:ndraw]
+
+        r = mean(X; dims=(:source, :subject))
+        @test vec(collect(parent(r))) ≈ [mean(b) for b in bags]
+        @test map(TreeArrays.name, TreeArrays.dims(r)) == (:draw, :subject, :source)
+
+        rq = quantile(X, TreeDim(:ribbon, (0.5,)); dims=(:source, :subject))
+        @test [parent(parent(rq)[d])[1] for d in 1:ndraw] ≈ [quantile(b, 0.5) for b in bags]
+
+        # an ECDF-style TreeData-returning kernel: per-draw pooled bag -> values over an x grid
+        xs = (0.0, 250.0, 550.0, 900.0)
+        re = mapslices(X; dims=(:source, :subject)) do bag
+            TreeData([count(y -> y ≤ x, bag) / length(bag) for x in xs], TreeDim(:x, xs))
+        end
+        @test [collect(parent(parent(re)[d])) for d in 1:ndraw] ≈
+              [[count(y -> y ≤ x, b) / length(b) for x in xs] for b in bags]
+
+        # reducing EVERYTHING (incl. the kept-then-reduced :draw) -> one fully-pooled scalar leaf
+        @test parent(mean(X; dims=(:draw, :source, :subject))) ≈ mean(vcat(vec.(mats)...))
+
+        # unequal per-chain :draw counts -- a REDUCED axis the skill used to call unsupported --
+        # pool too (kept :param labels prove which positions the pools land on)
+        C  = TreeData([TreeData(reshape(collect(1.0:(n*2)), n, 2), :draw, :param => (:a, :b))
+                       for n in (10, 6, 8)], :chain)
+        rc = mean(C; dims=(:draw, :chain))
+        for j in 1:2
+            @test parent(rc)[j] ≈ mean(vcat([parent(parent(C)[k])[:, j] for k in 1:3]...))
+        end
+
+        # a KEPT axis that differs in LENGTH still refuses (the "not conformable" phrase the
+        # refusal testset above pins), naming the axis and the guilty leaves
+        @test_throws "KEPT inner axis `:time`" mean(
+            TreeData(map(s -> TreeData(reshape(collect(1.0:(3*(2+s))), 3, 2+s), :draw, :time), 1:3), :subject);
+            dims=(:draw, :subject))
+
+        # ...as does a kept axis of the same length with DIFFERENT coordinates ...
+        Y = TreeData([TreeData(randn(4, 3), :draw, :p => (:a, :b, :c)),
+                      TreeData(randn(4, 3), :draw, :p => (:a, :b, :X))], :chain)
+        @test_throws "KEPT inner axis `:p`" mean(Y; dims=(:draw, :chain))
+        # ... and an unlabelled-vs-labelled kept axis ...
+        Yu = TreeData([TreeData(randn(4, 3), :draw, :p => (:a, :b, :c)),
+                       TreeData(randn(4, 3), :draw, :p)], :chain)
+        @test_throws "KEPT inner axis `:p`" mean(Yu; dims=(:draw, :chain))
+        # ... while the SAME labels in different containers (Tuple beside Vector) pool
+        Y2 = TreeData([TreeData(randn(4, 3), :draw, :p => (:a, :b, :c)),
+                       TreeData(randn(4, 3), :draw, :p => [:a, :b, :c])], :chain)
+        @test mean(Y2; dims=(:draw, :chain)) isa TreeData
+
+        # divergent leaf dim structure (a leaf missing the named inner dim) refuses by name
+        Z = TreeData([TreeData(randn(4, 3), :draw, :subject),
+                      TreeData(randn(4), :draw)], :source)
+        @test_throws "same dim structure" mean(Z; dims=(:source, :subject))
+
+        # mixed provenance (a pre-reduced ghost where the prototype has a live axis) refuses
+        pre = mapslices(maximum, TreeData(randn(4, 3), :draw, :subject); dims=:subject)
+        Mx  = TreeData([TreeData(randn(4, 3), :draw, :subject), pre], :source)
+        @test_throws "same dim structure" mean(Mx; dims=(:source, :subject))
+    end
+
 
     # `dims=` is foundALL, not foundany (decision 1iy1r57, user-directed). A name that resolves
     # NOWHERE used to reduce nothing and yield the `missing` sentinel -- a typo'd dim produced a
@@ -1706,6 +1971,101 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         msg_eq = try TreeActualArray(rag_eq); nothing catch e e.msg end
         @test msg_eq !== nothing
         @test occursin("`:chain`", msg_eq) && occursin("even when rectangular", msg_eq)
+    end
+
+    # Explicit lazy ragged-to-rectangular alignment views (todo 1l53kom): the caller names
+    # the ragged inner axis AND the policy (`dims=` + `align=` are both required -- the bare
+    # `TreeActualArray(ragged)` call above still refuses). The outer sibling axis lands
+    # immediately AFTER the aligned axis, so `:chain -> (:draw x :param)` presents as
+    # `:draw x :chain x :param` -- the `(iterations, chains, parameters)` ess/rhat order.
+    @testset "TreeActualArray ragged alignment views (1l53kom)" begin
+        ess_like(x::AbstractArray{<:Union{Missing,Real}}) = size(x)
+        mats = [reshape(collect(1.0:(n*2)), n, 2) .+ 1000*k for (k, n) in enumerate((10, 6, 8))]
+        X = TreeData([TreeData(m, :draw, :param => (:a, :b)) for m in mats], :chain)
+
+        A = TreeActualArray(X; dims=:draw, align=:truncate_min)
+        @test A isa AbstractArray{Float64,3}
+        @test size(A) == (6, 3, 2)
+        @test ess_like(A) == (6, 3, 2)
+        @test map(TreeArrays.name, TreeArrays.dims(A)) == (:draw, :chain, :param)
+        @test parent(A) === X
+        for k in 1:3, j in 1:2, i in 1:6
+            @test A[i, k, j] == mats[k][i, j]       # head truncation reads positions 1:6
+        end
+        mats[2][1, 1] = -999.0                       # zero-copy: the view reads live leaves
+        @test A[1, 2, 1] == -999.0
+        mats[2][1, 1] = 2001.0
+
+        T = TreeActualArray(X; dims=:draw, align=:thin_min)
+        for k in 1:3
+            idx = round.(Int, range(1, size(mats[k], 1); length=6))
+            @test [T[i, k, 1] for i in 1:6] == mats[k][idx, 1]
+        end
+
+        E = TreeActualArray(TreeData([TreeData(m[1:6, :], :draw, :param => (:a, :b))
+                                      for m in mats], :chain); dims=:draw, align=:error_equal)
+        @test size(E) == (6, 3, 2)
+        @test_throws "[10, 6, 8]" TreeActualArray(X; dims=:draw, align=:error_equal)
+
+        # 1-D leaves: `:subject -> :draw` becomes `:draw x :subject`
+        S = TreeData([TreeData(collect(1.0:n), :draw) for n in (5, 3)], :subject)
+        As = TreeActualArray(S; dims=:draw, align=:truncate_min)
+        @test size(As) == (3, 2)
+        @test As[3, 2] == 3.0
+        @test map(TreeArrays.name, TreeArrays.dims(As)) == (:draw, :subject)
+
+        # coordinate policy: the READ positions' coordinates must agree; the view carries
+        # the prototype's. Heads that agree truncate with head labels ...
+        L = TreeData([TreeData(m, :draw => 1:size(m, 1), :param => (:a, :b)) for m in mats], :chain)
+        Al = TreeActualArray(L; dims=:draw, align=:truncate_min)
+        @test collect(TreeArrays.meta(TreeArrays.dims(Al)[1]).values) == collect(1:6)
+        # ... heads that disagree (a chain continued at iteration 101) refuse ...
+        B = TreeData([TreeData(mats[1], :draw => 1:10, :param => (:a, :b)),
+                      TreeData(mats[2], :draw => 101:106, :param => (:a, :b))], :chain)
+        @test_throws "different coordinates" TreeActualArray(B; dims=:draw, align=:truncate_min)
+        # ... and thinning a labelled unevenly-sized axis refuses (evenly-spread positions
+        # mean different iterations per leaf, so no shared labels exist) ...
+        @test_throws "different coordinates" TreeActualArray(L; dims=:draw, align=:thin_min)
+        # ... while equal-length labelled leaves thin with agreeing labels
+        Le = TreeData([TreeData(mats[1][1:6, :], :draw => 1:6, :param => (:a, :b)),
+                       TreeData(mats[2], :draw => 1:6, :param => (:a, :b))], :chain)
+        Ae = TreeActualArray(Le; dims=:draw, align=:thin_min)
+        @test collect(TreeArrays.meta(TreeArrays.dims(Ae)[1]).values) == collect(1:6)
+
+        # non-aligned axes: lengths must match, coordinates must agree (missing-safe --
+        # unlabelled axes agree vacuously, unlike a bare `==` which answers `missing`)
+        U = TreeData([TreeData(m, :draw, :param) for m in mats], :chain)
+        @test size(TreeActualArray(U; dims=:draw, align=:truncate_min)) == (6, 3, 2)
+        W = TreeData([TreeData(mats[1][1:6, :], :draw, :param => (:a, :b)),
+                      TreeData(mats[2], :draw, :param => (:a, :X))], :chain)
+        @test_throws "inconsistent coordinates" TreeActualArray(W; dims=:draw, align=:truncate_min)
+        W2 = TreeData([TreeData(randn(6, 2), :draw, :param),
+                       TreeData(randn(6, 3), :draw, :param)], :chain)
+        @test_throws "differs across leaves" TreeActualArray(W2; dims=:draw, align=:truncate_min)
+
+        # every other shape throws by name: unknown policy/axis, no siblings, mixed
+        # provenance, non-array leaves, mixed eltypes
+        @test_throws "unknown align" TreeActualArray(X; dims=:draw, align=:bogus)
+        @test_throws "no inner axis" TreeActualArray(X; dims=:nope, align=:truncate_min)
+        @test_throws "no siblings" TreeActualArray(TreeData(TreeData[], :chain);
+                                                   dims=:draw, align=:truncate_min)
+        pre = mapslices(maximum, TreeData(randn(4, 3), :draw, :subject); dims=:subject)
+        Mx = TreeData([TreeData(randn(4, 3), :draw, :subject), pre], :chain)
+        @test_throws "different dim structure" TreeActualArray(Mx; dims=:subject, align=:truncate_min)
+        N = TreeData([TreeData(randn(4), :draw), TreeData(1.0, TreeDim(:draw, nothing))], :chain)
+        @test_throws "array-backed" TreeActualArray(N; dims=:draw, align=:truncate_min)
+        M = TreeData([TreeData(randn(6, 2), :draw, :param),
+                      TreeData(rand(6, 2) .> 0.5, :draw, :param)], :chain)
+        @test_throws "same numeric eltype" TreeActualArray(M; dims=:draw, align=:truncate_min)
+
+        # dispatch integrity: a half-named call throws for the missing keyword (never a
+        # default policy), and a BARE ragged call keeps the ORIGINAL refusal -- the kw
+        # method is positionally more specific, so it must route bare calls back
+        @test_throws "`align=` naming the policy" TreeActualArray(X; dims=:draw)
+        @test_throws "`dims=` naming the ragged inner axis" TreeActualArray(X; align=:truncate_min)
+        msg_bare = try TreeActualArray(X); nothing catch e e.msg end
+        @test msg_bare !== nothing
+        @test occursin("`:chain`", msg_bare) && occursin("[10, 6, 8]", msg_bare)
     end
 
     @testset "coords=true — a kernel sees the axis it reduces (snag kernels-cannot-s)" begin
