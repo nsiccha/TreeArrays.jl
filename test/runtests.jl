@@ -1,5 +1,6 @@
 using Test
 using TreeArrays
+using FlexiChains
 using Tables
 using NaNStatistics
 using Statistics
@@ -2235,5 +2236,7 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test_throws Exception @eval @kernel (:time => :stat) coords=yes _bad3(L) = maximum(L)
         @test_throws Exception @eval @kernel (:time => :stat) _bad4(L, t, z) = maximum(L)
     end
+
+    include("test_flexichains.jl")
 
 end
