@@ -141,8 +141,51 @@ function _ownschema(::Type{T}, ::Type{P}, alldims) where {T<:TreeData,P<:Union{A
 end
 function _ownschema(::Type{T}, ::Type{P}, alldims) where {T<:TreeData,P<:NamedTuple}
     recname = name(fieldtype(fieldtype(T, :meta), :outer_dim))
-    fixed = _flatfixed(filter(d -> name(d) !== recname, alldims))
+    own = filter(d -> name(d) !== recname, alldims)
+    _verifycontaineraxes(own, P)   # parroted live axes name-match the rep field (values are instance-only)
+    fixed = _flatfixed(filter(d -> _dimkind(d) !== :axis, own))
     (Symbol[map(name, fixed)...], Type[map(_fixedtype, fixed)...])
+end
+
+# A record container may parrot its fields' live axes in its own dims: a reduction adopts the
+# sample field's dims onto the container (`_mapslices(::TreeNamedTuple)`), and a hand-built
+# record may declare its fields' axes explicitly (todo 1m5087w). Those duplicate the fields'
+# own axes, so they contribute NO columns -- but they are VERIFIED, never ignored: every live
+# container axis must name-match a live axis of the representative field here (values are
+# instance-only, so `Tables.schema` -- like the rowdims-mismatch shape -- succeeds and
+# `Tables.columns` is where a value divergence is caught), and `_verifycontaineraxis` checks
+# the values there. A container axis with no field counterpart, or with divergent labels,
+# throws BY NAME; ghosts and fixed dims keep today's behavior (`_flatfixed`).
+function _verifycontaineraxes(own, ::Type{P}) where P<:NamedTuple
+    any(d -> _dimkind(d) === :axis, own) || return nothing
+    fnames = _repfieldaxisnames(P)
+    for d in own
+        _dimkind(d) === :axis || continue
+        name(d) in fnames || error("TreeArrays Tables adapter: container axis `:$(name(d))` " *
+            "has no counterpart axis in this record's fields -- a record container's live axes must " *
+            "duplicate its fields' axes (as a reduction leaves them), not declare new ones")
+    end
+    nothing
+end
+function _repfieldaxisnames(::Type{P}) where P<:NamedTuple
+    fieldcount(P) == 0 && return ()
+    F = fieldtype(P, 1)
+    F <: TreeData || return ()
+    fall = Tuple(fieldtype(fieldtype(F, :meta), :dims).parameters)
+    Tuple(name(d) for d in fall if _dimkind(d) === :axis)
+end
+function _verifycontaineraxis(d::TreeDim, rep)
+    n = name(d)
+    rep isa TreeData || error("TreeArrays Tables adapter: container axis `:$n` has no counterpart " *
+        "axis in this record's fields -- the fields are not TreeData")
+    fd = findfirst(x -> name(x) === n && _dimkind(x) === :axis, TreeArrays.dims(rep))
+    isnothing(fd) && error("TreeArrays Tables adapter: container axis `:$n` has no counterpart " *
+        "axis in this record's fields -- a record container's live axes must duplicate its " *
+        "fields' axes (as a reduction leaves them), not declare new ones")
+    _poolcoordsagree(meta(TreeArrays.dims(rep)[fd]).values, meta(d).values) || error(
+        "TreeArrays Tables adapter: container axis `:$n` carries different coordinates than the " *
+        "record fields' `:$n` axis -- the container must duplicate its fields' labels, not diverge")
+    nothing
 end
 function _ownschema(::Type{T}, ::Type{P}, alldims) where {T<:TreeData,P}   # bookkeeping wrapper (P<:TreeData) or scalar leaf
     fixed = _flatfixed(alldims)
@@ -923,7 +966,12 @@ end
 function _buildnode(ctx::BuildCtx, X::TreeData, p::NamedTuple, offset, pn, walk::Bool, fieldpath::Tuple{Vararg{Symbol}}=())
     alldims = TreeArrays.dims(X)
     recname = name(outerdim(X))
-    fixed = _flatfixed(filter(d -> name(d) !== recname, alldims))
+    own = filter(d -> name(d) !== recname, alldims)
+    for d in own
+        _dimkind(d) === :axis || continue
+        _verifycontaineraxis(d, first(values(p)))   # values must agree with the rep field
+    end
+    fixed = _flatfixed(filter(d -> _dimkind(d) !== :axis, own))
     fixidx = _fixedidxs(alldims, k -> name(alldims[k]) !== recname)
     fixcols = _fixedcols(ctx, alldims, fixidx, offset, walk, fieldpath)
     wfp = (fieldpath..., first(keys(p)))
@@ -1017,9 +1065,13 @@ _buildterminalfanout(ctx::BuildCtx, fields::NamedTuple{()}, ttype, offset, field
 # nothing left to de-duplicate against once fields disagree in KIND.
 function _buildfanout(ctx::BuildCtx, p::NamedTuple{names}, offset, pn, walk::Bool, fieldpath) where names
     fname = first(names)
-    # `pn` is this record's node; each field's OWN node is `pn.child` (all
-    # fields are `_planequal`, so the representative's stands for every one).
-    subnames, subcols = _buildfield(ctx, p[fname], offset, pn.child, walk || !pn.shared, (fieldpath..., fname))
+    # `pn` is the FIELDS' shared node (all fields are `_planequal`, so the
+    # representative's stands for every one) -- NOT their parent record's node.
+    # Passing `pn.child` here descended one plan level too many for TreeData fields:
+    # a nested record melted with its CHILD's node and crashed a level down with
+    # `type Nothing has no field child` (todo 1m5087w -- nested records never melted
+    # at all). Scalar fields ignore the node entirely, so they are unaffected.
+    subnames, subcols = _buildfield(ctx, p[fname], offset, pn, walk || !pn.shared, (fieldpath..., fname))
     rest = NamedTuple{Base.tail(names)}(Base.tail(values(p)))
     restnames, restcols = _buildfanout(ctx, rest, offset, pn, walk, fieldpath)
     ((map(nm -> _prefixname(fname, nm), subnames)..., restnames...), (subcols..., restcols...))

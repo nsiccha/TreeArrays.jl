@@ -1043,6 +1043,54 @@ end
         @test length(Tables.getcolumn(cw3, :lo)) == 10
     end
 
+    # A REDUCED record melts (todo 1m5087w, reporter Bruno:long-df-scrub): reductions adopt
+    # the sample field's dims onto the record container, so the container parrots the fields'
+    # live axes -- those duplicate the fields' own axes, contribute no columns, and are
+    # VERIFIED against the representative field (never ignored). This also fixed the nested
+    # record fanout, which descended one plan level too many and crashed (`type Nothing has
+    # no field child`) on any record-of-arrays-of-records -- nested records never melted.
+    @testset "Tables.jl: reduced records + nested records melt (1m5087w)" begin
+        subjects = (:s1, :s2, :s3, :s4)
+        a = reshape(collect(1.0:24.0), 6, 4)
+        b = reshape(collect(101.0:124.0), 6, 4)
+        tree = TreeData(:metric => (
+            a = TreeData(a, :draw, :subject => subjects),
+            b = TreeData(b, :draw, :subject => subjects),
+        ), TreeDim(:draw), TreeDim(:subject, subjects))
+
+        summary = nanquantile(tree, (median=0.5, lo=0.1); dims=:draw)
+        c = Tables.columns(TreeTable(summary))
+        @test Tables.columnnames(c) == (:subject, :a_median, :a_lo, :b_median, :b_lo)
+        @test Tables.getcolumn(c, :subject) == collect(subjects)
+        @test Tables.getcolumn(c, :a_median) == [Statistics.quantile(a[:, s], 0.5) for s in 1:4]
+        @test Tables.getcolumn(c, :a_lo) == [Statistics.quantile(a[:, s], 0.1) for s in 1:4]
+        @test Tables.getcolumn(c, :b_median) == [Statistics.quantile(b[:, s], 0.5) for s in 1:4]
+        @test Tuple(Tables.schema(TreeTable(summary)).names) == Tables.columnnames(c)
+
+        # the natural record (no explicit parent dims) melts identically
+        tree2 = TreeData(:metric => (
+            a = TreeData(a, :draw, :subject => subjects),
+            b = TreeData(b, :draw, :subject => subjects)))
+        c2 = Tables.columns(TreeTable(nanquantile(tree2, (median=0.5, lo=0.1); dims=:draw)))
+        @test Tables.columnnames(c2) == Tables.columnnames(c)
+        @test Tables.getcolumn(c2, :b_lo) == [Statistics.quantile(b[:, s], 0.1) for s in 1:4]
+
+        # the minimal nested shape (no reduction involved): record -> array-of-flat-records
+        inner = TreeData([TreeData(:q => (; m=Float64(i), l=Float64(-i))) for i in 1:3], :subject)
+        cn = Tables.columns(TreeTable(TreeData(:metric => (; a=inner, b=inner))))
+        @test Tables.columnnames(cn) == (:subject, :a_m, :a_l, :b_m, :b_l)
+        @test Tables.getcolumn(cn, :a_m) == [1.0, 2.0, 3.0]
+
+        # ... but verification, not silent acceptance: divergent container labels refuse ...
+        bad = TreeData(parent(summary), (; dims=(TreeDim(:subject, (:x1, :x2, :x3, :x4)),
+            TreeDim(:draw, nothing)), outer_dim=TreeArrays.outerdim(summary)))
+        @test_throws "different coordinates" Tables.columns(TreeTable(bad))
+        # ... as does a container axis with no counterpart in the fields (caught at schema)
+        bad2 = TreeData(parent(summary), (; dims=(TreeDim(:phantom, (1, 2, 3, 4)),
+            TreeDim(:draw, nothing)), outer_dim=TreeArrays.outerdim(summary)))
+        @test_throws "no counterpart axis" Tables.schema(TreeTable(bad2))
+    end
+
     # `showable(MIME"text/html"(), x)` is the branch HTMX's builder loop takes before
     # falling back to `print(io, child)`, so these methods are the whole of "automatic
     # rich display". Every preview is bounded -- a display method must never densify.
