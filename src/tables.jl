@@ -690,7 +690,7 @@ function _plan_node(p::NamedTuple)
     kids = map(_fieldplan, values(p))
     rep = first(kids)
     all(map(k -> _planequal(k.plan, rep.plan), kids)) ||
-        error("TreeArrays Tables adapter: record fields $(keys(p)) have inconsistent shape -- a record's fields lay out side by side over ONE shared row space, so fields of differing shape are not representable (regular/rectangular only)")
+        error("TreeArrays Tables adapter: record fields $(keys(p)) have inconsistent shape -- a record's fields lay out side by side over ONE shared row space, so fields of differing shape are not representable (regular/rectangular only). Melt each field on its own (one `TreeTable` per field -- e.g. one table per response).")
     shared = all(map(k -> k.shared, kids)) && _sigsagree(values(p), _fieldsig)
     PlanNode(rep.plan, shared, rep)   # wide emit: the record contributes NO row-dim of its own (decision 1kpyu7n) -- fields
                                        # become columns, not extra rows; their (validated-identical) deeper shape is the row-dim.

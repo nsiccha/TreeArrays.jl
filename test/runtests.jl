@@ -999,6 +999,50 @@ end
         @test_throws "absent-dim `missing` sentinel" Tables.schema(absentfield)
     end
 
+    # Multi-response outputs (brm-4): two conditional responses on DIFFERENT grids, each
+    # reduced over :draw to a :band axis. The blessed pattern is one `TreeTable` per response
+    # (long AND wide both work per field); the whole-record / whole-ragged pivots refuse and
+    # point at it. A ragged tree whose siblings AGREE still pivots -- the pivot refuses
+    # raggedness, not the ragged container.
+    @testset "Tables.jl: multi-response melts, one table per response (brm-4)" begin
+        draws1 = reshape(collect(1.0:50.0), 10, 5)
+        draws2 = reshape(collect(1.0:80.0), 10, 8)
+        r1 = quantile(TreeData(draws1, :draw, :grid => 1:5),
+                      :band => (; lo=0.1, med=0.5, hi=0.9); dims=:draw)
+        r2 = quantile(TreeData(draws2, :draw, :grid => 1:8),
+                      :band => (; lo=0.1, med=0.5, hi=0.9); dims=:draw)
+
+        # per-response: long AND wide both work, values pinned against base-Julia
+        cl = Tables.columns(TreeTable(r1))
+        @test Tables.columnnames(cl) == (:grid, :band, :value)
+        @test length(Tables.getcolumn(cl, :value)) == 15
+        cw = Tables.columns(TreeTable(r1; wide=:band))
+        @test Tables.columnnames(cw) == (:grid, :lo, :med, :hi)
+        @test length(Tables.getcolumn(cw, :lo)) == 5
+        @test Tables.getcolumn(cw, :med) == [Statistics.quantile(draws1[:, g], 0.5) for g in 1:5]
+        cw2 = Tables.columns(TreeTable(r2; wide=:band))
+        @test length(Tables.getcolumn(cw2, :hi)) == 8
+
+        # the whole-record melt refuses -- and points at the per-field pattern
+        rec = TreeData(:resp => (; r1, r2))
+        @test_throws "Melt each field on its own" Tables.columns(TreeTable(rec))
+
+        # ragged over :response: the LONG melt works (rows are a SUM) ...
+        rg = TreeData([r1, r2], :response)
+        cr = Tables.columns(TreeTable(rg))
+        @test Tables.columnnames(cr) == (:response, :grid, :band, :value)
+        @test length(Tables.getcolumn(cr, :value)) == 39
+        # ... while the pivot refuses -- WITHOUT blaming the :band axis, whose levels
+        # agree here (the tree is ragged in :grid, elsewhere), and pointing at the pattern
+        @test_throws "Melt each sibling on its own" Tables.columns(TreeTable(rg; wide=:band))
+
+        # same-shape siblings: the pivot works THROUGH the ragged container
+        rg2 = TreeData([r1, r1], :response)
+        cw3 = Tables.columns(TreeTable(rg2; wide=:band))
+        @test Tables.columnnames(cw3) == (:response, :grid, :lo, :med, :hi)
+        @test length(Tables.getcolumn(cw3, :lo)) == 10
+    end
+
     # `showable(MIME"text/html"(), x)` is the branch HTMX's builder loop takes before
     # falling back to `print(io, child)`, so these methods are the whole of "automatic
     # rich display". Every preview is bounded -- a display method must never densify.
