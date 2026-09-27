@@ -117,6 +117,19 @@ nanquantile(Xn, TreeDim(:band, (0.25, 0.5, 0.75)); dims = :draw)
 
 An all-`NaN` slice yields `NaN` at every level rather than throwing.
 
+## `hdi` — highest-density intervals
+
+`hdi(X; dims, mass = 0.9)` is the brms/bambi-style summary: the *shortest* interval
+holding at least `mass` of each slice's draws. Endpoints are always draws (no
+interpolation), and each slice packs into a `(; lower, upper)` record — the same
+wide-baking shape as the record `quantile` form, so it melts straight to ribbon
+columns. Call once per mass; `mass` must lie in `(0, 1]`, and (matching `quantile!`)
+`NaN` throws — drop NaNs first.
+
+```@example red
+hdi(TreeData(randn(2000, 2), :draw, :param => (:a, :b)); dims = :draw)
+```
+
 ## `coords = true` — let the kernel see the axis
 
 By default a kernel sees the **data slice only**. Positional tricks (`y[1]`,
