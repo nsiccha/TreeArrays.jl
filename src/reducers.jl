@@ -151,3 +151,65 @@ function Statistics.quantile(X::TreeData, (nm, spec)::Pair{Symbol, <:NamedTuple}
         TreeData(quantile!(scratch, probs), pdim)
     end
 end
+
+# Highest-density intervals (the brms/bambi-style summary): the SHORTEST interval holding at
+# least `mass` of the draws. Computed on a sorted copy -- never mutating the caller's slice --
+# by scanning the fixed-count windows, so ties resolve deterministically to the FIRST (lowest)
+# interval. An HDI is a data interval, not an interpolation: its endpoints are always draws.
+_checkhdimass(mass::Real) =
+    0 < mass <= 1 || throw(ArgumentError("hdi mass must lie in (0, 1] (got $mass)."))
+_checkhdimass(mass) =
+    throw(ArgumentError("hdi mass must be a Real in (0, 1] (got $mass)."))
+
+function _hdi_sorted!(s::AbstractVector, mass::Real)
+    n = length(s)
+    n == 0 && throw(ArgumentError(
+        "hdi of an empty slice is undefined (mass = $mass)."))
+    any(isnan, s) && throw(ArgumentError(
+        "hdi throws on NaN, matching quantile!: drop NaNs first (`filter(!isnan, y)`)."))
+    k = ceil(Int, mass * n)                       # draws the interval must cover (1 <= k <= n)
+    best, bestw = 1, s[k] - s[1]
+    for i in 2:n-k+1
+        w = s[i+k-1] - s[i]
+        w < bestw && (best = i; bestw = w)        # strict `<`: ties keep the FIRST window
+    end
+    (; lower=s[best], upper=s[best+k-1])
+end
+
+"""
+    hdi(y::AbstractVector, mass = 0.9)
+    hdi(X::TreeData; dims, mass = 0.9)
+
+The highest-density interval: the **shortest** interval holding at least `mass`
+of the draws. Endpoints are always draws (no interpolation); tied widths resolve
+to the first (lowest) interval.
+
+```julia
+hdi(randn(4000), 0.9)              # (; lower, upper)
+hdi(post.beta; dims = :draw)       # per-parameter `(; lower, upper)` record
+hdi(post.beta; dims = :draw, mass = 0.5)
+```
+
+The tree method reduces `dims` through [`mapslices`](@ref) (one shared sort
+scratch, ragged trees included) and packs each slice's interval into a
+[`TreeNamedTuple`](@ref) record with `lower`/`upper` fields — the same
+wide-baking shape as `quantile(X, p::NamedTuple; dims)`, so it melts straight to
+`lower`/`upper` columns for an AoV `lineribbon(bands = [:lower => :upper])`.
+For several masses, call once per mass.
+
+`mass` must lie in `(0, 1]`; an empty slice, and (matching [`quantile`](@ref)) a
+slice containing `NaN`, throws. Drop NaNs first (`filter(!isnan, y)`) or reduce
+a NaN-free tree.
+"""
+hdi(y::AbstractVector, mass=0.9) = (_checkhdimass(mass); _hdi_sorted!(sort(y), mass))
+function hdi(X::TreeData; dims, mass=0.9)
+    _checkhdimass(mass)
+    scratch = _eltype(X)[]
+    mapslices(X; dims) do slice
+        length(scratch) == length(slice) || resize!(scratch, length(slice))
+        copyto!(scratch, slice)
+        sort!(scratch)
+        (; lower, upper) = _hdi_sorted!(scratch, mass)
+        TreeData(:hdi => (; lower, upper))
+    end
+end

@@ -422,6 +422,67 @@ end
         @test Set(Tables.getcolumn(cols, :band)) == Set(keys(spec))
     end
 
+    # Highest-density intervals (brm-3): the SHORTEST interval holding at least `mass` of the
+    # draws, endpoints always draws. Pinned against an independent O(n^2) all-pairs reference
+    # (not a second call into the same window scan), on deterministic vectors.
+    @testset "hdi — highest-density intervals over named dims (brm-3)" begin
+        _brute_hdi(y, mass) = begin
+            s, n = sort(collect(y)), length(y)
+            best, bestw = (s[1], s[n]), s[n] - s[1]
+            for i in 1:n, j in i:n
+                (j - i + 1) / n >= mass || continue
+                w = s[j] - s[i]
+                w < bestw && ((best, bestw) = ((s[i], s[j]), w))
+            end
+            best
+        end
+
+        vecs = [[1.0, 1.1, 0.9, 1.05, 5.0, 5.2, 4.9, 5.1, 5.05, 1.0],
+                collect(1.0:20.0),
+                [0.5, -3.0, 2.2, 2.2, 2.2, -3.0, 10.0, 0.5, 0.5, 0.5, 0.5],
+                [7.0], [2.0, 2.0, 2.0, 2.0]]
+        for y in vecs, mass in (0.5, 0.9, 1.0)
+            got, exp = hdi(y, mass), _brute_hdi(y, mass)
+            @test (got.lower, got.upper) == exp
+        end
+        @test hdi(vecs[1]) == hdi(vecs[1], 0.9)   # default mass is 0.9
+
+        # endpoints are draws, never interpolations; ties resolve to the first window
+        @test hdi([1, 2, 3, 4], 0.5) == (; lower=1, upper=2)
+        @test hdi([1.0, 2.0, 3.0, 100.0], 0.5) == (; lower=1.0, upper=2.0)
+
+        # mass outside (0, 1], a non-Real mass, an empty slice, and NaN all throw LOUDLY
+        for bad in (0.0, -0.5, 1.5, NaN, Inf)
+            @test_throws ArgumentError hdi([1.0, 2.0], bad)
+        end
+        @test_throws ArgumentError hdi([1.0, 2.0], "0.9")
+        @test_throws "empty slice" hdi(Float64[])
+        @test_throws "throws on NaN" hdi([1.0, NaN, 2.0])
+
+        # the tree method: per-slice (; lower, upper) record over the kept dims
+        A = reshape(collect(1.0:60.0), 20, 3)
+        X = TreeData(A, :draw, :param => (:a, :b, :c))
+        r = hdi(X; dims=:draw)
+        @test map(TreeArrays.name, TreeArrays.dims(r)) == (:param, :draw)
+        for j in 1:3
+            @test (parent(parent(r)[j]).lower, parent(parent(r)[j]).upper) == _brute_hdi(A[:, j], 0.9)
+        end
+        r50 = hdi(X; dims=:draw, mass=0.5)
+        @test (parent(parent(r50)[2]).lower, parent(parent(r50)[2]).upper) == _brute_hdi(A[:, 2], 0.5)
+
+        # ... through the pooled straddle too (unequal leaves; the sort!-mutating kernel
+        # exercises the shared-bag refill path with a third kernel shape)
+        R  = TreeData([TreeData(A[1:n, :], :draw, :param => (:a, :b, :c)) for n in (20, 12, 17)], :chain)
+        r2 = hdi(R; dims=(:draw, :chain))
+        for j in 1:3
+            bag = vcat([A[1:n, j] for n in (20, 12, 17)]...)
+            @test (parent(parent(r2)[j]).lower, parent(parent(r2)[j]).upper) == _brute_hdi(bag, 0.9)
+        end
+
+        # the record melts straight to lower/upper columns (the AoV ribbon path)
+        @test Set(Tables.columnnames(Tables.columns(TreeTable(r)))) == Set((:param, :lower, :upper))
+    end
+
     # NaN-aware quantile lives in a package extension (todo b1am3w), not a
     # `skipnan` kwarg on Statistics.quantile (user override of 1qbk7u4) --
     # Statistics.quantile itself is untouched and keeps throwing on NaN.
