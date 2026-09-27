@@ -281,6 +281,49 @@ end
         @test TreeArrays.meta(Xnt) isa NamedTuple
     end
 
+    # ... and on a TreeRaggedArray OF records (todo 1h7ye2g): `X.beta` maps `.beta` over the
+    # leaves (eager outer vector of pointers, zero-copy children) under the container's own
+    # outer dims. foundALL: a non-record leaf, or a record missing the field, throws and names
+    # the leaf -- fields are never silently skipped.
+    @testset "getproperty on a ragged container of records maps over leaves (1h7ye2g)" begin
+        getbeta(X) = X.beta
+        mkrec(n) = TreeData(:param => (; beta=TreeData(randn(n), :draw),
+                                        sigma=TreeData(randn(n), :draw)))
+        X = TreeData([mkrec(n) for n in (5, 3, 8)], :subject)
+
+        B = X.beta
+        @test B isa TreeArrays.TreeRaggedArray
+        @test length(parent(B)) == 3
+        @test parent(B)[2] === parent(X)[2].beta      # zero-copy: the leaf's own child
+        @test map(TreeArrays.name, TreeArrays.dims(B)) == (:subject,)
+        @test propertynames(X) == (:beta, :sigma)     # the prototype leaf's fields
+        @test (@inferred getbeta(X)) isa TreeArrays.TreeRaggedArray
+
+        # a ghost dim stays on the container, never on the children
+        G = TreeData(X, TreeDim(:extra, nothing))
+        @test map(TreeArrays.name, TreeArrays.dims(G.beta)) == (:subject, :extra)
+
+        # a doubly-nested ragged container recurses leaf by leaf
+        N = TreeData([X, X], :group)
+        @test parent(N.beta)[1] isa TreeArrays.TreeRaggedArray
+        @test parent(parent(N.beta)[1])[2] === parent(parent(N)[1])[2].beta
+
+        # heterogeneous fields: leaf 2 lacks `beta` -> throws naming leaf + field
+        H = TreeData([mkrec(4), TreeData(:param => (; sigma=TreeData(randn(4), :draw)))], :subject)
+        @test_throws "leaf 2" H.beta
+        # a dense leaf among records refuses with its own words ...
+        D = TreeData([mkrec(4), TreeData(randn(4), :draw)], :subject)
+        @test_throws "TreeArray" D.beta
+        # ... as does an empty container (no leaf to read from)
+        E = TreeData(TreeData[], :subject)
+        @test_throws "empty TreeRaggedArray" E.beta
+
+        # propertynames is total: `()` where no fields are accessible, proto keys otherwise
+        @test propertynames(E) == ()
+        @test propertynames(TreeData([TreeData(randn(4), :draw)], :subject)) == ()
+        @test propertynames(D) == (:beta, :sigma)
+    end
+
     # The unified quantile no longer coerces p at all -- Base's quantile!(scratch, p)
     # preserves p's container as-is (scalar -> scalar leaf, Vector -> Vector leaf, Tuple ->
     # Tuple leaf), matching decision xxmv6c (option 2). _leafreduce gather-reduces
