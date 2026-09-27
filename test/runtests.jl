@@ -1924,6 +1924,101 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test occursin("`:chain`", msg_eq) && occursin("even when rectangular", msg_eq)
     end
 
+    # Explicit lazy ragged-to-rectangular alignment views (todo 1l53kom): the caller names
+    # the ragged inner axis AND the policy (`dims=` + `align=` are both required -- the bare
+    # `TreeActualArray(ragged)` call above still refuses). The outer sibling axis lands
+    # immediately AFTER the aligned axis, so `:chain -> (:draw x :param)` presents as
+    # `:draw x :chain x :param` -- the `(iterations, chains, parameters)` ess/rhat order.
+    @testset "TreeActualArray ragged alignment views (1l53kom)" begin
+        ess_like(x::AbstractArray{<:Union{Missing,Real}}) = size(x)
+        mats = [reshape(collect(1.0:(n*2)), n, 2) .+ 1000*k for (k, n) in enumerate((10, 6, 8))]
+        X = TreeData([TreeData(m, :draw, :param => (:a, :b)) for m in mats], :chain)
+
+        A = TreeActualArray(X; dims=:draw, align=:truncate_min)
+        @test A isa AbstractArray{Float64,3}
+        @test size(A) == (6, 3, 2)
+        @test ess_like(A) == (6, 3, 2)
+        @test map(TreeArrays.name, TreeArrays.dims(A)) == (:draw, :chain, :param)
+        @test parent(A) === X
+        for k in 1:3, j in 1:2, i in 1:6
+            @test A[i, k, j] == mats[k][i, j]       # head truncation reads positions 1:6
+        end
+        mats[2][1, 1] = -999.0                       # zero-copy: the view reads live leaves
+        @test A[1, 2, 1] == -999.0
+        mats[2][1, 1] = 2001.0
+
+        T = TreeActualArray(X; dims=:draw, align=:thin_min)
+        for k in 1:3
+            idx = round.(Int, range(1, size(mats[k], 1); length=6))
+            @test [T[i, k, 1] for i in 1:6] == mats[k][idx, 1]
+        end
+
+        E = TreeActualArray(TreeData([TreeData(m[1:6, :], :draw, :param => (:a, :b))
+                                      for m in mats], :chain); dims=:draw, align=:error_equal)
+        @test size(E) == (6, 3, 2)
+        @test_throws "[10, 6, 8]" TreeActualArray(X; dims=:draw, align=:error_equal)
+
+        # 1-D leaves: `:subject -> :draw` becomes `:draw x :subject`
+        S = TreeData([TreeData(collect(1.0:n), :draw) for n in (5, 3)], :subject)
+        As = TreeActualArray(S; dims=:draw, align=:truncate_min)
+        @test size(As) == (3, 2)
+        @test As[3, 2] == 3.0
+        @test map(TreeArrays.name, TreeArrays.dims(As)) == (:draw, :subject)
+
+        # coordinate policy: the READ positions' coordinates must agree; the view carries
+        # the prototype's. Heads that agree truncate with head labels ...
+        L = TreeData([TreeData(m, :draw => 1:size(m, 1), :param => (:a, :b)) for m in mats], :chain)
+        Al = TreeActualArray(L; dims=:draw, align=:truncate_min)
+        @test collect(TreeArrays.meta(TreeArrays.dims(Al)[1]).values) == collect(1:6)
+        # ... heads that disagree (a chain continued at iteration 101) refuse ...
+        B = TreeData([TreeData(mats[1], :draw => 1:10, :param => (:a, :b)),
+                      TreeData(mats[2], :draw => 101:106, :param => (:a, :b))], :chain)
+        @test_throws "different coordinates" TreeActualArray(B; dims=:draw, align=:truncate_min)
+        # ... and thinning a labelled unevenly-sized axis refuses (evenly-spread positions
+        # mean different iterations per leaf, so no shared labels exist) ...
+        @test_throws "different coordinates" TreeActualArray(L; dims=:draw, align=:thin_min)
+        # ... while equal-length labelled leaves thin with agreeing labels
+        Le = TreeData([TreeData(mats[1][1:6, :], :draw => 1:6, :param => (:a, :b)),
+                       TreeData(mats[2], :draw => 1:6, :param => (:a, :b))], :chain)
+        Ae = TreeActualArray(Le; dims=:draw, align=:thin_min)
+        @test collect(TreeArrays.meta(TreeArrays.dims(Ae)[1]).values) == collect(1:6)
+
+        # non-aligned axes: lengths must match, coordinates must agree (missing-safe --
+        # unlabelled axes agree vacuously, unlike a bare `==` which answers `missing`)
+        U = TreeData([TreeData(m, :draw, :param) for m in mats], :chain)
+        @test size(TreeActualArray(U; dims=:draw, align=:truncate_min)) == (6, 3, 2)
+        W = TreeData([TreeData(mats[1][1:6, :], :draw, :param => (:a, :b)),
+                      TreeData(mats[2], :draw, :param => (:a, :X))], :chain)
+        @test_throws "inconsistent coordinates" TreeActualArray(W; dims=:draw, align=:truncate_min)
+        W2 = TreeData([TreeData(randn(6, 2), :draw, :param),
+                       TreeData(randn(6, 3), :draw, :param)], :chain)
+        @test_throws "differs across leaves" TreeActualArray(W2; dims=:draw, align=:truncate_min)
+
+        # every other shape throws by name: unknown policy/axis, no siblings, mixed
+        # provenance, non-array leaves, mixed eltypes
+        @test_throws "unknown align" TreeActualArray(X; dims=:draw, align=:bogus)
+        @test_throws "no inner axis" TreeActualArray(X; dims=:nope, align=:truncate_min)
+        @test_throws "no siblings" TreeActualArray(TreeData(TreeData[], :chain);
+                                                   dims=:draw, align=:truncate_min)
+        pre = mapslices(maximum, TreeData(randn(4, 3), :draw, :subject); dims=:subject)
+        Mx = TreeData([TreeData(randn(4, 3), :draw, :subject), pre], :chain)
+        @test_throws "different dim structure" TreeActualArray(Mx; dims=:subject, align=:truncate_min)
+        N = TreeData([TreeData(randn(4), :draw), TreeData(1.0, TreeDim(:draw, nothing))], :chain)
+        @test_throws "array-backed" TreeActualArray(N; dims=:draw, align=:truncate_min)
+        M = TreeData([TreeData(randn(6, 2), :draw, :param),
+                      TreeData(rand(6, 2) .> 0.5, :draw, :param)], :chain)
+        @test_throws "same numeric eltype" TreeActualArray(M; dims=:draw, align=:truncate_min)
+
+        # dispatch integrity: a half-named call throws for the missing keyword (never a
+        # default policy), and a BARE ragged call keeps the ORIGINAL refusal -- the kw
+        # method is positionally more specific, so it must route bare calls back
+        @test_throws "`align=` naming the policy" TreeActualArray(X; dims=:draw)
+        @test_throws "`dims=` naming the ragged inner axis" TreeActualArray(X; align=:truncate_min)
+        msg_bare = try TreeActualArray(X); nothing catch e e.msg end
+        @test msg_bare !== nothing
+        @test occursin("`:chain`", msg_bare) && occursin("[10, 6, 8]", msg_bare)
+    end
+
     @testset "coords=true — a kernel sees the axis it reduces (snag kernels-cannot-s)" begin
         # AUC and tmax: the two standard non-compartmental PK summaries. Both need `t`, and the
         # positional workarounds (`v[1]`, `v .- v[1]`) provably cannot express either.
