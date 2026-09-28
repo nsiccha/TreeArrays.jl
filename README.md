@@ -22,8 +22,13 @@ using Pkg
 Pkg.add(url = "https://github.com/nsiccha/TreeArrays.jl")
 ```
 
-Hard dependencies: `Statistics` and `Tables`. `NaNStatistics` is a weak
+Hard dependencies: `Statistics`, `Tables`, and the `Serialization` standard
+library. `NaNStatistics` is a weak
 dependency enabling NaN-safe quantiles.
+
+Loading `DynamicObjects` enables direct `@mmap` caching and cold-process reopen
+of named results, including ragged trees. See [streaming statistics and
+disk caches](https://nsiccha.github.io/TreeArrays.jl/dev/streaming).
 
 ## The idea in one example
 

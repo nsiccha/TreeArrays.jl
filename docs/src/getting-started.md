@@ -13,9 +13,13 @@ using Pkg
 Pkg.add(url = "https://github.com/nsiccha/TreeArrays.jl")
 ```
 
-Its only hard dependencies are `Statistics` and `Tables`. `NaNStatistics` is a
+Its hard dependencies are `Statistics`, `Tables`, and the `Serialization`
+standard library. `NaNStatistics` is a
 weak dependency that lights up [`nanquantile`](@ref nan-safe-quantiles) when you
 load it.
+
+`DynamicObjects` is optional: loading it enables [direct mmap caching of
+named results](streaming.md), including ragged trees and streamed statistics.
 
 ## The mental model
 
