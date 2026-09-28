@@ -16,6 +16,7 @@ makedocs(;
         "Home"                => "index.md",
         "Getting started"     => "getting-started.md",
         "Reductions"          => "reductions.md",
+        "Streaming & caches"  => "streaming.md",
         "Ragged data"         => "ragged.md",
         "Tables & plotting"   => "tables.md",
         "Comparisons"         => "comparisons.md",
