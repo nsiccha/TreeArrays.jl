@@ -1615,6 +1615,77 @@ end
         @test_throws "not a concrete TreeData type" TreeArrays._eltype(D)
     end
 
+    # ============ empty-FIRST siblings (snag ragged-reduced-e-8494abd7) ============
+    # Case 7 above pins an empty sibling LAST. The column BUILD used to descend
+    # through `first(p)` at every boundary, so an empty sibling FIRST threw a
+    # bare `BoundsError` -- the plan already routed it to zero rows, but the
+    # build walked into it. The representative is now the first sibling owning
+    # ≥1 row (plan and build agree on it), and the per-row walk below a
+    # root-level record reaches the field's dims, not the record's.
+    @testset "empty-first siblings melt" begin
+        mkcell(n) = TreeData([TreeData(randn(100, 3), :draw, :time => 1:3) for _ in 1:n],
+                             :assay_name => ["a$i" for i in 1:n])
+
+        # --- 1. unreduced, empty first: same rows as the populated-first twin.
+        c0, c3 = mkcell(0), mkcell(3)
+        Fpop = TreeData([c3, c0], :subject => ["sF", "sE"])
+        Femp = TreeData([c0, c3], :subject => ["sE", "sF"])
+        bycell(r) = (r.subject, r.assay_name, r.draw, r.time, r.value)
+        @test Tables.schema(Femp).names == Tables.schema(Fpop).names
+        rt_emp = Tables.rowtable(Femp)
+        @test length(rt_emp) == 3 * 100 * 3
+        @test all(==("sF"), r.subject for r in rt_emp)   # the empty sibling emits no rows
+        @test sort(rt_emp; by=bycell) == sort(Tables.rowtable(Fpop); by=bycell)
+
+        # --- 2. the snag's shape: reduced ribbon (NamedTuple bands) over
+        # zero-time assays, the empty subject in every position.
+        band7 = (; median=0.5, q025=0.025, q10=0.1, q25=0.25, q75=0.75, q90=0.9, q975=0.975)
+        mkassay(ntime) = TreeData(randn(50, ntime), :draw, :time => collect(1:ntime))
+        mksubject(ntime) = TreeData([mkassay(ntime) for _ in 1:3], :assay => ["a1", "a2", "a3"])
+        S0, S4, S3 = mksubject(0), mksubject(4), mksubject(3)
+        melts = [nanquantile(TreeData(perm, :subject => labs), band7; dims=:draw)
+                 for (perm, labs) in (([S0, S4, S3], ["sE", "s1", "s2"]),
+                                      ([S4, S0, S3], ["s1", "sE", "s2"]),
+                                      ([S4, S3, S0], ["s1", "s2", "sE"]))]
+        byribbon(r) = (r.subject, r.assay, r.time, r.median, r.q025, r.q10, r.q25, r.q75, r.q90, r.q975)
+        @test all(m -> isconcretetype(typeof(m)), melts)
+        @test all(m -> Tables.schema(m).names == Tables.schema(melts[1]).names, melts)
+        rts = Tables.rowtable.(melts)
+        @test all(rt -> length(rt) == 3 * (4 + 3), rts)
+        @test sort(rts[1]; by=byribbon) == sort(rts[2]; by=byribbon) == sort(rts[3]; by=byribbon)
+        @test all(!=("sE"), r.subject for r in rts[1])
+        # one cell against scalar references.
+        ref = [nanquantile(vec(parent(parent(S4)[1])[:, 1]), b) for b in values(band7)]
+        got = first(filter(r -> r.subject == "s1" && r.assay == "a1" && r.time == 1, rts[1]))
+        @test all([getproperty(got, k) ≈ ref[i] for (i, k) in enumerate(keys(band7))])
+
+        # --- 3. empty-first nested INSIDE a record field: the shared wide build
+        # descends per field, so it needs the same representative rule.
+        leaf = TreeData(randn(2), :t => 1:2)
+        E = TreeData(typeof(leaf)[], :mid => String[])
+        F = TreeData([leaf, leaf], :mid => ["m1", "m2"])
+        rec = TreeData(:rec => (; a=TreeData([E, F], :in => ["e", "f"]),
+                                 b=TreeData([E, F], :in => ["e", "f"])))
+        rt_rec = Tables.rowtable(rec)
+        @test Tables.schema(rec).names == (:in, :mid, :t, :a, :b)
+        @test length(rt_rec) == 2 * 2
+        @test all(==("f"), r.in for r in rt_rec)
+        @test all(r.a == parent(leaf)[r.t] && r.b == parent(leaf)[r.t] for r in rt_rec)
+
+        # --- 4. a root record over divergent-but-populated fields (no empties):
+        # the Walk read below the record must reach the FIELD's dims, not the
+        # record's (this threw `TypeError ... expected String, got Symbol`).
+        leaf3 = TreeData(randn(3), :t => 1:3)
+        leaf2 = TreeData(randn(2), :t => 1:2)
+        fld = TreeData([leaf3, leaf2], :in => ["x", "y"])
+        rec2 = TreeData(:rec => (; a=fld, b=fld))
+        rt_rec2 = Tables.rowtable(rec2)
+        @test Tables.schema(rec2).names == (:in, :t, :a, :b)
+        @test length(rt_rec2) == 3 + 2
+        @test sort!(collect(Set(r.in for r in rt_rec2))) == ["x", "y"]
+        @test all(r.a == (r.in == "x" ? parent(leaf3)[r.t] : parent(leaf2)[r.t]) for r in rt_rec2)
+    end
+
 # an index-backed outer axis: each leaf is BUILT on `getindex`, so indexing it is observable.
 struct _LazyLeaves{T,F} <: AbstractVector{T}
     n::Int
