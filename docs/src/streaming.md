@@ -72,6 +72,47 @@ the generator. Explicit full-curve requests can still return
 `TreeData(trajectory(...), :time => labels)` from a named draw sweep; retaining
 those arrays is a separate, explicit request.
 
+## Pack larger scalar bundles into columns
+
+Each numeric leaf maps separately. The per-draw `fill(f(y))` layout therefore
+uses about `draws × statistics` mapping regions per retained result; additional
+results and complete-save validation add region pressure. Keep that layout
+within the process's OS mapping budget. A bounded Linux check at 4,000 draws
+and 8 statistics used 32,000 regions, versus 8 for packed statistic vectors.
+
+For larger fixed-shape scalar bundles, collect directly into fresh private
+columns, then assemble the existing dense named record. This example has a
+known schema: `total` returns `Float64`, and `above` returns `Int`. Choose column
+types to match your statistic outputs.
+
+```@example streaming
+function packed_statistics(generator, statistics, draw_labels, ntime)
+    columns = (total=Vector{Float64}(undef, length(draw_labels)),
+               above=Vector{Int}(undef, length(draw_labels)))
+    for (i, draw) in enumerate(draw_labels)
+        y = generator(draw, ntime)
+        columns.total[i] = statistics.total(y)
+        columns.above[i] = statistics.above(y)
+    end
+    TreeData(:stat => columns, :draw => draw_labels)
+end
+
+packed = packed_statistics(trajectory, statistics, [1,2,3,4], 32)
+quantile(packed.total, TreeDim(:ribbon, (0.1, 0.5, 0.9)); dims=:draw)
+```
+
+The columns remain exclusively owned until tree assembly. Each trajectory is
+generated once, passed unchanged to both statistics, and never overwritten or
+recycled. A DO owner with the `draw_labels` and `ntime` fields above can cache
+this result with the following member, keeping both callables explicit in the
+request:
+
+```julia
+# Inside the @dynamicstruct owner:
+@mmap v"1" packed(generator, statistics)::TreeData =
+    packed_statistics(generator, statistics, draw_labels, ntime)
+```
+
 ## Supported storage and lifetime
 
 The extension stores one tree container, with serialized structural metadata
