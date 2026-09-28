@@ -551,7 +551,16 @@ _valueat_field(v, idx::Tuple, fieldpath::Tuple) = v
 #      node) instead of bottoming out at a scalar. `S` is a build-time
 #      constant, and `_nax(typeof(p))` folds from the type, so `Val(S - …)`
 #      stays a compile-time subtraction and the whole walk inlines.
-_walkto(X::TreeData, idx::Tuple, fieldpath::Tuple, ::Val{0}) = X
+_walkto(X::TreeData, idx::Tuple, fieldpath::Tuple, ::Val{0}) = _walkto_zero(parent(X), X, idx, fieldpath)
+# At zero remaining idx slots the walk is AT its target node -- except through
+# a record, which consumes fieldpath entries and ZERO idx slots: a Walk column
+# for an axis directly inside a root-level record (S == 0, fieldpath ≠ ()) must
+# still descend to the field, or it reads the RECORD's dims instead of the
+# field's (snag ragged-reduced-e-8494abd7: `TypeError ... expected String, got
+# Symbol`). An empty fieldpath returns the node, as before.
+_walkto_zero(p::NamedTuple, X::TreeData, idx::Tuple, fp::Tuple{Symbol,Vararg{Symbol}}) =
+    _walkto(p[fp[1]], idx, Base.tail(fp), Val(0))
+_walkto_zero(p, X::TreeData, idx::Tuple, fp::Tuple) = X
 _walkto(X::TreeData, idx::Tuple, fieldpath::Tuple, ::Val{S}) where S = _walkto_node(parent(X), idx, fieldpath, Val(S))
 
 function _walkto_node(p::AbstractArray{<:TreeData}, idx::Tuple, fieldpath::Tuple, ::Val{S}) where S
@@ -698,7 +707,24 @@ _plan_node(p::Tuple{Vararg{TreeData}}) = _plan_container(p, (length(p),))
 # materializing one per sibling WOULD show up there. The ragged path builds
 # its offset table and per-sibling plans, which is O(siblings) by necessity.
 function _plan_container(p, csize)
+    # The representative owns ≥1 row: `_buildchild`/`_buildwidechild` descend
+    # through it BY INSTANCE, and an empty subtree bottoms out at an empty
+    # boundary with no `first` to read (snag ragged-reduced-e-8494abd7: an
+    # empty FIRST sibling threw a bare `BoundsError`). The build side names
+    # the same element via `_repidx`, so plan and build agree on it.
+    # All-empty keeps `first` -- total rows are 0 and `_buildcolumns`
+    # short-circuits before anything descends. Costs one `_nrows` when the
+    # first sibling is populated; the scan runs only in the empty-first case.
     rep = _plan(first(p))
+    if _nrows(rep.plan) == 0
+        for x in p
+            k = _plan(x)
+            if _nrows(k.plan) > 0
+                rep = k
+                break
+            end
+        end
+    end
     sameshape, allshared = true, true
     for x in p
         k = _plan(x)
@@ -1032,10 +1058,14 @@ function _buildwide_parent(ctx::BuildCtx, fields::NamedTuple, rep::TreeData, p, 
     ((map(name, fixed)..., vnames...), (fixcols..., vcols...))
 end
 
-_buildwidechild(ctx::BuildCtx, fields::NamedTuple, p::AbstractArray{<:TreeData}, offset, pn, walk::Bool, fieldpath, wfp) =
-    _buildwide(ctx, map(v -> first(parent(v)), fields), offset, pn.child, walk || !pn.shared, fieldpath, wfp)
-_buildwidechild(ctx::BuildCtx, fields::NamedTuple, p::Tuple{Vararg{TreeData}}, offset, pn, walk::Bool, fieldpath, wfp) =
-    _buildwide(ctx, map(v -> first(parent(v)), fields), offset, pn.child, walk || !pn.shared, fieldpath, wfp)
+function _buildwidechild(ctx::BuildCtx, fields::NamedTuple, p::AbstractArray{<:TreeData}, offset, pn, walk::Bool, fieldpath, wfp)
+    k = _repidx(length(p), pn.plan)   # one index serves every field -- fields are `_planequal`, so this level's offsets are identical across them
+    _buildwide(ctx, map(v -> parent(v)[k], fields), offset, pn.child, walk || !pn.shared, fieldpath, wfp)
+end
+function _buildwidechild(ctx::BuildCtx, fields::NamedTuple, p::Tuple{Vararg{TreeData}}, offset, pn, walk::Bool, fieldpath, wfp)
+    k = _repidx(length(p), pn.plan)   # one index serves every field -- fields are `_planequal`, so this level's offsets are identical across them
+    _buildwide(ctx, map(v -> parent(v)[k], fields), offset, pn.child, walk || !pn.shared, fieldpath, wfp)
+end
 _buildwidechild(ctx::BuildCtx, fields::NamedTuple, p::AbstractArray, offset, pn, walk::Bool, fieldpath, wfp) =
     _buildterminalfanout(ctx, fields, v -> eltype(parent(v)), offset, fieldpath)
 _buildwidechild(ctx::BuildCtx, fields::NamedTuple, p::Tuple, offset, pn, walk::Bool, fieldpath, wfp) =
@@ -1081,12 +1111,28 @@ _buildfanout(ctx::BuildCtx, p::NamedTuple{()}, offset, pn, walk::Bool, fieldpath
 # Descending a child boundary is where `walk` turns on: `pn.shared` is false
 # exactly when this node's siblings disagree (row count, axis coordinates, or
 # a fixed dim's value), so nothing below may be read off a representative.
+#
+# Representative INDEX at a child boundary: the first sibling owning ≥1 row
+# (the build-time twin of `_plan_container`'s rule -- both must name the same
+# element, since `pn.child` is THAT element's node). Dense siblings are
+# uniform, so with rows>0 the first is non-empty; a RaggedPlan's offsets name
+# the owner without recomputing any plan. `k` is a linear index, matching the
+# offsets/`plans` order `_decodeplan` uses. The all-zero fallback is
+# unreachable when rows>0 (`_buildcolumns` short-circuits at n==0) and keeps
+# the walk total.
+_repidx(n::Int, ::DensePlan) = 1
+function _repidx(n::Int, plan::RaggedPlan)
+    for k in 1:n
+        plan.offsets[k + 1] > plan.offsets[k] && return k
+    end
+    1
+end
 function _buildchild(ctx::BuildCtx, p::AbstractArray{<:TreeData}, offset, pn, walk::Bool, fieldpath)
-    c = first(p)
+    c = p[_repidx(length(p), pn.plan)]
     _buildnode(ctx, c, parent(c), offset, pn.child, walk || !pn.shared, fieldpath)
 end
 function _buildchild(ctx::BuildCtx, p::Tuple{Vararg{TreeData}}, offset, pn, walk::Bool, fieldpath)
-    c = first(p)
+    c = p[_repidx(length(p), pn.plan)]
     _buildnode(ctx, c, parent(c), offset, pn.child, walk || !pn.shared, fieldpath)
 end
 _buildchild(ctx::BuildCtx, p::AbstractArray, offset, pn, walk::Bool, fieldpath) = ((:value,), (ValueColumn{eltype(p)}(ctx.root, ctx.plan, ctx.n, fieldpath),))
