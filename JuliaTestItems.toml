@@ -1,0 +1,4 @@
+# Scope `@run_package_tests` discovery (which walks the whole package root) to
+# the package suite, so stray checkouts/snapshots under the root can never join
+# a test run.
+include = ["/test/"]
