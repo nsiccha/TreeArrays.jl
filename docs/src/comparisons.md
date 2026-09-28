@@ -7,8 +7,8 @@ CurrentModule = TreeArrays
 TreeArrays sits next to two packages people reasonably ask about:
 **DimensionalData.jl**, which also gives arrays named dimensions, and
 **FlexiChains.jl**, which holds MCMC output. This page says what is genuinely
-different, what is borrowed, and — for FlexiChains — what an integration would
-look like.
+different, what is borrowed, and — for FlexiChains — what the shipped
+integration does.
 
 ## [TreeArrays vs. DimensionalData](@id vs-dd)
 
@@ -104,12 +104,10 @@ Treat the two as overlapping-but-distinct until this page says otherwise.
 
 ## [TreeArrays and FlexiChains](@id vs-fc)
 
-!!! warning "This section is a sketch, not a shipped integration"
-    TreeArrays has **no** FlexiChains dependency, extension, or tested bridge
-    today, and the code below has not been run against FlexiChains. It describes
-    the *shape* such an integration would take, so the design is written down
-    somewhere. Check the FlexiChains documentation for its current API before
-    relying on any spelling here.
+!!! note "Shipped: this section describes a tested package extension"
+    `TreeData(chain)`, `FlexiChain(X)`, and `TreeData(summary)` below are real,
+    tested API — extension `TreeArraysFlexiChainsExt`, loaded automatically
+    whenever both packages are loaded. Nothing here is a sketch.
 
 FlexiChains.jl and TreeArrays solve **adjacent, non-overlapping** problems.
 
@@ -125,7 +123,7 @@ frame. That is a reduction problem.
 
 Neither replaces the other, and the seam between them is clean.
 
-### The natural bridge
+### The bridge
 
 The two type systems line up almost directly, because a chain object and a
 `TreeData` describe the same logical thing — a `(draw, chain)` grid of keyed
@@ -133,31 +131,47 @@ values:
 
 | FlexiChains | TreeArrays |
 |---|---|
-| the iteration dimension | an unlabelled `:draw` axis |
-| the chain dimension | an unlabelled `:chain` axis |
-| one scalar parameter key | a field of a [`TreeNamedTuple`](@ref) record, or a coordinate on a `:param` axis |
-| one array-valued parameter key | a nested `TreeData` leaf with its own inner axes |
-| keys whose per-draw values differ in size | a [`TreeRaggedArray`](@ref) node |
+| the iteration dimension | a `:draw` axis, with the chain's index lookups as coordinates |
+| the chain dimension | a `:chain` axis, same |
+| one scalar parameter key | a field of a [`TreeNamedTuple`](@ref) record over `:draw` + `:chain` |
+| one uniformly array-valued parameter key | a nested `TreeData` leaf with its own inner axes (`:elem`, or `:elem_1`, `:elem_2`, …) |
+| keys whose cells differ in shape or type | refused by name — split the key upstream |
 
-So a conversion would build a record whose fields are the chain's keys, over
-shared `:draw` and `:chain` axes:
+So ingesting a chain builds a record whose fields are the chain's keys, over
+shared `:draw` and `:chain` axes, with the record axis named `:param`:
 
 ```julia
-# SKETCH — not a supported API. Adapt the accessors to FlexiChains' actual surface.
-function TreeArrays.TreeData(chain::FlexiChains.FlexiChain)
-    fields = (; (Symbol(k) => _as_leaf(chain, k) for k in keys(chain))...)
-    TreeData(:param => fields, :draw, :chain)
-end
-
-# a scalar key becomes a plain (draw, chain) matrix; an array-valued key becomes
-# a nested TreeData carrying its own inner axes
-_as_leaf(chain, k) = ...
+X = TreeData(chain)                  # parameters only
+X = TreeData(chain; extras=true)     # also `Extra` keys (e.g. `:lp`)
+mean(X; dims=:draw)                  # ordinary reductions from here
 ```
 
-Once that exists, everything on the rest of this site applies unchanged:
+Field names are `Symbol(key)`, so `VarName` optics survive textually (`y[1]`
+and `y[2]` stay distinct); a `Parameter`/`Extra` pair collapsing to one name
+throws. Scalar keys become `(draw, chain)` matrix fields. The `:draw`/`:chain`
+coordinates come from the chain's index lookups, so `discard_initial`/thinning
+offsets survive the crossing. Ingest copies once per key at construction
+(`chain[k]` materializes; FlexiChains exposes no public zero-copy accessor) —
+that copy is a construction cost, and reductions on the result never copy.
+
+The crossing runs both ways, plus summaries:
 
 ```julia
-post = TreeData(chain)                       # zero-copy where the backing allows
+FlexiChain(X)                        # rectangular numeric trees back to a chain
+TreeData(summarystats(chain))        # a summary melted over its surviving dims
+```
+
+`FlexiChain(X)` accepts a dense leaf over exactly `:draw`/`:chain`/`:param`
+(in any order) or a flat `:param` record — nested sub-trees unstack back to
+array-valued keys — and refuses ragged, `Tuple`-backed, heterogeneous, and
+scalar shapes by name. A fully-collapsed single stat (e.g. `mean(chain)`)
+melts to a dense `:param` vector; anything else becomes a record over the
+surviving `:draw`/`:chain`/`:stat` dims.
+
+From there, everything else on this site applies unchanged:
+
+```julia
+post = TreeData(chain)
 
 post.mu                                      # read one key back, still labelled
 quantile(post, (lower = 0.025, median = 0.5, upper = 0.975); dims = (:draw, :chain))
@@ -173,21 +187,19 @@ Three things make the pairing more than cosmetic:
   axis of separately-allocated per-chain matrices. Chains that were sampled
   independently, possibly memory-mapped, never need `hcat`ing to be summarized
   together. See [Ragged data](@ref).
-- **FlexiChains' arbitrary-type values are what TreeArrays' record and ragged
-  nodes are for.** A key whose draws are vectors of *differing* length is a
-  ragged node, not a padding problem.
+- **Array-valued keys keep their shape across the crossing.** Uniform cells nest
+  as a sub-`TreeData` on the way in and unstack to array-valued keys on the way
+  out; genuinely ragged per-draw data stays on the TreeArrays side as a
+  [`TreeRaggedArray`](@ref) node, summarized together with the rest.
 - **`TreeActualArray`** promotes a record axis to a real array dimension, so a
   record-of-per-parameter-matrices feeds `ess`/`rhat` with no copy and no parallel
   plain-array builder.
 
-### Where this would live
+### Where this lives
 
-Not in TreeArrays' core. A hard dependency on any modelling-ecosystem package is
-a non-starter here — the core's dependencies are `Statistics` and `Tables`, and
-that is intentional. The bridge belongs in a **package extension**, on whichever
-side is willing to own it, exactly as the `NaNStatistics` extension does for
+In a **package extension**, not in TreeArrays' core: `TreeArraysFlexiChainsExt`,
+behind a weak dependency on FlexiChains and loaded automatically when both
+packages are loaded. A hard dependency on any modelling-ecosystem package is a
+non-starter here — the core's dependencies are `Statistics` and `Tables`, and
+that is intentional — exactly as the `NaNStatistics` extension does for
 [`nanquantile`](@ref nan-safe-quantiles).
-
-If you want this, [open an issue](https://github.com/nsiccha/TreeArrays.jl/issues)
-— knowing which direction the conversion is actually needed in is the missing
-input, not the implementation.
