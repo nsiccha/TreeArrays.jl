@@ -208,16 +208,53 @@ A[1, 1, 2] === parent(draws).sigma[1, 1]    # zero-copy: it is the same element
 
 A dense leaf `TreeData(arr3d, :draw, :chain, :param => names)` and that record
 give the **same** array, so `ess(A)`/`rhat(A)` work whichever way the draws are
-held. `parent(A)` recovers the tree, `dims(A)` its axes. Rectangular only —
-ragged and heterogeneous shapes error by name.
+held. `parent(A)` recovers the tree, `dims(A)` its dimension metadata.
+
+An outer grid of numeric scalar-terminal trees also has a lazy numeric view.
+For example, extract one field from a NamedTuple quantile result and pass it
+directly to an array consumer:
+
+```@example tab
+using NaNStatistics
+values = reshape(1.0:24.0, 3, 2, 4)
+input = TreeData(values, :subject, :time => (0.0, 1.0), :draw)
+p05 = nanquantile(input, (p05=0.05, p50=0.5); dims=:subject).p05
+grid = TreeActualArray(p05)
+(size(grid), eltype(grid), grid[1, 2], coords(dims(grid)[1]))
+```
+
+The view keeps the outer shape, axes, coordinate collections and declaration
+order. Reduced ghosts and fixed dimensions stay in `dims(grid)` without adding
+physical axes. All cells must hold the same concrete numeric scalar type, with
+no real inner axes. Empty grids work when their declared `TreeData` element type
+retains that scalar type. Mixed scalar/array cells, nonnumeric terminals, nested
+grids and heterogeneous scalar types error; no promotion or packing is implicit.
+A zero-dimensional array-backed leaf remains an array: it works by itself, but
+a grid of those leaves is outside this scalar-terminal case.
+
+Views retain their trees and read through their backing for their lifetime.
+They are read-only; changes made through an existing backing alias are visible,
+including replacement of a scalar-grid cell with a compatible scalar tree.
+Keep the shape, axes, coordinates and terminal types unchanged while using a
+view. `collect(grid)` or `Array(grid)` makes an independent numeric copy for a
+consumer that writes, preserving shape and value order with one-based axes.
+Quantile results already contain computed values, so the
+view aliases the extracted result rather than the quantile input.
+
+Other outer arrays of sub-trees still require an explicit alignment policy:
+`TreeActualArray(chains; dims=:draw, align=:truncate_min)`, `:thin_min`, or
+`:error_equal`. Array-backed sub-trees are refused by a bare call even when
+rectangular, and heterogeneous records error by name. Alignment inserts the
+outer sibling axis immediately after the aligned inner axis; scalar grids use
+their own outer axis order.
 
 **`parent(X)`** — the backing storage verbatim, zero-copy, but an `AbstractArray`
 only when the leaf is array-backed, and it drops the labels. (A `selectdim` leaf's
 parent is a `SubArray` — still an array, feeds fine.)
 
-**`collect(X)` / `Array(X)`** — a materialized dense copy, for a consumer that
-mutates or strictly requires an `Array`. `Array(X)` works if it can and
-`MethodError`s otherwise.
+**`collect(X)` / `Array(X)`** — a copy of an array-backed tree's backing. For a
+scalar grid that backing is an array of trees; use `collect(TreeActualArray(X))`
+or `Array(TreeActualArray(X))` to materialize the numeric array instead.
 
 ## Rich display
 
