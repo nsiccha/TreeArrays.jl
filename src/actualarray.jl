@@ -70,6 +70,7 @@ is visible through the view. Keep shapes, axes, coordinates and terminal types
 unchanged while a view exists. Use `collect(A)` or `Array(A)` for an independent,
 mutable numeric array. Construction validates the leaves without packing their
 values; a view of a reduced field aliases that field, not the reducer's input.
+Dense copies preserve shape and value order and use one-based axes.
 
 Other outer arrays of sub-trees are refused even when rectangular — unequal
 leaves name the outer axis plus the differing inner axis and lengths — unless
@@ -188,6 +189,12 @@ Base.axes(A::_ScalarGridTreeActualArray) = getfield(A, :outer_axes)
 Base.IndexStyle(::Type{<:_ScalarGridTreeActualArray}) = IndexCartesian()
 Base.parent(A::_ScalarGridTreeActualArray) = getfield(A, :tree)
 dims(A::_ScalarGridTreeActualArray) = dims(parent(A))
+# A dense copy normalizes physical axes to one-based positions. Julia's generic
+# Array constructor requires equal axes, which would reject a shifted backing.
+function Base.Array{T,N}(A::_ScalarGridTreeActualArray{S,N}) where {T,S,N}
+    dest = Array{T,N}(undef, size(A))
+    copyto!(dest, CartesianIndices(dest), A, CartesianIndices(A))
+end
 @inline function Base.getindex(A::_ScalarGridTreeActualArray{T,N},
         I::Vararg{Int,N}) where {T,N}
     @boundscheck checkbounds(A, I...)

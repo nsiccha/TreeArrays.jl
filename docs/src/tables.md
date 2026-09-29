@@ -237,7 +237,8 @@ They are read-only; changes made through an existing backing alias are visible,
 including replacement of a scalar-grid cell with a compatible scalar tree.
 Keep the shape, axes, coordinates and terminal types unchanged while using a
 view. `collect(grid)` or `Array(grid)` makes an independent numeric copy for a
-consumer that writes. Quantile results already contain computed values, so the
+consumer that writes, preserving shape and value order with one-based axes.
+Quantile results already contain computed values, so the
 view aliases the extracted result rather than the quantile input.
 
 Other outer arrays of sub-trees still require an explicit alignment policy:

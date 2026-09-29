@@ -63,12 +63,14 @@
         singleton = TreeActualArray(TreeData([TreeData(3.0)], :position => (:only,)))
         @test size(singleton) == (1,)
         @test singleton[1] === 3.0
+        @test Array(singleton) == [3.0]
         @test coords(dims(singleton)[1]) === (:only,)
         makeview(tree) = TreeActualArray(tree)
         @test (@inferred makeview(TreeData([TreeData(3.0)], :position))) isa AbstractVector{Float64}
         scalar = TreeActualArray(TreeData(fill(TreeData(4.0))))
         @test size(scalar) == axes(scalar) == ()
         @test scalar[] === scalar[1] === scalar[CartesianIndex()] === 4.0
+        @test Array(scalar)[] === 4.0
         @test_throws BoundsError scalar[2]
 
         proto = TreeData(0.0, TreeDim(:subject, nothing), TreeDim(:dose, 20))
@@ -81,6 +83,7 @@
             @test axes(A) == axes(leaves)
             @test isempty(A)
             @test collect(A) == zeros(shape)
+            @test Array(A) == zeros(shape)
             @test sum(A) == 0.0
             @test_throws BoundsError A[1]
         end
@@ -101,6 +104,11 @@
         @test [A[i] for i in 1:6] == collect(1.0:6.0)
         @test Array(A) == reshape(collect(1.0:6.0), 2, 3)
         @test collect(A) == reshape(collect(1.0:6.0), 2, 3)
+        @test Matrix{Float32}(A) == reshape(Float32.(1:6), 2, 3)
+        @test Array{Float32}(A) == reshape(Float32.(1:6), 2, 3)
+        copy = Array(A)
+        copy[1, 1] = -1.0
+        @test A[-1, 2] === 1.0
         for (i, I) in enumerate(CartesianIndices(A))
             @test A[I] === Float64(i)
         end
