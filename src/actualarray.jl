@@ -13,8 +13,9 @@
 # param) shape ess/rhat want. Both draw representations arrive at the SAME array: a dense leaf
 # `TreeData(arr3d, :draw,:chain,:param=>names)` (real axes ARE parent's axes) and a record
 # `TreeData(:param => per-param-matrices, :draw,:chain)` (fields assembled lazily). v1 supports
-# an array-backed leaf and a (possibly nested) HOMOGENEOUS NamedTuple record. An outer axis
-# of sub-trees is refused EVEN WHEN rectangular, naming the outer axis; unequal leaves
+# an array-backed leaf and a (possibly nested) HOMOGENEOUS NamedTuple record. Numeric
+# scalar-terminal grids additionally expose their outer array axes directly. Other sub-trees
+# are refused EVEN WHEN rectangular, naming the outer axis; unequal leaves
 # additionally name the differing inner axis and lengths (heterogeneous / Tuple-record
 # shapes error BY NAME likewise — rectangular only, mirrors the Tables adapter's contract).
 # Nested records fall out of the recursion.
@@ -43,22 +44,53 @@ Both draw representations therefore arrive at the *same* array — a dense leaf
 axes in `dims` order, with the record axis trailing — exactly the
 `(draw, chain, param)` shape `ess`/`rhat` want.
 
-`parent(A)` recovers the tree and [`dims`](@ref)`(A)` its axes.
+An N-D outer array of **numeric scalar-terminal** trees also presents as a
+numeric array, in the outer array's axis order. This includes a field extracted
+from a NamedTuple quantile reduction:
 
-Rectangular only: an outer axis of sub-trees is refused even when rectangular —
-unequal leaves name the outer axis plus the differing inner axis and lengths —
-and heterogeneous / `Tuple`-record shapes error by name.
+```julia
+using NaNStatistics
+X = TreeData(reshape(1.0:24.0, 3, 2, 4), :subject, :time => (0.0, 1.0), :draw)
+p05 = nanquantile(X, (p05=0.05, p50=0.5); dims=:subject).p05
+A = TreeActualArray(p05)           # numeric 2 × 4 view, no dense assembly
+A[1, 2]                           # 7.1
+coords(dims(A)[1])                 # (0.0, 1.0)
+```
+
+Every scalar-grid leaf must hold the same concrete `Number` type and have no
+real inner axes; fixed dimensions and reduced ghosts are allowed. Empty grids
+must retain a concrete scalar-terminal `TreeData` element type. Outer physical
+axes and coordinates are preserved. `parent(A)` recovers the tree and
+[`dims`](@ref)`(A)` its dimension metadata, including fixed/ghost dimensions;
+those dimensions do not add physical array axes.
+
+The view is read-only and retains its tree for its lifetime. Reads alias the
+existing backing; replacing a scalar-grid cell with a compatible scalar tree
+is visible through the view. Keep shapes, axes, coordinates and terminal types
+unchanged while a view exists. Use `collect(A)` or `Array(A)` for an independent,
+mutable numeric array. Construction validates the leaves without packing their
+values; a view of a reduced field aliases that field, not the reducer's input.
+
+Other outer arrays of sub-trees are refused even when rectangular — unequal
+leaves name the outer axis plus the differing inner axis and lengths — unless
+explicit ragged alignment is requested with `dims=` and `align=`. Mixed
+scalar/array, nonnumeric, nested-grid and heterogeneous scalar types are
+unsupported. A zero-dimensional **array-backed** leaf is not a scalar terminal:
+it works as a dense leaf on its own, but a grid of such leaves still takes the
+array-subtree refusal path. `Tuple`-record shapes remain unsupported.
 
 Two lower-level ways across the same boundary: `parent(X)` is the backing
-verbatim and zero-copy, but is an `AbstractArray` only for an array-backed leaf
-and drops the labels; `collect(X)` / `Array(X)` materialize a dense copy.
+verbatim and zero-copy, but a scalar grid's backing contains trees rather than
+numbers and a record's backing is a NamedTuple. `collect(X)` / `Array(X)` copy
+array-backed storage; `collect(A)` / `Array(A)` materialize the numeric view.
 """
 struct TreeActualArray{T,N,X<:TreeData} <: AbstractArray{T,N}
     tree::X
     size::NTuple{N,Int}
 end
 
-function TreeActualArray(X::TreeData)
+TreeActualArray(X::TreeData) = _actualarray(X)
+function _actualarray(X::TreeData)
     sz = _actualsize(X)                      # descends + enforces rectangularity / homogeneity
     TreeActualArray{_eltype(X),length(sz),typeof(X)}(X, sz)
 end
@@ -141,6 +173,84 @@ _actualatfield(v::AbstractArray, inner::Tuple) = v[inner...]
 _actualatfield(v::TreeData, inner::Tuple)      = _actualat(v, inner)
 _actualatfield(v, ::Tuple)                     = v            # scalar field terminal
 
+# A scalar-terminal grid already has its complete physical shape in the outer
+# array. Keep that array (and its axes) intact; read just the selected terminal.
+# This is a separate view, like the aligned-ragged view below, so the established
+# dense/record value walk and axis order stay unchanged.
+struct _ScalarGridTreeActualArray{T,N,X,A} <: AbstractArray{T,N}
+    tree::X
+    shape::NTuple{N,Int}
+    outer_axes::A
+end
+
+Base.size(A::_ScalarGridTreeActualArray) = getfield(A, :shape)
+Base.axes(A::_ScalarGridTreeActualArray) = getfield(A, :outer_axes)
+Base.IndexStyle(::Type{<:_ScalarGridTreeActualArray}) = IndexCartesian()
+Base.parent(A::_ScalarGridTreeActualArray) = getfield(A, :tree)
+dims(A::_ScalarGridTreeActualArray) = dims(parent(A))
+@inline function Base.getindex(A::_ScalarGridTreeActualArray{T,N},
+        I::Vararg{Int,N}) where {T,N}
+    @boundscheck checkbounds(A, I...)
+    parent(parent(parent(A))[I...])::T
+end
+
+# Scalar eligibility is a representation check, never the ((), ()) shape
+# signature: a zero-dimensional AbstractArray is still an array-backed leaf.
+_actualscalarterminal(::TreeData) = true
+_actualscalarterminal(::Union{TreeArray,TreeNamedTuple,TreeTuple}) = false
+_actualscalarterminal(::TreeRaggedArray) = true  # validate/refuse nested grids by name
+_actualscalarterminaltype(::Type) = false
+_actualscalarterminaltype(::Type{<:TreeData{<:Number}}) = true
+
+function _actualscalargridtype(::Type{TreeData{P,M}}) where {P<:Number,M}
+    isconcretetype(TreeData{P,M}) || error(
+        "TreeActualArray scalar grid: an empty grid must retain a concrete numeric scalar TreeData element type")
+    isconcretetype(P) || error("TreeActualArray scalar grid: the numeric scalar type must be concrete")
+    ds = fieldtype(M, :dims)
+    any(_isaxis, fieldtypes(ds)) && error(
+        "TreeActualArray scalar grid: scalar terminals cannot carry real inner axes -- " *
+        "only fixed dimensions and reduced ghosts are supported on a scalar leaf")
+    P
+end
+_actualscalargridtype(::Type{L}) where L = error(
+    "TreeActualArray scalar grid: every leaf must hold a numeric scalar terminal; got $L -- " *
+    "mixed scalar/array leaves, nonnumeric terminals and nested containers are unsupported " *
+    "(a zero-dimensional array-backed leaf is an array, not a scalar terminal). " *
+    "An empty grid must retain a concrete numeric scalar TreeData element type")
+
+function _actualscalargrid(tree::TreeRaggedArray)
+    leaves = parent(tree)
+    T = _actualscalargridtype(isempty(leaves) ? eltype(leaves) : typeof(first(leaves)))
+    for (j, leaf) in pairs(leaves)
+        S = _actualscalargridtype(typeof(leaf))
+        S === T || error(
+            "TreeActualArray scalar grid: every leaf must have the same numeric scalar type; " *
+            "leaf $j holds $S where the first holds $T -- no implicit promotion")
+    end
+    axis_dims = filter(_isaxis, dims(tree))
+    length(axis_dims) == ndims(leaves) || error(
+        "TreeActualArray scalar grid: every outer array axis must have one dimension label")
+    for (j, d) in enumerate(axis_dims)
+        labels = meta(d).values
+        (labels === missing || length(labels) == size(leaves, j)) || error(
+            "TreeActualArray scalar grid: outer axis `:$(name(d))` has $(length(labels)) " *
+            "coordinates for $(size(leaves, j)) positions")
+    end
+    _ScalarGridTreeActualArray{T,ndims(leaves),typeof(tree),typeof(axes(leaves))}(
+        tree, size(leaves), axes(leaves))
+end
+
+function _actualarray(tree::TreeRaggedArray)
+    leaves = parent(tree)
+    # Empty grids have no sample: only their retained element type can prove
+    # scalar eligibility. Non-empty grids validate every leaf, including broad
+    # containers whose actual terminals nevertheless share one numeric type.
+    scalar = isempty(leaves) ? _actualscalarterminaltype(eltype(leaves)) :
+        any(_actualscalarterminal, leaves)
+    scalar && return _actualscalargrid(tree)
+    _actualsize(tree)                         # existing array/record-subtree refusal
+end
+
 # ===================== ragged alignment views (todo 1l53kom) =====================
 # Spliced upstream from Bruno's `web-pkpd/src/treearrays_compat.jl` bridge (nearly verbatim --
 # same struct shape, same `dims=`/`align=` keywords, same three policies), plus the two pieces
@@ -161,7 +271,8 @@ A lazy, zero-copy `AbstractArray` view of a one-level ragged tree whose leaves
 differ only along the inner axis `dims`, aligned under the named policy. The
 caller must name **both** — there is no implicit ragged-to-rectangular
 conversion, and a half-named call throws for the missing keyword. A bare
-`TreeActualArray(X)` on a ragged tree keeps refusing exactly as before.
+`TreeActualArray(X)` on array-backed sub-trees keeps refusing; homogeneous
+numeric scalar-terminal grids instead expose their outer axes without alignment.
 
 ```julia
 A = TreeActualArray(chains; dims = :draw, align = :truncate_min)
@@ -221,11 +332,11 @@ end
 function TreeActualArray(tree::TreeRaggedArray; dims::Union{Symbol,Nothing}=nothing,
         align::Union{Symbol,Nothing}=nothing)
     # This method is positionally MORE specific than the bare `TreeActualArray(X)` constructor,
-    # so a bare ragged call lands here too -- route it to the ORIGINAL refusal (`_actualsize`
-    # always throws for a ragged tree), keeping bare-call behavior byte-identical. A HALF-named
+    # so a bare ragged call lands here too -- scalar grids use their outer axes,
+    # while other subtrees retain the original refusal. A HALF-named
     # call is not a bare call: each missing keyword throws for itself, never a default policy.
     if isnothing(dims) && isnothing(align)
-        _actualsize(tree)
+        return _actualarray(tree)
     end
     isnothing(dims) && error(
         "TreeActualArray ragged alignment: `dims=` naming the ragged inner axis is required -- " *
