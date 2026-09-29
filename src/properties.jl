@@ -53,9 +53,14 @@ end
 Base.propertynames(X::TreeNamedTuple) = keys(parent(X))
 
 # A ragged container of records (todo 1h7ye2g): `X.beta` maps `.beta` over the leaves.
-# EAGER outer map, zero-copy children -- the fresh `Vector` holds `length(X)` pointers, not data,
-# so the no-eager-restructuring invariant (which forbids stacking DATA into dense blocks) is
-# untouched; a lazy outer view would need a new wrapper type for no structural gain. foundALL:
+# EAGER outer map, zero-copy children -- the fresh outer array holds one pointer per leaf
+# position, not data, so the no-eager-restructuring invariant (which forbids stacking DATA
+# into dense blocks) is untouched; a lazy outer view would need a new wrapper type for no
+# structural gain. `map` over `(keys, els)` re-wraps at the container's OWN shape -- a
+# Matrix of records (the natural shape a chained cross-axis reduce leaves behind) reads to
+# a Matrix of children, not a flattened vector wearing the container's two inner dims.
+# Leaf keys keep their true position (`CartesianIndex` there), so the foundALL errors below
+# name the failing leaf at its actual (row, col). foundALL:
 # EVERY leaf must be a record carrying the field -- the first that is not throws BY NAME (leaf
 # index + what it carries), never a silent skip. An EMPTY container has no leaf to read from,
 # so it throws too (the `_emptyreduce` "no prototype" reasoning). Nested ragged leaves recurse
@@ -64,21 +69,26 @@ function Base.getproperty(X::TreeRaggedArray, s::Symbol)
     els = parent(X)
     isempty(els) && throw(ArgumentError(
         "cannot read `.$s` from an empty TreeRaggedArray -- there is no leaf to read the field from."))
-    TreeData([_raggedfield(el, s, j) for (j, el) in pairs(els)], meta(X))
+    TreeData(map((j, el) -> _raggedfield(el, s, j), keys(els), els), meta(X))
 end
-_raggedfield(el::TreeNamedTuple, s::Symbol, j::Int) =
+_raggedfield(el::TreeNamedTuple, s::Symbol, j) =
     hasfield(typeof(parent(el)), s) ? getproperty(el, s) : throw(ArgumentError(
-        "cannot read `.$s`: leaf $j of this TreeRaggedArray is a record without field `$s` " *
+        "cannot read `.$s`: leaf $(_leaflabel(j)) of this TreeRaggedArray is a record without field `$s` " *
         "(it has fields $(keys(parent(el)))). `.` is foundALL -- every leaf must carry the field."))
-_raggedfield(el::TreeRaggedArray, s::Symbol, ::Int) = getproperty(el, s)   # nested ragged: recurse
-_raggedfield(el::TreeArray, s::Symbol, j::Int) = throw(ArgumentError(
-    "cannot read `.$s`: leaf $j of this TreeRaggedArray is a dense numeric leaf (TreeArray), " *
+_raggedfield(el::TreeRaggedArray, s::Symbol, j) = getproperty(el, s)   # nested ragged: recurse
+_raggedfield(el::TreeArray, s::Symbol, j) = throw(ArgumentError(
+    "cannot read `.$s`: leaf $(_leaflabel(j)) of this TreeRaggedArray is a dense numeric leaf (TreeArray), " *
     "not a record. `.` reads record fields -- index the leaf or split the tree."))
-_raggedfield(el::TreeTuple, s::Symbol, j::Int) = throw(ArgumentError(
-    "cannot read `.$s`: leaf $j of this TreeRaggedArray is a positional record (TreeTuple), " *
+_raggedfield(el::TreeTuple, s::Symbol, j) = throw(ArgumentError(
+    "cannot read `.$s`: leaf $(_leaflabel(j)) of this TreeRaggedArray is a positional record (TreeTuple), " *
     "whose fields have no names. `.` reads NAMED record fields -- index the leaf positionally."))
-_raggedfield(el::TreeData, s::Symbol, j::Int) = throw(ArgumentError(
-    "cannot read `.$s`: leaf $j of this TreeRaggedArray is a $(typeof(el)), not a named record."))
+_raggedfield(el::TreeData, s::Symbol, j) = throw(ArgumentError(
+    "cannot read `.$s`: leaf $(_leaflabel(j)) of this TreeRaggedArray is a $(typeof(el)), not a named record."))
+
+# Leaf labels carry the leaf's TRUE position: linear for a Vector-backed container,
+# `(row, col)` for an N-D one (`keys` of an N-D array is `CartesianIndices` there).
+_leaflabel(j::CartesianIndex) = string(Tuple(j))
+_leaflabel(j) = string(j)
 
 # The prototype leaf's fields. Deliberately NOT an all-leaves intersection: walking every leaf
 # on a listing call would build a lazy outer axis in full (the cost `_leafreduce` avoids), and

@@ -323,6 +323,43 @@ end
         @test propertynames(E) == ()
         @test propertynames(TreeData([TreeData(randn(4), :draw)], :subject)) == ()
         @test propertynames(D) == (:beta, :sigma)
+
+        # N-D backing (snag raggedfield-cart-e580ab3f): a chained cross-axis reduce leaves a
+        # MATRIX of records (time x qoi). `.` maps over it at the container's OWN shape --
+        # keys are CartesianIndices there, so the read must not flatten and the foundALL
+        # errors must name the failing leaf at its true (row, col), not a linear index.
+        mkq(i, j; fields = (a = 1.0 * i + j, b = 1.0 * i * j)) =
+            TreeData(:q => fields)
+        M = TreeData([mkq(i, j) for i in 1:2, j in 1:3],
+                     :time => (10.0, 20.0), :qoi => (:x, :y, :z))
+        A = M.a
+        @test parent(A) isa Matrix && size(parent(A)) == (2, 3)           # shape preserved
+        @test [parent(parent(A)[i, j]) for i in 1:2, j in 1:3] ==
+              [1.0*i + j for i in 1:2, j in 1:3]                          # right leaf at right position
+        @test map(TreeArrays.name, TreeArrays.dims(A)) == (:time, :qoi)   # container dims survive
+        @test propertynames(M) == (:a, :b)                                # prototype leaf's fields
+        geta(X) = X.a
+        @test (@inferred geta(M)) isa TreeData
+        H2 = TreeData(reshape([mkq(1, 1), mkq(2, 1), mkq(1, 2), mkq(2, 2; fields=(; a=9.0))], 2, 2),
+                      :time => (10.0, 20.0), :qoi => (:x, :y))
+        @test_throws "leaf (2, 2)" H2.b                                    # true (row, col), not leaf 4
+        D2 = TreeData(reshape([mkq(1, 1); TreeData(randn(4), :draw)], 2, 1), :time => (10.0, 20.0), :qoi => (:x,))
+        @test_throws "leaf (2, 1)" D2.a                                    # dense leaf named at its position
+
+        # the reporter's literal chain: chained nanquantile NamedTuple reduces leave a Matrix
+        # of records whose fields hold the second band; the documented reads work on it.
+        X4 = TreeData(randn(3, 4, 2, 5), :subject, :time => (1.0, 2.0, 3.0, 4.0),
+                      :qoi => (:a, :b), :draw)
+        band1 = nanquantile(X4, (p05=0.05, p50=0.5, p95=0.95); dims=:subject)
+        band2 = nanquantile(band1, (lower=0.025, median=0.5, upper=0.975); dims=:draw)
+        p50 = band2.p50                       # one read: (time, qoi) records of the band
+        @test parent(p50) isa Matrix && size(parent(p50)) == (4, 2)
+        @test map(TreeArrays.name, TreeArrays.dims(p50)) == (:time, :qoi, :draw, :subject)
+        recs = parent(band2)
+        @test parent(p50)[2, 2] === recs[2, 2].p50      # zero-copy: the record's own child
+        med = p50.median                      # second read: the raw medians at their positions
+        @test [parent(parent(med)[i, j]) for i in 1:4, j in 1:2] ==
+              [parent(recs[i, j].p50).median for i in 1:4, j in 1:2]
     end
 
     # The unified quantile no longer coerces p at all -- Base's quantile!(scratch, p)
