@@ -60,7 +60,7 @@ same way `mean` does.
 
 [`quantile`](@ref) is the output-axis reducer. You hand it the *name and levels
 of the output axis*, and it computes every level in **one sorted pass** over a
-shared scratch buffer.
+reused scratch buffer.
 
 ```@example red
 r = quantile(X, TreeDim(:band, (0.1, 0.5, 0.9)); dims = :draw)
@@ -247,6 +247,35 @@ selectdim(X, :param, sel)                  # 3-arg form, mirroring Base.selectdi
 label vector is subset. Positional selectors (a mask, integer indices) also work
 on an *unlabelled* axis; a Regex or predicate on one throws, because there are no
 labels to match.
+
+## Threads — independent slices, identical results
+
+Every slice of a reduction is independent, so the built-in reducers
+(`quantile`, `nanquantile`, `hdi`, `mean`, `sum`, `var`, `std`) spread their
+slices over Julia's threads by default. Start Julia with threads
+(`julia -t auto`) and a `(time × qoi × draw)` ribbon reduction scales with them:
+in one measurement, 8067 slices of 4000 draws went from 1.33 s to 0.19 s on
+8 threads.
+
+The result does not depend on the thread count. Each cell is computed by the
+same kernel from the same slice and written to its own position; nothing is
+combined across slices, so there is no reordering to change a floating-point
+sum. A failing slice throws the same exception as the serial loop.
+
+```julia
+nanquantile(X, (lower = 0.025, median = 0.5, upper = 0.975); dims = :draw)   # threaded
+nanquantile(X, (lower = 0.025, median = 0.5, upper = 0.975); dims = :draw,
+            threads = false)                                                 # calling task only
+```
+
+Your own `mapslices` kernels stay serial unless you pass `threads = true`.
+TreeArrays cannot tell whether a kernel is safe to run on two tasks at once:
+one that writes to a buffer it closes over would race and return wrong numbers
+that look right. A kernel that only reads its slice is safe.
+
+Small inputs and single-threaded sessions skip the task machinery entirely.
+With threads, transient memory is one reduced-axis sort buffer per task (at
+most `2 * Threads.nthreads()` of them) instead of one per call.
 
 ## Type stability — the function barrier is the lever
 
