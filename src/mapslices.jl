@@ -93,6 +93,11 @@ end
 _wantcoords(f, ::Val{false}) = f
 _wantcoords(f, ::Val{true})  = _NeedsCoords(f)
 
+# A threaded loop copies the kernel per task (threading.jl); the coordinate wrappers carry no state
+# of their own, so they copy whatever they wrap.
+_taskcopy(g::_NeedsCoords) = _NeedsCoords(_taskcopy(g.f))
+_taskcopy(g::_WithCoords)  = _WithCoords(_taskcopy(g.f), g.coords)
+
 # The reduced AXIS dims at this node, in AXIS order -- which is exactly the order of the slice's
 # own dimensions (Base's `Slices` preserves the order of the sliced dims), so the coordinate
 # vectors line up positionally with what the kernel receives. `@generated` for the same reason
@@ -139,7 +144,7 @@ _refusecoords(::_NeedsCoords, want) = throw(ArgumentError(
 # Returns `nothing` when `want` doesn't hit a real axis here -> the caller decides what that
 # means (a true leaf -> sentinel/idempotent re-slice; an intermediate node -> recurse deeper
 # into each element).
-function _reduceouter(f, X, valwant::Val{want}) where want
+function _reduceouter(f, X, valwant::Val{want}, threads::Bool) where want
     alldims = TreeArrays.dims(X)
     n_ax    = ndims(parent(X))
     @assert all(_isaxis, alldims[1:n_ax]) "_reduceouter assumes the first $n_ax dims of $(typeof(X)) are exactly the parent array's axes, positionally, in order; got a non-axis dim at position $(findfirst(!_isaxis, alldims[1:n_ax])) (dims = $(map(name, alldims)))"
@@ -148,7 +153,8 @@ function _reduceouter(f, X, valwant::Val{want}) where want
     # AFTER `foundany`: a branch that reduces nothing here must not bind (and must not demand
     # coordinates from) an axis it isn't touching -- the ragged recursion re-enters per element.
     g = _bindcoords(f, alldims, Val(n_ax), valwant)
-    outs = isempty(keepaxes) ? _leafreduce(g, parent(X)) : map(sl -> _leafreduce(g, sl), _eachslice(parent(X), Val(keepaxes)))
+    outs = isempty(keepaxes) ? _leafreduce(g, parent(X), threads) :
+        _tmap((gk, sl) -> _leafreduce(gk, sl, threads), g, _eachslice(parent(X), Val(keepaxes)), length(parent(X)), threads)
     _assemble(outs, keptdims, trailing)
 end
 
@@ -180,11 +186,11 @@ _leafmeta(proto::TreeTuple)      = (;dims = TreeArrays.dims(proto))
 # call. Say so, instead of a bare `BoundsError` from `first` (snag: empty/zero-leaf).
 _emptyreduce(sl) = error("TreeArrays: cannot reduce a length-0 axis whose elements are TreeData (got a $(typeof(sl)) of $(length(sl))) -- there is no leaf to push the reduction into. Reduce a dim of the LEAVES instead, and keep the empty axis (it melts to zero rows).")
 
-_leafreduce(f, sl::AbstractArray{<:Union{TreeNamedTuple,TreeTuple}}) = begin
+_leafreduce(f, sl::AbstractArray{<:Union{TreeNamedTuple,TreeTuple}}, threads::Bool) = begin
     isempty(sl) && _emptyreduce(sl)
     proto = first(sl)
     ks = keys(parent(proto))
-    fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl)), ks)
+    fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl), threads), ks)
     TreeData(_reassemble(parent(proto), fields), _leafmeta(proto))
 end
 # `sl` is indexed once per ELEMENT here, never once per element per inner position. The
@@ -200,18 +206,19 @@ end
 # incremental accumulator; a slice kernel like `quantile` needs the full gathered slice per inner
 # position, so its peak is irreducible. Nothing is stacked or pivoted -- `ps` holds the parents'
 # own arrays, not a combined copy -- so the no-eager-restructuring invariant is intact.
-_leafreduce(f, sl::AbstractArray{<:TreeData}) = begin
+_leafreduce(f, sl::AbstractArray{<:TreeData}, threads::Bool) = begin
     isempty(sl) && _emptyreduce(sl)   # BEFORE `collect`: there is no `proto` to read
     els = collect(sl)   # the one and only pass over `sl`
     proto = first(els)
     p = parent(proto)
-    p isa AbstractArray || return _leafreduce(f, map(parent, els))  # scalar leaf: reduce directly, no positions
+    p isa AbstractArray || return _leafreduce(f, map(parent, els), threads)  # scalar leaf: reduce directly, no positions
     _assertconformable(els, size(p))   # `els`, never `sl`: re-walking a lazy outer axis is
     ps = map(parent, els)              # exactly the cost `fcb3f9a` removed
-    vals = map(i -> _leafreduce(f, map(P -> P[i], ps)), CartesianIndices(p))
+    # every inner position is an independent gathered slice: threadable like `_reduceouter`'s map
+    vals = _tmap((fk, i) -> _leafreduce(fk, map(P -> P[i], ps), threads), f, CartesianIndices(p), length(p) * length(ps), threads)
     TreeData(vals, meta(proto))
 end
-_leafreduce(f, sl::AbstractArray) = f(sl)
+_leafreduce(f, sl::AbstractArray, threads::Bool) = f(sl)
 
 # The gather above indexes EVERY leaf with `CartesianIndices` of the FIRST leaf's parent. If
 # the leaves have different shapes -- a genuinely ragged nesting whose inner axis was never
@@ -313,7 +320,7 @@ end
 end
 
 """
-    mapslices(f, X::TreeData; dims, coords = false)
+    mapslices(f, X::TreeData; dims, coords = false, threads = false)
 
 Reduce the named `dims` of a tree with `f`, thread every remaining index
 recursively, and return a [`TreeData`](@ref).
@@ -366,6 +373,34 @@ not, deliberately — at this boundary a `hasmethod(f, (slice, coords))` probe i
 true for `maximum` (because `maximum(f, itr)` exists) and would silently treat
 your data slice as a predicate.
 
+# `threads = true` — reduce independent slices on several tasks
+
+Every slice is reduced on its own, so `mapslices` can spread the slices over
+Julia's threads. It does so only when asked: TreeArrays cannot see whether
+*your* kernel is safe to run on two tasks at once, and a kernel that writes to a
+buffer it closes over would race and return plausible-looking wrong numbers.
+
+```julia
+mapslices(X; dims = :draw, threads = true) do y   # reads its slice, shares no state
+    TreeData(:stat => (; lo = minimum(y), hi = maximum(y)))
+end
+```
+
+The result is the serial result, cell for cell: the same kernel computes each
+cell from the same slice and writes it to its own position, nothing is combined
+across slices, and a kernel that throws throws the exception the serial loop
+would have. Work is split into at most `2 * Threads.nthreads()` tasks, and only
+when there is enough of it (tens of thousands of elements per task), so with one
+thread or a small input the reduction stays on the calling task. Dense
+reductions, the gather over a ragged outer axis, and the pooled straddle all
+thread; descending into the children of a ragged node does not (each child
+threads its own slices).
+
+TreeArrays' own reducers — [`quantile`](@ref), `nanquantile`, [`hdi`](@ref),
+[`mean`](@ref), [`sum`](@ref), [`var`](@ref), [`std`](@ref) — know their kernels,
+so they default to `threads = true`; pass `threads = false` to keep one on the
+calling task. Each task gets its own copy of their sort buffer.
+
 # Rules
 
   - Every name in `dims` must exist somewhere in the tree. A name that resolves
@@ -381,13 +416,13 @@ your data slice as a predicate.
 
 See also [`quantile`](@ref), [`@kernel`](@ref), [`selectdim`](@ref).
 """
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims, coords::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims, coords::Bool=false, threads::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
 end
-function _mapslices(f, X::TreeArray, valwant::Val{want}) where want
-    r = _reduceouter(f, X, valwant)
+function _mapslices(f, X::TreeArray, valwant::Val{want}, threads::Bool) where want
+    r = _reduceouter(f, X, valwant, threads)
     isnothing(r) || return r
     alldims = TreeArrays.dims(X)
     # The name exists SOMEWHERE (the public entry proved it) but not on this branch. There is no
@@ -432,31 +467,31 @@ end
 # `_firstsample` (find the first non-`missing` field) is GONE with 1iy1r57: a field that lacks
 # the dim now throws in `_mapslices(::TreeArray)` rather than yielding `missing`, so no field of
 # `newfields` can be `missing` and every field is a valid sample.
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeNamedTuple; dims, coords::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeNamedTuple; dims, coords::Bool=false, threads::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
 end
-function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}) where want
+function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}, threads::Bool) where want
     rec  = outerdim(X)
     inner, ghosts = _splitrecord(TreeArrays.dims(X), Val(name(rec)))   # rec enumerates the fields, not an inner axis
-    newfields = map(v -> _mapslices(f, _aschild(v, inner), valwant), parent(X))   # `_mapslices`: children never re-assert
+    newfields = map(v -> _mapslices(f, _aschild(v, inner), valwant, threads), parent(X))   # `_mapslices`: children never re-assert
     sample = first(newfields)
     have   = map(name, TreeArrays.dims(sample))
     extra  = _exclude(ghosts, Val(have))
     TreeData(newfields, (;dims = (TreeArrays.dims(sample)..., extra...), outer_dim = rec))
 end
 
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims, coords::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims, coords::Bool=false, threads::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)   # a typo, before any structural check can mistake it for a shape
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
 end
-function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}) where want
-    _isstraddle(X, valwant) && return _pooledstraddle(f, X, valwant)   # outer axis + named leaf-inner dims: pool
-    r = _reduceouter(f, X, valwant)
+function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}, threads::Bool) where want
+    _isstraddle(X, valwant) && return _pooledstraddle(f, X, valwant, threads)   # outer axis + named leaf-inner dims: pool
+    r = _reduceouter(f, X, valwant, threads)
     isnothing(r) || return r
-    TreeData(map(el -> _mapslices(f, el, valwant), parent(X)), meta(X))   # `_mapslices`: children never re-assert
+    TreeData(map(el -> _mapslices(f, el, valwant, threads), parent(X)), meta(X))   # `_mapslices`: children never re-assert
 end
 
 # A TreeTuple is the POSITIONAL twin of TreeRaggedArray: a `map(f, ::TreeDim)` container (setdim.jl)
@@ -469,15 +504,15 @@ end
 # a Vector (which references the children, never copies their backing) delegates to it rather than
 # duplicating `_reduceouter` / `_pooledstraddle` for a Tuple parent. A scalar-tuple LEAF has only
 # its outer axis, so that same delegation reduces it as a dense array. (snag nanquantile-tree.)
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeTuple; dims, coords::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeTuple; dims, coords::Bool=false, threads::Bool=false)
     valwant = Val(_dimnames(dims))
     _assertdimsexist(X, valwant)
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
 end
-function _mapslices(f, X::TreeTuple, valwant::Val{want}) where want
+function _mapslices(f, X::TreeTuple, valwant::Val{want}, threads::Bool) where want
     any(nm -> nm in map(name, TreeArrays.dims(X)), want) &&
-        return _mapslices(f, TreeData(collect(parent(X)), meta(X)), valwant)   # outer/straddle: reuse the ragged path
-    TreeData(map(el -> _mapslices(f, el, valwant), parent(X)), meta(X))   # inner-only: recurse per position, keep the Tuple
+        return _mapslices(f, TreeData(collect(parent(X)), meta(X)), valwant, threads)   # outer/straddle: reuse the ragged path
+    TreeData(map(el -> _mapslices(f, el, valwant, threads), parent(X)), meta(X))   # inner-only: recurse per position, keep the Tuple
 end
 
 # A `dims=` that names BOTH this ragged node's outer axis AND a dim living inside its leaves is a
@@ -506,7 +541,7 @@ end
 # means) -- and keeps the loud refusals for everything else: a KEPT outer axis, record/tuple/
 # doubly-ragged leaves, divergent leaf dim structure, and KEPT inner axes that differ in length or
 # coordinates (the never-silently-wrong discipline, decisions 16fwcnx / 1iy1r57).
-function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}) where want
+function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}, threads::Bool) where want
     _refusecoords(f, want)          # a pooled bag has no single aligned coordinate vector
     alldims = TreeArrays.dims(X)
     n_outer = ndims(parent(X))
@@ -530,18 +565,26 @@ function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}) where want
     T      = mapreduce(eltype, promote_type, ps)         # the pooled bag's eltype (what `vcat` would give)
     redaxes = Tuple(i for i in 1:ndims(p) if !(i in keepaxes))
     baglen = sum(P -> _redlen(P, redaxes), ps)           # Σ over leaves; exact at every kept index
-    bag    = Vector{T}(undef, baglen)                     # ONE scratch bag, refilled IN FULL per kept index
+    bag    = Vector{T}(undef, baglen)                     # ONE scratch bag per task, refilled IN FULL per kept index
     if isempty(keepaxes)                                  # every inner axis reduced too: one fully-pooled leaf
-        _assemble(_leafreduce(f, _fillbag!(bag, map(vec, ps))), keptdims, ghosts)
+        _assemble(_leafreduce(f, _fillbag!(bag, map(vec, ps)), threads), keptdims, ghosts)
     else                                                  # keep the un-named inner axes; pool per kept index
         sls  = map(P -> _eachslice(P, Val(keepaxes)), ps)
         inds = CartesianIndices(first(sls))
-        outs = map(inds) do i
-            _leafreduce(f, _fillbag!(bag, (vec(sl[i]) for sl in sls)))
+        outs = _tmap(_PoolKernel(f, bag), inds, baglen * length(inds), threads) do pk, i
+            _leafreduce(pk.f, _fillbag!(pk.bag, (vec(sl[i]) for sl in sls)), threads)
         end
         _assemble(outs, keptdims, ghosts)
     end
 end
+
+# The straddle's kernel state: the kernel plus the pooled bag it is refilled into. The bag is task
+# state exactly like a `_ScratchKernel`'s buffer, so a threaded straddle gives every task its own.
+struct _PoolKernel{F,T}
+    f::F
+    bag::Vector{T}
+end
+_taskcopy(k::_PoolKernel) = _PoolKernel(_taskcopy(k.f), similar(k.bag))
 _redlen(P::AbstractArray, redaxes) = prod(ax -> size(P, ax), redaxes; init=1)
 
 # Fill the shared pooled bag from one contribution per leaf -- no per-leaf allocation, one copy per
