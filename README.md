@@ -121,3 +121,7 @@ full discussion, including a sketch of how TreeArrays could interoperate with
 `v0.1.0`, unregistered, young. Used in anger for PKPD postprocessing, but the API
 is not frozen and some corners are explicitly unfinished (`setdim` is a stub).
 Where a limit exists, the error says so.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
