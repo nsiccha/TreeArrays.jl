@@ -1252,5 +1252,10 @@ _terminalbuild(ctx::BuildCtx, p::TreeData, offset, pn, walk::Bool, fieldpath) = 
 _terminalbuild(ctx::BuildCtx, p, offset, pn, walk::Bool, fieldpath) = ((:value,), (ValueColumn{typeof(p)}(ctx.root, ctx.plan, ctx.n, fieldpath),))
 
 Tables.columns(X::TreeData) = _buildcolumns(X)   # validation lives in `_buildcolumns` -- see there
-Tables.getcolumn(X::TreeData, i::Union{Int,Symbol}) = Tables.getcolumn(Tables.columns(X), i)
+# One method per index type, never one `i::Union{Int,Symbol}`: Tables.jl's own fallbacks
+# `getcolumn(x, ::Int)` / `getcolumn(x, ::Symbol)` are each more specific in the index, so a
+# Union method is AMBIGUOUS on every call -- e.g. `DataFrame` of a plain Array of TreeData,
+# which reads each element through the row interface (snag treedata-getcolu-e82afcfe).
+Tables.getcolumn(X::TreeData, i::Int)     = Tables.getcolumn(Tables.columns(X), i)
+Tables.getcolumn(X::TreeData, nm::Symbol) = Tables.getcolumn(Tables.columns(X), nm)
 Tables.rows(X::TreeData) = Tables.rows(Tables.columns(X))

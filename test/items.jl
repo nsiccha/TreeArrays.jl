@@ -676,6 +676,30 @@ end
         @test Tables.columnnames(Tables.columns(rec)) == (:lower, :median, :upper)
     end
 
+    # snag treedata-getcolu-e82afcfe: one `getcolumn(::TreeData/::TreeTable, ::Union{Int,Symbol})`
+    # method was ambiguous with Tables.jl's `getcolumn(x, ::Int)` / `getcolumn(x, ::Symbol)` on
+    # EVERY call, so a plain Array of reduced trees -- which `DataFrame` / `Tables.columntable`
+    # read element-wise through the ROW interface -- threw a MethodError.
+    @testset "Tables.jl: getcolumn on the tree itself is unambiguous (Int AND Symbol)" begin
+        td = TreeData(reshape(collect(1.0:12.0), 4, 3), :draw => ["d$i" for i in 1:4], :time => [0.0, 0.5, 1.0])
+        r  = quantile(td, :band => (lower=0.05, median=0.5, upper=0.95); dims=(:draw, :time))
+        wide = TreeTable(quantile(td, :band => (lower=0.05, upper=0.95); dims=:draw); wide=:band)
+        for x in (td, r, TreeTable(td), wide)
+            cols = Tables.columns(x)
+            for (i, nm) in enumerate(Tables.columnnames(cols))
+                @test collect(Tables.getcolumn(x, nm)) == collect(Tables.getcolumn(cols, nm))
+                @test collect(Tables.getcolumn(x, i))  == collect(Tables.getcolumn(cols, i))
+            end
+        end
+        # the reported shape: a plain Array of reduced trees, each element read as a ROW
+        ct = Tables.columntable([r, r])
+        @test keys(ct) == Tables.columnnames(Tables.columns(r))
+        @test all(j -> collect(ct.value[j]) == collect(Tables.getcolumn(Tables.columns(r), :value)), 1:2)
+        # no TreeArrays method on ANY Tables.jl function may be ambiguous
+        fnmod(m) = (ft = Base.unwrap_unionall(m.sig).parameters[1]; ft isa DataType ? parentmodule(ft) : nothing)
+        @test isempty([p for p in Test.detect_ambiguities(TreeArrays; recursive=true) if any(m -> fnmod(m) === Tables, p)])
+    end
+
     @testset "Tables.jl: stats_percentiles schema + view columns (stat/population/posterior)" begin
         stats_percentiles = _tt_stats_percentiles()
         @test Tables.istable(typeof(stats_percentiles))
