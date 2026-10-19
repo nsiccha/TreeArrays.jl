@@ -307,5 +307,7 @@ Tables.columns(tt::TreeTable)     = _pivotcolumns(tt)
 Tables.columnnames(tt::TreeTable) = keys(_pivotcolumns(tt))
 Tables.schema(tt::TreeTable)      = (c = _pivotcolumns(tt); Tables.Schema(keys(c), map(eltype, values(c)); stored=true))
 
-Tables.getcolumn(tt::TreeTable, i::Union{Int,Symbol}) = Tables.getcolumn(Tables.columns(tt), i)
-Tables.rows(tt::TreeTable)                            = Tables.rows(Tables.columns(tt))
+# Split by index type for the same reason as `getcolumn(::TreeData, …)` in tables.jl.
+Tables.getcolumn(tt::TreeTable, i::Int)     = Tables.getcolumn(Tables.columns(tt), i)
+Tables.getcolumn(tt::TreeTable, nm::Symbol) = Tables.getcolumn(Tables.columns(tt), nm)
+Tables.rows(tt::TreeTable)                  = Tables.rows(Tables.columns(tt))
