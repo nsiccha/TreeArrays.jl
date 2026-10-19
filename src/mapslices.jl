@@ -249,8 +249,8 @@ end
 #
 # Decidable from the TYPE alone: every dim name is a `TreeDim{N}` type parameter. The walk
 # reports `complete = false` at a non-concrete boundary (a JAGGED nesting hides its children's
-# names), because absence cannot be PROVEN there -- and rejecting a reduce TreeArrays exists to
-# serve would be far worse than missing one typo. So the assert stands down, never guesses.
+# names), so the type alone cannot PROVE absence there. The walk never guesses: an incomplete
+# result sends the caller to the instance (`_absentdims` below).
 _alldimnames(::Type{T}) where T<:TreeData = begin
     isconcretetype(T) || return ((), false)          # jagged: cannot see through, cannot prove absence
     own = map(name, Tuple(fieldtype(fieldtype(T, :meta), :dims).parameters))
@@ -304,15 +304,19 @@ end
 # typo, and returned a plausible result. Absence is always provable -- just not always from the
 # type. Fall back to the instance rather than let a typo through (user, 2026-07-10: "always fail
 # loudly instead of doing something unexpected").
-@noinline function _assertdimsexist(X::TreeData, ::Val{want}) where want
+#
+# `_absentdims` is that decision, shared by every foundALL check (`dims=` here, `selectdim`'s
+# axis lookup): the names in `want` that exist nowhere in `X`, and the names `X` does carry.
+@inline function _absentdims(X::TreeData, ::Val{want}) where want   # inlined: a correct concrete call still folds away
     absent, complete, have = _absentnames(typeof(X), Val(want))
+    (isempty(absent) || complete) && return (absent, have)
+    seen = Tuple(unique(_instancedimnames(X)))     # jagged: the type hid some names, the tree has them
+    (Tuple(filter(nm -> !(nm in seen), collect(want))), seen)
+end
+
+@noinline function _assertdimsexist(X::TreeData, ::Val{want}) where want
+    absent, have = _absentdims(X, Val(want))
     isempty(absent) && return nothing
-    if !complete                                   # jagged: the type hid some names, the tree has them
-        seen = Tuple(unique(_instancedimnames(X)))
-        still = Tuple(filter(nm -> !(nm in seen), collect(want)))
-        isempty(still) && return nothing
-        absent, have = still, seen
-    end
     error("TreeArrays: dims=$(want) names " *
           (length(absent) == 1 ? "a dim that exists" : "dims that exist") *
           " nowhere in this tree: $(absent). Available dims: $(have). " *
