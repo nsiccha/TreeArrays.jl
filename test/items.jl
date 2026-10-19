@@ -1067,6 +1067,88 @@ end
         @test_throws "absent-dim `missing` sentinel" Tables.schema(absentfield)
     end
 
+    # Siblings whose TYPES differ only in STORAGE melt (snag treedata-abstrac-14b2e828):
+    # each shape below must melt to exactly the table of its hand-narrowed twin -- same
+    # names, element types, values and row order -- because the twin is what consumers
+    # used to build by hand before every melt.
+    @testset "Tables.jl: siblings differing only in storage type melt like their concrete twin" begin
+        band = (; q05=0.05, q50=0.5, q95=0.95)
+        function sametable(A, B)
+            ca, cb = Tables.columns(A), Tables.columns(B)
+            Tables.schema(A) == Tables.schema(B) && Tables.columnnames(ca) == Tables.columnnames(cb) &&
+                all(nm -> eltype(Tables.getcolumn(ca, nm)) == eltype(Tables.getcolumn(cb, nm)) &&
+                          isequal(collect(Tables.getcolumn(ca, nm)), collect(Tables.getcolumn(cb, nm))),
+                    Tables.columnnames(ca))
+        end
+        m = reshape(collect(1.0:240.0), 60, 4); tt = collect(range(0, 1, 10))
+        a, b = TreeData(m[1:50, :], :draw, :time_h => tt[1:4]), TreeData(m[11:60, 1:3], :draw, :time_h => tt[1:3])
+        # the comparison itself can fail: a reordered tree is NOT the same table
+        @test !sametable(TreeData([a, b], :s => ["1", "2"]), TreeData([b, a], :s => ["1", "2"]))
+
+        # 1. a homogeneous `TreeData[]` filled in a loop: one concrete child type, abstract eltype
+        v = TreeData[]; push!(v, a); push!(v, b)
+        X, Xc = TreeData(v, :s => ["1", "2"]), TreeData([a, b], :s => ["1", "2"])
+        @test !isconcretetype(eltype(parent(X))) && isconcretetype(eltype(parent(Xc)))
+        @test sametable(X, Xc)
+        @test sametable(TreeTable(X), TreeTable(Xc))
+        @test Tables.columnnames(TreeTable(X)) == Tables.columnnames(TreeTable(Xc))
+
+        # 2. coordinate containers drift: a `view` beside a `Vector` (equal values), before
+        #    and after a reduction -- the reduction keeps the drift, so both must melt
+        c2  = TreeData(m[11:60, :], :draw, :time_h => view(tt, 1:4))
+        c2n = TreeData(m[11:60, :], :draw, :time_h => tt[1:4])
+        Xd, Xdn = TreeData([a, c2], :s => ["1", "2"]), TreeData([a, c2n], :s => ["1", "2"])
+        @test !isconcretetype(eltype(parent(Xd)))
+        @test sametable(Xd, Xdn)
+        @test sametable(nanquantile(Xd, band; dims=:draw), nanquantile(Xdn, band; dims=:draw))
+        @test sametable(TreeTable(nanquantile(Xd, :band => band; dims=:draw); wide=:band),
+                        TreeTable(nanquantile(Xdn, :band => band; dims=:draw); wide=:band))
+
+        # 3. backing drift: a `Matrix` beside a `view`
+        Xb = TreeData([a, TreeData(view(m, 11:60, :), :draw, :time_h => tt[1:4])], :assay => ["A", "B"])
+        @test sametable(Xb, TreeData([a, TreeData(m[11:60, :], :draw, :time_h => tt[1:4])], :assay => ["A", "B"]))
+
+        # 4. a range beside a `Vector`; tuple coordinates of different lengths (types differ by LENGTH)
+        r1 = TreeData(m[1:50, 1:3], :draw, :time_h => 0.0:0.5:1.0)
+        r2 = TreeData(m[1:50, 2:4], :draw, :time_h => [0.0, 0.5, 1.0])
+        @test sametable(TreeData([r1, r2], :s => ["1", "2"]),
+                        TreeData([TreeData(m[1:50, 1:3], :draw, :time_h => [0.0, 0.5, 1.0]), r2], :s => ["1", "2"]))
+        j1, j2 = TreeData(m[1:50, 1:2], :draw, :dose => (10, 20)), TreeData(m[1:50, 3:3], :draw, :dose => (20,))
+        @test sametable(TreeData([j1, j2], :s => ["1", "2"]),
+                        TreeData([TreeData(m[1:50, 1:2], :draw, :dose => [10, 20]),
+                                  TreeData(m[1:50, 3:3], :draw, :dose => [20])], :s => ["1", "2"]))
+
+        # 5. nested: a `TreeData[]` of per-subject reduced trees whose assay coordinates drift
+        #    between subjects (the shape a per-subject loop builds)
+        assays(k) = TreeData([TreeData(view(m, 1:50, :), :draw, :time_h => (k == 1 ? tt[1:4] : view(tt, 1:4)))
+                              for _ in 1:2], :assay_name => ["A1", "A2"])
+        subjects = TreeData[]
+        for k in 1:2; push!(subjects, nanquantile(assays(k), band; dims=:draw)); end
+        @test sametable(TreeData(subjects, :subject_name => ["x", "y"]),
+                        TreeData([nanquantile(assays(1), band; dims=:draw) for _ in 1:2], :subject_name => ["x", "y"]))
+
+        # 6. still lazy: rows scale 100x, the column build does not
+        mk(n) = (w = TreeData[]; for s in 1:4
+                     push!(w, TreeData(randn(n + s), :time => (isodd(s) ? collect(1.0:n+s) : 1.0:n+s)))
+                 end; TreeData(w, :subject))
+        small, big = mk(10), mk(1000)
+        Tables.columns(small); Tables.columns(big)
+        @test (@allocated Tables.columns(big)) <= 4 * (@allocated Tables.columns(small))
+        @test Tables.getcolumn(Tables.columns(big), :value) isa TreeArrays.ValueColumn
+
+        # genuine layout differences are refused BY NAME, never coerced into one column type:
+        # an Int coordinate beside a Float64 one, a different axis name, a different nesting
+        # (same flat columns, but the dims sit at different levels)
+        i1 = TreeData(m[1:50, 1:2], :draw, :t => [1, 2])
+        @test_throws "do not melt to one table" Tables.schema(TreeData([i1, TreeData(m[1:50, 1:2], :draw, :t => [1.0, 2.0])], :s => ["1", "2"]))
+        @test_throws "do not melt to one table" Tables.columns(TreeData([i1, TreeData(m[1:50, 1:2], :draw, :u => [1, 2])], :s => ["1", "2"]))
+        flat = TreeData(m[1:3, 1:2], :draw, :t => [1, 2])
+        nest = TreeData([TreeData(m[d, 1:2], :t => [1, 2]) for d in 1:3], :draw)
+        @test Tables.schema(flat) == Tables.schema(nest)
+        @test_throws "nest their dims differently" Tables.schema(TreeData([flat, nest], :s => ["1", "2"]))
+        @test_throws "nest their dims differently" TreeTable(TreeData([flat, nest], :s => ["1", "2"]); wide=:t)
+    end
+
     # Multi-response outputs (brm-4): two conditional responses on DIFFERENT grids, each
     # reduced over :draw to a :band axis. The blessed pattern is one `TreeTable` per response
     # (long AND wide both work per field); the whole-record / whole-ragged pivots refuse and
@@ -1421,15 +1503,24 @@ end
         end
 
         # A truly ragged GRID (study :B lacks a dose :A has) gives sibling TreeDatas whose
-        # axis lengths differ AS TYPES, so `[a, b]` widens to a non-concrete eltype and the
-        # type-only `_schema` walk hits the ragged tree itself. It used to die with Base's
-        # "type NamedTuple has no field dims"; it must name the real problem.
+        # axis lengths differ AS TYPES, so `[a, b]` widens to a non-concrete eltype that the
+        # type-only `_schema` walk cannot see through. The siblings still share one layout,
+        # so it melts LONG (snag treedata-abstrac-14b2e828) -- one row per (study, dose, band)
+        # cell actually present, each the cell's pooled quantile. Only the `wide=` pivot
+        # still refuses it: the tree is ragged along `:dose_mg`, and a pivot needs one row
+        # shape.
         inner_A = TreeData([TreeData(view(P,:,[1,2]), :draw, :subject), TreeData(view(P,:,[3]), :draw, :subject)],
                            TreeDim(:dose_mg, (10, 20)))
         inner_B = TreeData([TreeData(view(P,:,[4,5,6,7]), :draw, :subject)], TreeDim(:dose_mg, (20,)))
         jagged = quantile(TreeData([inner_A, inner_B], TreeDim(:study, (:A, :B))), :band => spec; dims=(:draw, :subject))
-        @test_throws "ragged trees are not a supported Tables shape" TreeTable(jagged; wide=:band)
-        @test_throws "ragged trees are not a supported Tables shape" Tables.columns(TreeTable(jagged))
+        @test !isconcretetype(eltype(parent(jagged)))
+        @test_throws "not a supported Tables shape under `wide=`" Tables.columns(TreeTable(jagged; wide=:band))
+        jrows = Tables.rowtable(TreeTable(jagged))
+        @test length(jrows) == 3 * length(spec)
+        cellcols = Dict((:A, 10) => [1, 2], (:A, 20) => [3], (:B, 20) => [4, 5, 6, 7])
+        for row in jrows
+            @test row.value ≈ Statistics.quantile(vec(P[:, cellcols[(row.study, row.dose_mg)]]), spec[row.band])
+        end
     end
 
     # `wide=(:a,:b)` widens several axes at once: the cartesian product of their levels

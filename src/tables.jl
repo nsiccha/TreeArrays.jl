@@ -5,7 +5,10 @@
 # computed on access (decision from the user's live steering, 2026-07-06:
 # TA->AoV must never repeat metadata before the final JSON-values boundary).
 # `Tables.columnnames`/`Tables.schema` are computed from the TYPE alone (no
-# instance access at all).
+# instance access at all) wherever the type can answer; below an array/tuple-
+# of-TreeData boundary whose element type is not concrete they read each
+# sibling's storage-free LAYOUT instead (`_meltschema`, snag
+# treedata-abstrac-14b2e828).
 #
 # RAGGED trees melt LONG (snag `ragged-tree-cann`). Long form needs no
 # rectangularity -- each row's coordinate is read from the position it
@@ -20,12 +23,17 @@
 # melt are exactly its rectangular counterpart's, which is why it already
 # reported them correctly while `Tables.columns` refused.
 #
-# Two shapes remain unsupported, both because they are genuinely not
-# expressible rather than merely unbuilt:
-#   * a NON-CONCRETE tree type (siblings whose axis lengths differ AS TYPES
-#     -- a `:dose_mg` axis of `(10, 20)` beside one of `(20,)`). The
-#     type-only schema walk cannot run at all, so there is no static schema
-#     to serve. Caught in `_schema`.
+# A NON-CONCRETE tree type melts too: siblings whose TYPES differ only in
+# storage -- a `TreeData[]` filled in a loop, a `view` coordinate beside a
+# `Vector` one, a `:dose_mg` axis of `(10, 20)` beside one of `(20,)`, a
+# `Matrix` backing beside a `view` -- share one storage-free layout, and
+# `_meltschema` serves that layout's schema (see `_walkable`/`_canon`).
+# Siblings that differ in dim names, kinds, element types or nesting are
+# refused by name there; an EMPTY abstract container (`TreeData(TreeData[],
+# …)`) has no element to read a layout from and is refused by name too.
+#
+# One shape remains unsupported, because it is genuinely not expressible
+# rather than merely unbuilt:
 #   * `TreeTable(x; wide=…)` over a ragged tree. A pivot spreads one axis's
 #     levels into columns, which needs ONE level set and ONE column length;
 #     a ragged axis has neither. Caught in `_pivotcolumns`, and it says so.
@@ -113,20 +121,16 @@ end
 # type, so the type-level walk below succeeds and `_plan` melts them long on the instance.
 # But siblings that differ in axis LENGTH-AS-TYPE -- a `:dose_mg` axis of `(10, 20)` beside
 # one of `(20,)` -- have different `TreeDim` types, so `[a, b]` widens to a non-concrete
-# eltype and the type walk itself hits the ragged tree. `fieldtype(T, :meta)` is then the
-# abstract `NamedTuple` and the next line died with "type NamedTuple has no field dims" --
-# an internal error where this adapter promises a clear one everywhere else.
+# eltype that this walk cannot see through. The melt entry points route such a tree
+# through `_meltschema`, which hands this walk the siblings' agreed concrete LAYOUT
+# (`_canon`, below) instead of the non-concrete type.
 function _schema(::Type{T}) where T<:TreeData
-    # `T` non-concrete has exactly two causes, and consumers hit both. Name them, rather
-    # than letting the accessors below die with Base's "type NamedTuple has no field dims".
-    #   (a) RAGGED: siblings whose axis lengths differ AS TYPES (a `:dose_mg` axis of
-    #       `(10, 20)` beside one of `(20,)`) widen `[a, b]` to a non-concrete eltype.
-    #       Siblings differing only in SIZE share a type, so THEY melt (long) on the
-    #       instance via `_plan`; only this type-level flavour is unsupportable,
-    #       because no static schema can be walked out of a non-concrete type.
-    #   (b) EMPTY: `TreeData(TreeData[], ...)`, the natural-looking empty container, erases
-    #       the child structure this walk reads.
-    isconcretetype(T) || error("TreeArrays Tables adapter: `$T` is not a concrete TreeData type. Either sibling TreeData elements have inconsistent TYPES -- ragged trees are not a supported Tables shape yet (regular/rectangular only) -- or an empty container was spelled `TreeData(TreeData[], ...)` instead of carrying its element type (`TreeData(typeof(leafproto)[], :assay_name => String[])`)")
+    # A non-concrete `T` has no static schema to walk. The melt entry points never
+    # hand one over -- `_meltschema` reads a non-concrete boundary's siblings by
+    # instance and walks their agreed, concrete layout instead -- so reaching this
+    # means a caller asked a bare TYPE. Name it, rather than letting the accessors
+    # below die with Base's "type NamedTuple has no field dims".
+    isconcretetype(T) || error("TreeArrays Tables adapter: `$T` is not a concrete TreeData type, so no schema can be walked from the type alone -- ask the instance (`Tables.schema(x)`), which reads each sibling's layout; an empty container must carry its element type (`TreeData(typeof(leafproto)[], :assay_name => String[])`, not `TreeData(TreeData[], ...)`)")
     P = fieldtype(T, :parent)
     alldims = Tuple(fieldtype(fieldtype(T, :meta), :dims).parameters)
     names, types = _ownschema(T, P, alldims)
@@ -228,6 +232,109 @@ _prefixname(fname::Symbol, sub::Symbol) = sub === :value ? fname : Symbol(fname,
 
 _alldimsof(::Type{T}) where T<:TreeData = Tuple(fieldtype(fieldtype(T, :meta), :dims).parameters)
 _parentof(::Type{T}) where T<:TreeData = fieldtype(T, :parent)
+
+# ---- melt LAYOUT: the instance fallback for a tree whose TYPE cannot answer
+#      (snag treedata-abstrac-14b2e828). ----
+# `_schema` walks the TYPE, so it stops at the first array/tuple-of-TreeData
+# boundary whose element type is not concrete. Siblings land there for reasons
+# that do not change a single column: a `TreeData[]` filled in a loop (one
+# concrete child type behind an abstract eltype), coordinates handed over in
+# different CONTAINERS (`Vector` / `view` / range / a tuple of another length),
+# or backings that differ the same way (`Matrix` beside a `view`). Every
+# reduction accepts those trees; refusing to melt them made consumers narrow
+# vectors and copy coordinates by hand before every melt.
+#
+# A melt reads exactly this much of a type: dim names and kinds, coordinate and
+# backing ELEMENT types, record fields and nesting. `_canontype` keeps all of
+# that and replaces only the containers (`Vector{eltype}` coordinates,
+# `Array{eltype,N}` backings), so two siblings melt alike iff their canonical
+# types are EQUAL, and `_schema` of that type is their shared schema. Where the
+# type still answers (`_walkable`), nothing changes: `_meltschema` takes the
+# type-only `_schema` path untouched. Only below a boundary it cannot see
+# through does `_canon` read the instance -- one `typeof` per sibling, one
+# canonical type per distinct sibling type; O(structure), never O(rows).
+#
+# Agreement is EXACT, never promoted: an `Int` coordinate beside a `Float64`
+# one, a missing axis or a different nesting refuses by name -- a melt that
+# coerced one sibling into another's column type would hand back a
+# valid-looking table the data does not support. Equal canonical types are
+# also what the column builder relies on: it reads every sibling through ONE
+# representative's dim positions (`WalkAxisColumn`'s `S`/`D`), which is sound
+# only when every sibling nests the same way.
+_walkable(::Type{T}) where T<:TreeData = isconcretetype(T) && _walkable(_parentof(T))
+_walkable(::Type{P}) where P<:AbstractArray{<:TreeData} = _walkable(eltype(P))
+_walkable(::Type{P}) where P<:Tuple{TreeData,Vararg{TreeData}} = _walkable(eltype(P))   # "at least one" -- see `_eltype` (types.jl)
+_walkable(::Type{P}) where P<:NamedTuple = all(_walkable, fieldtypes(P))
+_walkable(::Type) = true   # plain array / tuple / scalar leaf
+
+_canontype(::Type{T}) where T<:TreeData = TreeData{_canonparent(_parentof(T)), _canonmeta(fieldtype(T, :meta))}
+_canonparent(::Type{P}) where P<:AbstractArray{<:TreeData} = Array{_canontype(eltype(P)), ndims(P)}
+_canonparent(::Type{P}) where P<:Tuple{TreeData,Vararg{TreeData}} = Vector{_canontype(eltype(P))}
+_canonparent(::Type{P}) where P<:AbstractArray = Array{eltype(P), ndims(P)}
+_canonparent(::Type{Tuple{}}) = Tuple{}   # keeps today's zero-field behaviour exactly
+_canonparent(::Type{P}) where P<:Tuple = Vector{eltype(P)}
+_canonparent(::Type{P}) where P<:NamedTuple = NamedTuple{fieldnames(P), Tuple{map(_canonfield, fieldtypes(P))...}}
+_canonparent(::Type{P}) where P<:TreeData = _canontype(P)   # bookkeeping wrapper
+_canonparent(::Type{P}) where P = P                          # scalar leaf terminal
+_canonfield(::Type{F}) where F<:TreeData = _canontype(F)
+_canonfield(::Type{F}) where F = F
+
+_canonmeta(::Type{M}) where M<:NamedTuple = NamedTuple{fieldnames(M), Tuple{map(_canonmetafield, fieldtypes(M))...}}
+_canonmetafield(::Type{D}) where D<:TreeDim = _canondim(D)
+_canonmetafield(::Type{D}) where D<:Tuple{Vararg{TreeDim}} = Tuple{map(_canondim, fieldtypes(D))...}
+_canonmetafield(::Type{X}) where X = X
+_canondim(::Type{TreeDim{N,M}}) where {N,M} =
+    TreeDim{N, NamedTuple{fieldnames(M), Tuple{map((k, V) -> k === :values ? _canoncoords(V) : V, fieldnames(M), fieldtypes(M))...}}}
+_canoncoords(::Type{V}) where V<:Union{Tuple,AbstractArray,AbstractRange} = Vector{eltype(V)}
+_canoncoords(::Type{V}) where V = V   # `missing` (unlabelled), `nothing` (ghost) or a fixed scalar
+
+# The instance walk, entered only where `_walkable` says the type cannot answer.
+_canon(X::TreeData) = _walkable(typeof(X)) ? _canontype(typeof(X)) :
+    TreeData{_canonnode(parent(X), X), _canonmeta(typeof(meta(X)))}
+_canonnode(p::AbstractArray{<:TreeData}, X) = Array{_canonelems(p, X), ndims(p)}
+_canonnode(p::Tuple{TreeData,Vararg{TreeData}}, X) = Vector{_canonelems(p, X)}
+_canonnode(p::NamedTuple, X) = NamedTuple{keys(p), Tuple{map(_canonfieldof, values(p))...}}
+_canonnode(p::TreeData, X) = _canon(p)
+_canonnode(p, X) = _canonparent(typeof(p))
+_canonfieldof(v::TreeData) = _canon(v)
+_canonfieldof(v) = _canonfield(typeof(v))
+
+# The siblings of one array/tuple-of-TreeData boundary: their common canonical
+# type, or a named refusal. A walkable sibling TYPE canonicalizes the same way for
+# every instance, so each distinct one is computed once (`seen`); a non-walkable
+# sibling is read instance by instance, because what it holds below can differ.
+function _canonelems(p, X)
+    E = eltype(p)
+    _walkable(E) && return _canontype(E)
+    isempty(p) && error("TreeArrays Tables adapter: `$E` is not a concrete TreeData type and this container is EMPTY, so there is no element to read its layout from -- an empty container must carry its element type (`TreeData(typeof(leafproto)[], :assay_name => String[])`, not `TreeData(TreeData[], ...)`)")
+    rep = first(p)
+    C = _canon(rep)
+    seen = _walkable(typeof(rep)) ? Any[typeof(rep)] : Any[]
+    for (k, x) in enumerate(p)
+        k == 1 && continue
+        T = typeof(x)
+        any(S -> S === T, seen) && continue
+        Ck = _canon(x)
+        Ck == C || _layouterror(X, k, C, Ck)
+        _walkable(T) && push!(seen, T)
+    end
+    C
+end
+
+function _layouterror(X, k, C, Ck)
+    axes = map(name, filter(d -> _dimkind(d) === :axis, TreeArrays.dims(X)))
+    (n1, t1), (nk, tk) = _schema(C), _schema(Ck)
+    what = (n1, t1) == (nk, tk) ? "elements 1 and $k melt to the same columns $n1 but nest their dims differently" :
+                                  "element 1 melts to $n1 :: $t1, element $k to $nk :: $tk"
+    error("TreeArrays Tables adapter: the sub-trees along $axes do not melt to one table -- " *
+          "$what. A long melt lays every sibling's rows under ONE set of columns, so siblings may differ in " *
+          "storage (coordinate or backing containers: `Vector` / `view` / range / tuple, `Matrix` / `view`) " *
+          "and in shape, but not in dim names, dim kinds, element types or nesting.")
+end
+
+# The schema a melt serves: type-only wherever the type can answer (unchanged), the
+# instance's agreed layout below a boundary it cannot see through.
+_meltschema(X::TreeData) = _walkable(typeof(X)) ? _schema(typeof(X)) : _schema(_canon(X))
 
 # ---- TYPE-level mirror of `_buildwide` (see its comment for the full
 #      rationale) -- same de-duplication (shared axis/fixed columns from a
@@ -357,7 +464,7 @@ _nrows(p::DensePlan) = prod(p.dims; init=1)
 _nrows(p::RaggedPlan) = @inbounds p.offsets[end]
 
 # arity: how many idx slots this plan fills (identical across a RaggedPlan's
-# siblings -- guaranteed by the concrete-type precondition `_schema` enforces)
+# siblings -- guaranteed by the one-layout precondition `_meltschema` enforces)
 _arity(::DensePlan{K}) where K = K
 _arity(p::RaggedPlan{K}) where K = K + _arity(first(p.plans))
 
@@ -376,8 +483,8 @@ _planequal(a, b) = false
 
 Tables.istable(::Type{<:TreeData}) = true
 Tables.columnaccess(::Type{<:TreeData}) = true
-Tables.columnnames(X::TreeData) = _schema(typeof(X))[1]
-Tables.schema(X::TreeData) = Tables.Schema(_schema(typeof(X))...)
+Tables.columnnames(X::TreeData) = _meltschema(X)[1]
+Tables.schema(X::TreeData) = Tables.Schema(_meltschema(X)...)
 
 # ===================== lazy view columns =====================
 # Three concrete column types (dispatch by type, never a runtime kind tag).
@@ -913,16 +1020,16 @@ struct BuildCtx{R,P}
 end
 
 function _buildcolumns(X::TreeData)
-    # The type-only validation runs HERE, not at the `Tables.columns(::TreeData)`
+    # The schema validation runs HERE, not at the `Tables.columns(::TreeData)`
     # entry point, because `_buildcolumns` has more than one caller: `TreeTable`
     # with no `wide=` dispatches straight to it, and the `wide=` pivot builds the
     # long columns through it too. While a ragged INSTANCE was refused, `_plan`
-    # happened to throw first and masked the gap; now that ragged melts, an
-    # unvalidatable tree (a non-concrete/jagged tree type, whose schema cannot be
-    # walked from the type at all) would have slipped through the `TreeTable`
-    # door and produced columns whose element types are `Any`. One call, cheap
-    # and type-only, covers every door.
-    _schema(typeof(X))
+    # happened to throw first and masked the gap; now that ragged melts, a tree
+    # whose siblings do not share one layout would have slipped through the
+    # `TreeTable` door and produced columns read through the wrong dim
+    # positions. One call -- type-only wherever the type answers, O(structure)
+    # below a non-concrete boundary -- covers every door.
+    _meltschema(X)
     pn = _plan(X)
     n = _nrows(pn.plan)
     n == 0 && return _emptycolumns(X)
@@ -957,10 +1064,10 @@ _fixedcols(ctx, alldims, fixedidx, offset, walk::Bool, fp) =
 # type-derived schema as zero-length, concretely-typed vectors -- a lazy view column
 # carries no information at length 0, so this is not an eager densification (there is no
 # row DATA to densify), and it keeps `Tables.columns` TOTAL on every tree
-# `Tables.schema` accepts. `_schema` is type-only, so the names/types here are the exact
+# `Tables.schema` accepts. Both read `_meltschema`, so the names/types here are the exact
 # ones `Tables.schema` reports -- the two cannot drift.
 function _emptycolumns(X::TreeData)
-    names, types = _schema(typeof(X))
+    names, types = _meltschema(X)
     NamedTuple{names}(map(T -> T[], types))
 end
 

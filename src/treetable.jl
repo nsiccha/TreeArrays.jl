@@ -96,14 +96,14 @@ _widetuple(::Nothing)                   = ()
 
 # every name in `wide` must name a real axis somewhere in the melt -- fail loudly
 # on a typo'd/absent wide-dim, never silently ignore it. Checked against
-# `_schema`, which enumerates every melt column from the TYPE alone, so a dim
-# nested BELOW the top level (the band axis a chained reduction leaves on the
-# leaf -- the whole point of `wide=:band`) validates too, and no instance is
-# touched. Whether that column is a real *axis* (and so has levels to spread)
-# needs the instance, so `_pivotcolumns` re-checks it there.
+# `_meltschema`, which enumerates every melt column (from the TYPE alone wherever
+# the type can answer), so a dim nested BELOW the top level (the band axis a
+# chained reduction leaves on the leaf -- the whole point of `wide=:band`)
+# validates too. Whether that column is a real *axis* (and so has levels to
+# spread) needs the instance, so `_pivotcolumns` re-checks it there.
 function _validatewide(x::TreeData, w::Tuple{Vararg{Symbol}})
     isempty(w) && return
-    have = _schema(typeof(x))[1]
+    have = _meltschema(x)[1]
     for nm in w
         nm in have || error("TreeTable: wide=$(nm) is not a dim of this TreeData (melt columns: $(have))")
     end
@@ -125,9 +125,9 @@ Tables.columnaccess(::Type{<:TreeTable}) = true
 #     exactly this -- delegate straight to it. (Records-wide is one of the
 #     user-sanctioned defaults; an all-long default would be a per-call flag,
 #     a fast-follow.)
-Tables.columns(tt::TreeTable{TX, ()}) where TX   = _buildcolumns(_source(tt))
-Tables.schema(::TreeTable{TX, ()}) where TX      = Tables.Schema(_schema(TX)...)
-Tables.columnnames(::TreeTable{TX, ()}) where TX = _schema(TX)[1]
+Tables.columns(tt::TreeTable{TX, ()}) where TX     = _buildcolumns(_source(tt))
+Tables.schema(tt::TreeTable{TX, ()}) where TX      = Tables.Schema(_meltschema(_source(tt))...)
+Tables.columnnames(tt::TreeTable{TX, ()}) where TX = _meltschema(_source(tt))[1]
 
 # --- wide=(dims...) : spread the named AXES' levels into columns.
 #
