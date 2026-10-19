@@ -38,12 +38,15 @@ allocation:
 subjects = TreeData(map(s -> TreeData(view(mat, :, idx[s]), :draw, :time), 1:n), :subject)
 ```
 
-!!! warning "Siblings must share a *type*, not a *shape*"
-    Differing lengths are exactly what raggedness is. What breaks is differing
-    *types*: give one subject's `:time` coordinates as a 4-`Tuple` and another's
-    as a 3-`Tuple` and the container's eltype widens to something non-concrete,
-    which has no static schema to serve. Use `Vector` coordinates (as above) —
-    every leaf then shares one concrete type and lengths are free to differ.
+!!! note "Siblings share a *layout*, not a *shape* or a *type*"
+    Differing lengths are exactly what raggedness is, and differing *storage*
+    is fine too: one subject's `:time` coordinates as a 4-`Tuple` and another's
+    as a 3-`Tuple`, a `view` beside a `Vector`, or a `TreeData[]` filled in a
+    loop all widen the container's eltype to something non-concrete, and the
+    tree still reduces and melts. What must agree is the layout — dim names and
+    kinds, element types, nesting — and siblings that differ there are refused
+    by name. `Vector` coordinates (as above) keep every leaf one concrete type,
+    which keeps the per-row melt type-stable.
 
 ## Reducing it
 

@@ -168,11 +168,15 @@ the serialization boundary.
 
 Each of these errors clearly rather than producing a silently-wrong table:
 
-- **A concrete tree type.** Sibling subtrees must share a *type*; they need not
-  share a *shape*. What cannot melt is a tree whose axis lengths differ *as
-  types* (a `:dose` axis of `(10, 20)` beside one of `(20,)` widens the container
-  to a non-concrete eltype, so there is no static schema), and
-  `TreeData(TreeData[], …)`, the empty container that erases its element type.
+- **One layout across siblings.** Sibling subtrees must melt to the same
+  columns: the same dim names and kinds, the same coordinate and value element
+  types, the same nesting. They need not share a *shape*, nor a *type*: storage
+  may differ freely — a `TreeData[]` filled in a loop, a `view` coordinate
+  beside a `Vector` one, a `:dose` axis of `(10, 20)` beside one of `(20,)`, a
+  `Matrix` backing beside a `view`. Siblings whose layouts genuinely differ (an
+  `Int` coordinate beside a `Float64` one, a missing axis) are refused by name,
+  never coerced. `TreeData(TreeData[], …)` — an *empty* container that erases
+  its element type — has no element to read a layout from and is refused too.
 - **No `missing` in a leaf or record field.** A reduction can no longer produce
   one; only a hand-built `TreeData(:rec => (; a = 1, b = missing))` still can.
 - **No raw, non-`TreeData` array-valued record field** — it carries no dim labels.
