@@ -127,8 +127,8 @@ end
 @noinline function _noselectaxis(X::TreeArray, nm::Symbol)
     n_ax  = ndims(parent(X))
     outer = ntuple(i -> name(TreeArrays.dims(X)[i]), n_ax)
-    allnames, _ = _alldimnames(typeof(X))
-    nm in allnames && error(
+    absent, _ = _absentdims(X, Val((nm,)))   # instance-backed: a jagged tree's type hides inner names
+    isempty(absent) && error(
         "TreeArrays: selectdim cannot restrict `:$nm` -- it is not one of this tree's selectable " *
         "outer array axes $(outer) (it is a fixed/aggregated dim, or lives inside the leaves/record). " *
         "Selecting an inner or record axis is not implemented yet -- ask TreeArrays.")

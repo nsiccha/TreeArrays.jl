@@ -246,6 +246,22 @@ end
         T = TreeData(randn(3, 4), :a => (:x, :y, :z), :b)
         @test axvals(selectdim(T, :a => in((:x, :z))), 1) === (:x, :z)
         @test size(parent(mean(selectdim(X, :param => pat); dims = :draw))) == (2, 5)
+
+        # An INNER axis is refused by name, never called a typo -- also on a ragged tree whose
+        # children vector is non-concrete (a `TreeData[]` filled in a loop; a `view` coordinate
+        # beside a `Vector` one), where the type hides the leaves' dim names (todo 0vrppnz).
+        tt   = collect(range(0, 1, 10))
+        leaf(t) = TreeData(randn(5, length(t)), :draw, :time_h => t)
+        Rc   = TreeData([leaf(tt[1:4]), leaf(tt[1:4])], :s => ["s1", "s2"])        # concrete eltype
+        v    = TreeData[]; push!(v, leaf(tt[1:4])); push!(v, leaf(tt[1:4]))
+        Ra   = TreeData(v, :s => ["s1", "s2"])                                     # abstract eltype
+        Rv   = TreeData([leaf(tt[1:4]), leaf(view(tt, 1:4))], :s => ["s1", "s2"])  # storage drift
+        @test !isconcretetype(eltype(parent(Ra))) && !isconcretetype(eltype(parent(Rv)))  # the shapes under test
+        for R in (Rc, Ra, Rv)
+            @test_throws "not one of this tree's selectable outer array axes" selectdim(R, :time_h, 1:2)
+            @test_throws "no axis named" selectdim(R, :tmie_h, 1:2)                # a real typo stays one
+            @test length(parent(selectdim(R, :s => ==("s2")))) == 1                # the outer axis still selects
+        end
     end
 
     @testset "outer_dim survives TreeData-forwarding" begin
