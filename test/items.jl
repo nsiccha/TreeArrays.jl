@@ -588,6 +588,19 @@ end
             @test isconcretetype(eltype(parent(r)))                              # the gathered TreeData is concrete
         end
 
+        # A scalar-prob reduction leaves SCALAR-parent leaves, which matched none of `_eltype`'s
+        # aliases and read as `Any`, so chaining nanquantile onto one threw `float(::Type{Any})`
+        # (todo qsk8uh). The leaf eltype is the scalar's own TYPE.
+        @testset "chained nanquantile over a scalar-leaf result (qsk8uh)" begin
+            s = nanquantile(Xq, TreeDim(:median, 0.5); dims=:draw)
+            @test TreeArrays._eltype(parent(s)[1]) === Float64
+            @test TreeArrays._eltype(s) === Float64
+            r = nanquantile(s, TreeDim(:median2, 0.5); dims=:param)   # was: MethodError float(::Type{Any})
+            @test parent(r) isa Float64
+            @test parent(r) == Statistics.quantile([Statistics.quantile(c, 0.5) for c in eachcol(parent(Xq))], 0.5)
+            @test TreeArrays._eltype(TreeData("abc", TreeDim(:k, 1))) === String   # the TYPE, not eltype(String) == Char
+        end
+
         @testset "no per-slice allocation regression (shared scratch, O(1) per slice)" begin
             n_draws, n_cols = 50, 200
             X = TreeData(randn(n_draws, n_cols), :draw, :param)

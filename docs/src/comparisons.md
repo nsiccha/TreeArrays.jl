@@ -82,7 +82,7 @@ that is a genuine reason to prefer DimensionalData.
 | Dim identity in the type | yes | yes (borrowed) |
 | Selectors | rich (`At`, `Near`, `Between`, …) | `selectdim` — Regex / predicate / mask / indices |
 | Scope | general-purpose named arrays; the base of a GIS/raster ecosystem | a narrow **postprocessing / summarization** layer |
-| Maturity | mature, widely used | `v0.1.0`, unregistered, young |
+| Maturity | mature, widely used | `v0.1.1`, unregistered, young |
 
 ### Will TreeArrays supersede DimensionalData?
 

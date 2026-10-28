@@ -78,7 +78,7 @@ per-block kernel quality — not the cost of the individual evaluations.
 
 ## Status
 
-Version `0.1.0`, unregistered, and young. It is used in anger for PKPD
+Version `0.1.1`, unregistered, and young. It is used in anger for PKPD
 postprocessing, but the API is not frozen and some corners are explicitly
 unfinished — [`setdim`](@ref) is still a stub, and a handful of shapes error by
 name rather than being supported. Where a limit exists, the error says so; the

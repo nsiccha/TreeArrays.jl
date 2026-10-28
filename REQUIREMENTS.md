@@ -73,9 +73,9 @@ exists to answer it empirically.
    tuple → tuple along an axis (`14bbwbt` / `xxmv6c`). `TreeArray` **never
    coerces to an internal "array-backed" assumption** — a leaf may be
    non-array-backed (a tuple or scalar parent) and the machinery accommodates
-   it. This is the root of *no eager restructuring* (§1) and the missing-sentinel
-   rule (§7): TreeArrays moves and labels data, it does not silently reshape or
-   re-type it.
+   it. This is the root of *no eager restructuring* (§1) and the
+   never-a-valid-looking-value rule (§7): TreeArrays moves and labels data, it
+   does not silently reshape or re-type it.
 
 ## 4. Core abstractions / types
 
@@ -140,10 +140,13 @@ materialize(X)   # escape hatch: pin a reused block
 
 - **`mapslices` lowering:** `mapslices(f; dims=D)` ≡ `map(f, eachslice(...; over
   complement of D))` — views (no copy) + function barrier (specialize on `f`,
-  concrete eltype). **How a NamedTuple-returning `f`'s results are collected — a
-  pivoted `StructArray` (SoA) vs a kept-as-provided nested structure — is OPEN
-  (§8, `gy3mf8`)**; the shape-faithful principle (§3.6) leans against a silent
-  pivot.
+  concrete eltype). **A NamedTuple-returning `f`'s results are kept as
+  provided, never pivoted into a `StructArray` (SoA):** each slice's record stays
+  a record leaf (`TreeNamedTuple`) at its position, as `quantile(X, p::NamedTuple;
+  dims)` and `hdi` return it. That pivot would be eager restructuring, which the
+  user ruled out ("no eager restructuring (ever)", decision `1uzarfr`); the
+  gather-reduction (`8c44c89`) removed the pivot engine. Wide per-field columns
+  come lazily from the Tables bridge / `TreeTable`, not from a pivoted copy.
 - **`stack` vs `ragged_stack` — two functions for type stability.** Dense-vs-
   ragged is a *runtime* property of block lengths; one polymorphic `stack` would
   return `Union{Dense,Ragged}`. `stack` asserts congruent blocks (errors → points
@@ -190,10 +193,14 @@ dense is a property of the *assembled* time axis, not of `loc`.
   scalar leaf + fixed coordinate; vector `p` → vector leaf + axis; **tuple `p` →
   tuple leaf + axis** (`xxmv6c`). The tree machinery handles the non-array-backed
   leaf; no coercion to a vector.
-- **Absent reduce-dim → `missing`, never a valid-looking value** (`16fwcnx`). A
-  reduction whose requested dim isn't present returns the `missing` sentinel —
-  never a coerced or plausible-but-wrong value. A dedicated `Sentinel` type may
-  replace the bare `missing` later (`13lob71`).
+- **Never a valid-looking value** (`16fwcnx`): a reduction never returns a
+  coerced or plausible-but-wrong value. So an **absent reduce-dim throws**:
+  `dims=` is found-all — every requested name must exist in the tree and in
+  every branch it reaches, and a typo or a branch missing the dim errors by name
+  (decision `1iy1r57`, `d8fceb1`). The `missing` sentinel an absent dim first
+  returned is retired, and so is the `Sentinel` type planned to replace it
+  (`13lob71`, dropped). `missing` still marks an *unlabelled axis*
+  (`TreeDim(:draw)`), an unrelated job.
 
 ## 8. Open questions / decisions
 
@@ -205,10 +212,9 @@ dense is a property of the *assembled* time axis, not of `loc`.
    where is the cutoff to fields?
 4. **`stack` ergonomics** — infer the new axis name/levels purely from inputs'
    fixed coords, or also accept an explicit dim?
-5. **`mapslices` result layout** (`gy3mf8`) — collect a NamedTuple-returning `f`
-   into a pivoted `StructArray` (SoA), or keep the per-slice results as a nested
-   / as-provided structure? The shape-faithful principle (§3.6) leans against the
-   pivot; unresolved.
+5. ~~**`mapslices` result layout**~~ — settled: per-slice results are kept as
+   provided, never pivoted into a `StructArray` (§5 `mapslices` lowering;
+   decision `1uzarfr`, built in `8c44c89`).
 
 ## Appendix — cleanups already spotted in `usage/main.jl`
 
