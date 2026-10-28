@@ -240,6 +240,15 @@ _eltype(X::TreeNamedTuple) = _eltype(first(parent(X)))
 _eltype(X::TreeRaggedArray) = isempty(parent(X)) ?
     _eltype(eltype(parent(X))) :      # no representative -- ask the element type
     _eltype(first(parent(X)))         # a representative exists, and it always answers
+# A SCALAR-parent leaf -- what `quantile(X, TreeDim(:median, 0.5))` builds at each position --
+# is none of the four aliases, and used to fall to the `eltype(x)` fallback below: `Any` for
+# every TreeData, which a chained `nanquantile`'s `float(_eltype(X))` cannot take. Its leaf
+# eltype is the scalar's own TYPE, the terminal `_actualeltfield` and the type walk's `where P`
+# method already use (a `String` leaf is `String`, not `eltype(String) == Char`). A TreeData
+# parent is a wrapper level, so that one recurses by instance like the aliases above.
+_eltype(X::TreeData) = _leafeltype(parent(X))
+_leafeltype(x::TreeData) = _eltype(x)
+_leafeltype(x) = typeof(x)
 _eltype(x) = eltype(x)
 
 # --- the TYPE walk. Reached only from the empty branch above, where no element exists.
