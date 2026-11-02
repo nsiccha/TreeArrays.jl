@@ -118,11 +118,9 @@ full discussion, including a sketch of how TreeArrays could interoperate with
 
 ## Status
 
-`v0.1.2`, unregistered, young. Used in anger for PKPD postprocessing. The public
+`v0.2.0`, unregistered, young. Used in anger for PKPD postprocessing. The public
 surface is listed on the [API page](docs/src/api.md) under "Public API (frozen
-for 1.0)" and guarded by a test; three corners are still being decided before
-1.0 (`setdim` is a stub that errors, the `TreeData(:time)` builder, and
-array-of-structs backings). Where a limit exists, the error says so.
+for 1.0)" and guarded by a test. Where a limit exists, the error says so.
 
 ## License
 

@@ -68,11 +68,12 @@ TreeArrays.dims(D)
 (`df[!, :dose] .= 20`) that TreeArrays exists to retire — it costs O(1), not
 O(rows).
 
-!!! warning "`TreeData(:name)` with no backing array is a *builder*"
-    `TreeData(dims::Symbol...)` curries: it returns a closure
-    `(x, vals...) -> TreeData(x, dims...)`, which is what makes the `map` form in
-    [Ragged data](@ref) work. So `TreeData(:time)` is a constructor waiting for
-    data, not a value. Don't pass it where you meant a constructed tree.
+!!! warning "`TreeData(:name)` with no backing array throws"
+    A `TreeData` always starts from its backing. `TreeData(:time)` alone throws
+    and says so (before 0.2.0 it returned a builder closure: a constructor call
+    that silently gave back a non-tree). To build one tree per item, as
+    [Ragged data](@ref) does, map an explicit closure:
+    `map((v, t) -> TreeData(v, :time => t), values, times)`.
 
 ## Reading the labels back
 

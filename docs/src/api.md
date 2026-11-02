@@ -74,15 +74,22 @@ A test (`test/public_api.jl`) holds the export list to exactly this surface.
   for mmap-backed caches.
 - NaNStatistics: `nanquantile`, as above.
 
-### Being decided before 1.0
+### Settled before 1.0 (0.2.0)
 
-Three corners are exported or documented today and are under review; do not
-build on them until the decision lands and the changelog records it:
+Three corners were decided and closed in 0.2.0:
 
-- `setdim` is an exported stub that errors on every call.
-- `TreeData(:time)` with no backing returns a builder closure for `map`.
-- An `AbstractArray{<:NamedTuple}` backing (an array of structs) matches none
-  of the four leaf shapes and fails late; it may be refused by name instead.
+- `setdim` is gone. It was an exported stub that errored on every call; a
+  lazy re-label / fix-a-dim operation can be added later without a breaking
+  change.
+- `TreeData(:time)` with no backing throws by name. It used to return a
+  builder closure for `map`; write `map((v, t) -> TreeData(v, :time => t), values, times)`.
+- An `AbstractArray{<:NamedTuple}` backing (an array of structs), or a `Tuple`
+  of `NamedTuple`s, is refused by name at construction. Records are stored
+  struct-of-arrays: use
+  `TreeData(:field => (; a = …, b = …), dims...)`, or wrap each element in its
+  own record leaf. The same refusal fires inside `mapslices` and the sweeps
+  when a kernel or cell returns a plain `NamedTuple`: return
+  `TreeData(:stat => nt)` instead.
 
 ### Settled design points
 

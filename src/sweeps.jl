@@ -1,17 +1,7 @@
-unsetdim(X) = X
-
-"""
-    setdim(X::TreeData; kwargs...)
-
-!!! danger "Not implemented"
-    `setdim` is an exported **stub** and always errors. It is kept as a
-    placeholder for re-labelling an axis in place.
-
-    To *restrict* a named axis to a subset of its coordinates, use
-    [`selectdim`](@ref), which does exist and copies no data.
-"""
-setdim(X::TreeData; kwargs...) = error("setdim not implemented")#TreeData(unsetdim(parent(X); kwargs...), (;dims=setdim(meta(X).dims; kwargs...)))
-setdim(dims::Tuple; kwargs...) = error("setdim not implemented")#values(merge(), (;kwargs...))
+# Scenario sweeps: `map` / `stack` over one `TreeDim` or an `Iterators.product` of them
+# (treearrays-use §7a). The exported `setdim` stub that used to live here was removed in
+# 0.2.0 (decision 1c2lsko): a 1.0 does not export a function that throws on every call, and
+# a lazy re-label / fix-a-dim operation can be added later without a breaking change.
 
 # The coordinate values a dim contributes to a sweep. A dim is swept over exactly
 # what it *is*: a collection sweeps its elements, and a scalar is a single fixed
@@ -36,7 +26,9 @@ _sweepvalues(::Symbol, values) = values
     map(f, Iterators.product(dims::TreeDim...))
 
 Build a **scenario sweep**: a [`TreeData`](@ref) whose axes are the swept dims,
-in order, and whose every cell is whatever `f` returns.
+in order, and whose every cell is whatever `f` returns: a scalar or a
+[`TreeData`](@ref). A plain `NamedTuple` cell is refused by name (it would make
+the sweep an array of structs); return `TreeData(:stat => nt)` instead.
 
 `f` receives the **coordinate tuple** (the labels, not data), in dim order — so
 destructure it:

@@ -85,15 +85,20 @@ Build a record with the `name => NamedTuple` form, which names the field axis:
 TreeData(:param => (; alpha = a_matrix, beta = b_matrix), :draw, :chain)
 ```
 
-!!! warning "Currying"
-    `TreeData(:time)` — dim names and **no** backing array — returns a *builder*
-    closure `(x, vals...) -> TreeData(x, :time => vals)`, meant for `map`:
+!!! warning "A backing array is required"
+    `TreeData(:time)` — dim names and **no** backing array — throws by name.
+    (Before 0.2.0 it returned a builder closure: a constructor call that
+    silently gave back a non-tree.) To build one tree per item, map an explicit
+    closure:
 
     ```julia
-    measurement = map(TreeData(:time), per_subject_values, per_subject_times)
+    measurement = map((v, t) -> TreeData(v, :time => t), per_subject_values, per_subject_times)
     ```
 
-    It is not a constructed tree; do not pass it where you meant one.
+    An `AbstractArray{<:NamedTuple}` backing (an array of structs) is refused by
+    name too: records are stored struct-of-arrays. Use the record form
+    `TreeData(:field => (; a = …, b = …), dims...)`, or wrap each element in its
+    own record leaf.
 
 A `TreeData` is deliberately **not** an `AbstractArray` (only the array-backed
 [`TreeArray`](@ref) leaf forwards `size`/`getindex`/`iterate` to its parent). To
@@ -110,9 +115,30 @@ struct TreeData{P,M<:NamedTuple}
 end
 Base.parent(X::TreeData) = getfield(X, :parent)
 meta(X::TreeData) = getfield(X, :meta)
-TreeData(dims::Symbol...) = (x, vals...)->TreeData(x, map(TreeDim, dims, vals)...)
+# `TreeData(:time)` -- dim names, no backing -- used to curry into a builder closure: a
+# constructor call that silently returned a non-tree (todo iukt7; removed in 0.2.0, decision
+# 1c2lsko). Throw by name and show the explicit spelling.
+TreeData(dims::Symbol...) = error(
+    "TreeArrays: `TreeData(" * join(repr.(dims), ", ") * ")` names dims but no backing array. " *
+    "Pass the backing first (`TreeData(x, " * join(repr.(dims), ", ") * ")`); to build one tree " *
+    "per item, map an explicit closure: `map((v, t) -> TreeData(v, :time => t), values, times)`."
+)
 TreeData(x, dims...; kwargs...) = TreeData(x, map(TreeDim, dims)..., map(TreeDim, keys(kwargs), values(kwargs))...)
 TreeData(x, dims::TreeDim...) = TreeData(x, (;dims))
+# An array of structs matches none of the four leaf shapes -- records are struct-of-arrays
+# (`TreeNamedTuple`) -- and used to be accepted here only to fail late and opaquely inside a
+# reduction (`float(::Type{Any})`). Refuse it by name at construction (decision 1c2lsko, 0.2.0);
+# widening into a record-array leaf later would be non-breaking. Internal paths build through
+# the inner `TreeData(parent, meta::NamedTuple)` constructor, which stays permissive.
+# A `Tuple` of NamedTuples is the same shape in positional form (what a `map` sweep over a
+# Tuple-valued dim builds when every cell is a plain NamedTuple), so it is refused alike.
+const _StructsBacking = Union{AbstractArray{<:NamedTuple}, Tuple{NamedTuple, Vararg{NamedTuple}}}
+TreeData(x::_StructsBacking, dims::TreeDim...) = error(
+    "TreeArrays: a `$(typeof(x))` backing (an array or tuple of structs) is not a supported leaf: " *
+    "records are stored struct-of-arrays. Build the record form " *
+    "`TreeData(:field => (; a = …, b = …), dims...)`, or wrap each element in its own record " *
+    "leaf: `TreeData(map(nt -> TreeData(:field => nt), x), dims...)`."
+)
 # a TreeNamedTuple keeps its record axis in the type as a SEPARATE `outer_dim` (which axis
 # enumerates the fields is a property of the container, not of a dim) *and* lists it in
 # `dims` like any other axis, so it's not lost when forwarded (e.g. by `TreeData(X::TreeData, dims...)`).

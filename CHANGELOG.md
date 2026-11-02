@@ -13,6 +13,35 @@ API states the version as its floor, for example `[compat] TreeArrays =
 when it resolves, instead of failing or silently behaving differently at run
 time.
 
+## 0.2.0
+
+Three corners of the surface, listed as "being decided" in 0.1.2, are settled
+(user decision: the TreeArrays agent's recommendations, 2026-11-02). All three
+are **Breaking** for a caller that used the old behaviour; no dependant did.
+
+- **Breaking:** `setdim` is removed. It was an exported stub that errored on
+  every call since `bfc1de6`. A lazy re-label / fix-a-dim operation can be
+  added later without a breaking change; `selectdim` restricts an axis today.
+- **Breaking:** `TreeData(:time)` with dim names and no backing array now
+  throws by name. It used to return a builder closure meant for
+  `map(TreeData(:time), values, times)`, a constructor call that silently gave
+  back a non-tree. Write the closure out:
+  `map((v, t) -> TreeData(v, :time => t), values, times)`.
+- **Breaking:** an `AbstractArray{<:NamedTuple}` backing (an array of structs),
+  or a `Tuple` of `NamedTuple`s, is refused by name at construction. It matched none of the four leaf shapes
+  and failed late inside a reduction (`float(::Type{Any})`). Records are stored
+  struct-of-arrays: build `TreeData(:field => (; a = …, b = …), dims...)`, or
+  wrap each element in its own record leaf,
+  `TreeData(map(nt -> TreeData(:field => nt), x), dims...)`.
+- **Breaking:** the same refusal applies where TreeArrays itself would have
+  built that shape: a `mapslices` kernel, or a `map` / `stack` sweep cell, that
+  returns a plain `NamedTuple` now throws by name instead of gathering into an
+  array of structs that the next reduction could not read. Return
+  `TreeData(:stat => nt)` (a named record leaf, as `quantile(X, p::NamedTuple)`
+  and `hdi` do) or a scalar. `@kernel` already wraps its record and is unchanged.
+- `src/setdim.jl` is renamed `src/sweeps.jl`; it holds only the `map` /
+  `stack` scenario sweeps, which are otherwise unchanged.
+
 ## 0.1.2
 
 - The public API is now listed on the documentation's API page under "Public
