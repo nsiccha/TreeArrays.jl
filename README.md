@@ -122,6 +122,10 @@ full discussion, including a sketch of how TreeArrays could interoperate with
 surface is listed on the [API page](docs/src/api.md) under "Public API (frozen
 for 1.0)" and guarded by a test. Where a limit exists, the error says so.
 
+`benchmark/` and `web/` are developer scaffolding (benchmarks; the KB web
+harness that compares the design options), not part of the package;
+`REQUIREMENTS.md` is the historical design record.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

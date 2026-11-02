@@ -1,9 +1,12 @@
 # TreeArrays.jl — Requirements, Features & Syntax
 
-> Status: design draft, distilled from the `usage/main.jl` exploration. Syntax
-> below is **illustrative** (current sketch + agreed direction), not final — the
-> exact spelling is partly what the DD-exploration / mock-TA step exists to pin
-> down.
+> **This is the historical design record, not the API.** It was written before
+> the package existed (distilled from the `usage/main.jl` exploration) and is
+> kept because the principles, invariants and the DimensionalData position in
+> it still hold. The shipped, semver-frozen surface is `docs/src/api.md`
+> ("Public API (frozen for 1.0)"); where a sketch below differs from it, the API
+> page wins. Lines marked `✗ never shipped` in §5 are spellings that were
+> replaced by the time the package landed.
 
 ## 1. Purpose & scope
 
@@ -105,6 +108,7 @@ exists to answer it empirically.
 
 ```julia
 # Construction — fixed coordinates given as (dim, level) selectors
+# ✗ never shipped as written; today: TreeData(x, :draw, :param => names; random_effect = :in_sample, ...)
 S = TreeArray(randn(n_draws, n_cols),
         (; dims=(draw, param, random_effect.in_sample, placebo.on, space.sampler)))
 
@@ -117,6 +121,7 @@ S = TreeArray(randn(n_draws, n_cols),
 # setdose(X, d) = setdim(X, dose => d)
 
 # Subsetting by a categorical level
+# ✗ never shipped as written; today: selectdim(X, :random_effect => ==(:zero))
 X[random_effect.zero]
 
 # Reductions over named dims — eager kernels; reducing a ragged axis re-densifies
@@ -132,6 +137,9 @@ compute_stats(X) = mapslices(X; dims=:time) do L
 end                                                                  # NamedTuple is refused (0.2.0)
 
 # Assembly — dense stack reads each input's fixed coord, promotes the differing dim
+# ✗ never shipped as written; today a sweep is `map(f, Iterators.product(dims::TreeDim...))`
+# (`stack` is an accepted spelling of that `map`), ragged input stays a ragged tree of
+# views, and there is no `materialize`: `collect` / `Array` copy out when needed.
 stack((S, S0))                                   # → random_effect ∈ (in_sample, zero)
 stack(Iterators.product(doses, placebos)) do dose, placebo
     loc(setplacebo(setdose(P, dose), placebo))   # → dose, placebo axes
