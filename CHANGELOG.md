@@ -13,6 +13,24 @@ API states the version as its floor, for example `[compat] TreeArrays =
 when it resolves, instead of failing or silently behaving differently at run
 time.
 
+## 0.1.2
+
+- The public API is now listed on the documentation's API page under "Public
+  API (frozen for 1.0)", and a test (`test/public_api.jl`) holds the export
+  list to exactly that list. Anything not listed there is internal and may
+  change without notice; that includes `TreeArrays.meta`, `TreeArrays.name`
+  and the layout of a tree's `meta` NamedTuple.
+- `quantile!` is no longer exported. TreeArrays never defined a method for it;
+  the export only re-exported `Statistics.quantile!`, and no dependant used it
+  through TreeArrays. A caller that did adds `using Statistics: quantile!`.
+- The undocumented `Base.cat(X::TreeData...)` method is removed. It wrapped its
+  arguments in a dimension-less `TreeTuple`; nothing used it. Build a positional
+  container with `TreeData((X, Y), :name => (…, …))`, or a sweep with
+  `map(f, TreeDim(...))`.
+- Three corners of the surface are being decided before 1.0 and are marked as
+  such on the API page: the exported `setdim` stub, the `TreeData(:time)`
+  currying builder, and whether an array-of-structs backing is refused by name.
+
 ## 0.1.1
 
 - A reduction with a scalar probability, such as

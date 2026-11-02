@@ -13,8 +13,6 @@ unsetdim(X) = X
 setdim(X::TreeData; kwargs...) = error("setdim not implemented")#TreeData(unsetdim(parent(X); kwargs...), (;dims=setdim(meta(X).dims; kwargs...)))
 setdim(dims::Tuple; kwargs...) = error("setdim not implemented")#values(merge(), (;kwargs...))
 
-Base.cat(X::TreeData...) = TreeData(X)
-
 # The coordinate values a dim contributes to a sweep. A dim is swept over exactly
 # what it *is*: a collection sweeps its elements, and a scalar is a single fixed
 # position, so it contributes ZERO array axes (`Iterators.product` treats a Number

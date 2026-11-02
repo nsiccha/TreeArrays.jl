@@ -39,6 +39,9 @@ end
 TreeDim(N, values) = TreeDim(N, (;values))
 TreeDim(N::Symbol) = TreeDim(N, missing)
 TreeDim((N,values)::Pair) = TreeDim(N, values)
+# `name`, `meta` and `sliced` are INTERNAL accessors (not exported, not part of the public
+# API): read a dim's coordinates with `coords`, a tree's axes with `dims`, its backing
+# with `parent`. Their names and the `meta` NamedTuple's layout may change without notice.
 name(::TreeDim{N}) where N = N
 name(::Type{<:TreeDim{N}}) where N = N
 meta(X::TreeDim) = getfield(X, :meta)
