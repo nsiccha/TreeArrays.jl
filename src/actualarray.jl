@@ -44,6 +44,11 @@ Both draw representations therefore arrive at the *same* array — a dense leaf
 axes in `dims` order, with the record axis trailing — exactly the
 `(draw, chain, param)` shape `ess`/`rhat` want.
 
+A numeric scalar-backed leaf, including a fully reduced result, presents as a
+zero-dimensional array: `size(A) == ()` and `A[] === parent(X)`. Fixed and reduced
+dimensions remain in `dims(A)` without adding physical axes. `parent(X)` reads
+the number directly when an array interface is not needed.
+
 An N-D outer array of **numeric scalar-terminal** trees also presents as a
 numeric array, in the outer array's axis order. This includes a field extracted
 from a NamedTuple quantile reduction:
@@ -106,6 +111,12 @@ dims(A::TreeActualArray) = dims(getfield(A, :tree))
 
 # ---- size: descend, promoting the record axis; enforce homogeneity (ragged/heterogeneous error).
 _actualsize(X::TreeArray) = size(parent(X))     # numeric leaf: real axes ARE parent's axes
+function _actualsize(X::TreeData{<:Number})
+    any(_isaxis, dims(X)) && error(
+        "TreeActualArray: a scalar-backed leaf cannot carry real axes — " *
+        "only fixed dimensions and reduced ghosts are supported")
+    ()
+end
 function _actualsize(X::TreeNamedTuple)
     haskey(meta(X), :outer_dim) || error(
         "TreeActualArray: this TreeNamedTuple has no record axis to promote — build it as " *
@@ -164,6 +175,7 @@ _actualeltfield(v)                 = typeof(v)
 #      the trailing record index, picks that field (homogeneous ⇒ `values(p)[k]` stays
 #      type-stable), and recurses on the remaining inner indices. Nothing is materialized.
 _actualat(X::TreeArray, I::NTuple{M,Int}) where M = parent(X)[I...]
+_actualat(X::TreeData{<:Number}, ::Tuple{}) = parent(X)
 function _actualat(X::TreeNamedTuple, I::NTuple{M,Int}) where M
     inner = ntuple(k -> I[k], Val(M - 1))       # compile-time split — M is a type param
     _actualatfield(values(parent(X))[I[M]], inner)
