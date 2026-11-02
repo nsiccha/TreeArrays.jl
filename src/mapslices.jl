@@ -216,7 +216,7 @@ _leafreduce(f, sl::AbstractArray{<:TreeData}, threads::Bool) = begin
     ps = map(parent, els)              # exactly the cost `fcb3f9a` removed
     # every inner position is an independent gathered slice: threadable like `_reduceouter`'s map
     vals = _tmap((fk, i) -> _leafreduce(fk, map(P -> P[i], ps), threads), f, CartesianIndices(p), length(p) * length(ps), threads)
-    TreeData(vals, meta(proto))
+    TreeData(_refuserecords(vals), meta(proto))
 end
 _leafreduce(f, sl::AbstractArray, threads::Bool) = f(sl)
 
@@ -498,7 +498,7 @@ function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}, threads::Bool) wh
     TreeData(map(el -> _mapslices(f, el, valwant, threads), parent(X)), meta(X))   # `_mapslices`: children never re-assert
 end
 
-# A TreeTuple is the POSITIONAL twin of TreeRaggedArray: a `map(f, ::TreeDim)` container (setdim.jl)
+# A TreeTuple is the POSITIONAL twin of TreeRaggedArray: a `map(f, ::TreeDim)` container (sweeps.jl)
 # whose elements are themselves TreeData, with the swept axis stored in `dims`. It differs from the
 # ragged form only in the PARENT (a Tuple, not an Array) -- deliberate, so heterogeneously-shaped
 # children keep their concrete types. So reducing a dim that lives INSIDE the positional children
@@ -671,5 +671,17 @@ _poolcoordsagree_content(a, b) = false
 # types.jl), so the ghosts trail the child's own axes and no wrapper level is created. `keptdims`
 # is empty in this branch by construction (a single child <=> `keepaxes` empty), so only
 # `trailing` carries dims to merge.
-_assemble(outs, keptdims, trailing)           = TreeData(outs, (;dims = (keptdims..., trailing...)))
+# A kernel that returns a plain NamedTuple per slice would gather into an array of structs:
+# the shape 0.2.0 refuses at construction (decision 1c2lsko), because it matches none of the
+# four leaf aliases and fails late inside the next reduction (`convert(NamedTuple -> Float64)`).
+# Refuse it here too, at the points the gathered results are wrapped, and say what to return.
+# Dispatch on the gathered type, so every other path pays nothing.
+_refuserecords(vals) = vals
+_refuserecords(vals::Union{NamedTuple, AbstractArray{<:NamedTuple}}) = error(
+    "TreeArrays: the kernel returned a plain NamedTuple per slice (" *
+    string(vals isa NamedTuple ? typeof(vals) : eltype(vals)) * "), which would gather into an " *
+    "array of structs -- a shape no reduction can read. Return a named record leaf instead, " *
+    "`TreeData(:stat => (; lo = …, hi = …))` (as `quantile(X, p::NamedTuple)` does with `:quantile`), " *
+    "or a scalar.")
+_assemble(outs, keptdims, trailing)           = TreeData(_refuserecords(outs), (;dims = (keptdims..., trailing...)))
 _assemble(outs::TreeData, keptdims, trailing) = TreeData(outs, keptdims..., trailing...)

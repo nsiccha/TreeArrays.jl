@@ -118,9 +118,13 @@ full discussion, including a sketch of how TreeArrays could interoperate with
 
 ## Status
 
-`v0.1.1`, unregistered, young. Used in anger for PKPD postprocessing, but the API
-is not frozen and some corners are explicitly unfinished (`setdim` is a stub).
-Where a limit exists, the error says so.
+`v0.2.0`, unregistered, young. Used in anger for PKPD postprocessing. The public
+surface is listed on the [API page](docs/src/api.md) under "Public API (frozen
+for 1.0)" and guarded by a test. Where a limit exists, the error says so.
+
+`benchmark/` and `web/` are developer scaffolding (benchmarks; the KB web
+harness that compares the design options), not part of the package;
+`REQUIREMENTS.md` is the historical design record.
 
 ## License
 

@@ -78,11 +78,11 @@ per-block kernel quality — not the cost of the individual evaluations.
 
 ## Status
 
-Version `0.1.1`, unregistered, and young. It is used in anger for PKPD
-postprocessing, but the API is not frozen and some corners are explicitly
-unfinished — [`setdim`](@ref) is still a stub, and a handful of shapes error by
-name rather than being supported. Where a limit exists, the error says so; the
-package tries hard never to return a plausible-looking wrong answer.
+Version `0.2.0`, unregistered, and young. It is used in anger for PKPD
+postprocessing. The public surface is listed on the [API](@ref) page under
+"Public API (frozen for 1.0)" and held there by a test; a handful of shapes
+error by name rather than being supported. Where a limit exists, the error says
+so; the package tries hard never to return a plausible-looking wrong answer.
 
 Install it straight from GitHub:
 

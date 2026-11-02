@@ -1,9 +1,12 @@
 # TreeArrays.jl — Requirements, Features & Syntax
 
-> Status: design draft, distilled from the `usage/main.jl` exploration. Syntax
-> below is **illustrative** (current sketch + agreed direction), not final — the
-> exact spelling is partly what the DD-exploration / mock-TA step exists to pin
-> down.
+> **This is the historical design record, not the API.** It was written before
+> the package existed (distilled from the `usage/main.jl` exploration) and is
+> kept because the principles, invariants and the DimensionalData position in
+> it still hold. The shipped, semver-frozen surface is `docs/src/api.md`
+> ("Public API (frozen for 1.0)"); where a sketch below differs from it, the API
+> page wins. Lines marked `✗ never shipped` in §5 are spellings that were
+> replaced by the time the package landed.
 
 ## 1. Purpose & scope
 
@@ -44,7 +47,7 @@ exists to answer it empirically.
 ## 3. Design principles
 
 1. **Eager compute, lazy assembly.** Transforms (`constrain`, `zero_re`,
-   `setdim`) and summary stats run *now*, in tight type-stable loops, on each
+   `selectdim`) and summary stats run *now*, in tight type-stable loops, on each
    materialized block. The combined matrix is structural; a reduction does
    *materialize one block → eager kernel → discard → next*. No deferred compute
    graph, no per-element closures, no recompute-on-reaccess.
@@ -105,15 +108,20 @@ exists to answer it empirically.
 
 ```julia
 # Construction — fixed coordinates given as (dim, level) selectors
+# ✗ never shipped as written; today: TreeData(x, :draw, :param => names; random_effect = :in_sample, ...)
 S = TreeArray(randn(n_draws, n_cols),
         (; dims=(draw, param, random_effect.in_sample, placebo.on, space.sampler)))
 
-# Set / fix a dimension (lazy override, no copy)
-zero_re(X)    = setdim(X, random_effect.zero)
-constrain(X)  = setdim(X, space.user)
-setdose(X, d) = setdim(X, dose => d)
+# Set / fix a dimension (lazy override, no copy) -- RETIRED: `setdim` was never implemented
+# and its exported stub was removed in 0.2.0 (decision 1c2lsko). Fixed dims are given at
+# construction (`TreeData(x, :draw; dose = 20)`); `selectdim` restricts an axis; a re-label
+# operation can be added later without a breaking change.
+# zero_re(X)    = setdim(X, random_effect.zero)
+# constrain(X)  = setdim(X, space.user)
+# setdose(X, d) = setdim(X, dose => d)
 
 # Subsetting by a categorical level
+# ✗ never shipped as written; today: selectdim(X, :random_effect => ==(:zero))
 X[random_effect.zero]
 
 # Reductions over named dims — eager kernels; reducing a ragged axis re-densifies
@@ -125,10 +133,13 @@ compute_stats(X) = mapslices(X; dims=:time) do L
     trough, peak  = extrema(L)
     baseline      = L[1]
     dtrough,dpeak = extrema(L .- baseline)
-    (; trough, peak, baseline, dtrough, dpeak)
-end
+    TreeData(:stat => (; trough, peak, baseline, dtrough, dpeak))   # a NAMED record leaf; a bare
+end                                                                  # NamedTuple is refused (0.2.0)
 
 # Assembly — dense stack reads each input's fixed coord, promotes the differing dim
+# ✗ never shipped as written; today a sweep is `map(f, Iterators.product(dims::TreeDim...))`
+# (`stack` is an accepted spelling of that `map`), ragged input stays a ragged tree of
+# views, and there is no `materialize`: `collect` / `Array` copy out when needed.
 stack((S, S0))                                   # → random_effect ∈ (in_sample, zero)
 stack(Iterators.product(doses, placebos)) do dose, placebo
     loc(setplacebo(setdose(P, dose), placebo))   # → dose, placebo axes
@@ -224,5 +235,7 @@ dense is a property of the *assembled* time axis, not of `loc`.
 - Undefined helpers used in the sketch: `setre`, `loc`, `doses` / `placebos`,
   `population_quantiles` / `posterior_quantiles`, bare-name dims (`time`,
   `subject`, `draw`).
-- Package core still unimplemented: `setdim`, `stack`, `mapslices` (stub
-  `error()` at `:12`), `Statistics.var` for `TreeArray`.
+- ~~Package core still unimplemented: `setdim`, `stack`, `mapslices` (stub
+  `error()` at `:12`), `Statistics.var` for `TreeArray`.~~ — `stack` (the sweep
+  spelling), `mapslices` and `var` are implemented; `setdim` was retired in
+  0.2.0 instead (see §5).

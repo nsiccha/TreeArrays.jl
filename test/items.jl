@@ -159,7 +159,7 @@ end
     end
 
     @testset "reduce a TreeTuple container: map(f, ::TreeDim) reduces like its product twin (snag nanquantile-tree)" begin
-        # `map(f, ::TreeDim)` (setdim.jl) builds a TreeTuple whose ELEMENTS are TreeData -- the
+        # `map(f, ::TreeDim)` (sweeps.jl) builds a TreeTuple whose ELEMENTS are TreeData -- the
         # single-axis twin of the product-swept TreeRaggedArray above. It must reduce identically.
         # Reporter's exact shape: an outer :covariate TreeTuple of aligned dense TreeArray leaves.
         mk() = map(Iterators.product(TreeDim(:parameter, ("Vc",)), TreeDim(:draw, Base.OneTo(2)),
@@ -203,12 +203,6 @@ end
         # a scalar-tuple LEAF (a quantile band result) still reduces its own positional axis.
         band = quantile(TreeData(randn(50), :draw), TreeDim(:band, (0.1, 0.5, 0.9)); dims = :draw)
         @test parent(band) isa Tuple && mean(band; dims = :band) isa TreeData
-    end
-
-    @testset "setdim stubs throw instead of silently no-oping" begin
-        X = TreeData(randn(4,3), :draw, :param)
-        @test (try; setdim(X; foo=:bar); false; catch; true; end)                # was: silently returned X unchanged
-        @test (try; setdim((:draw, :param); foo=:bar); false; catch; true; end)  # was: bare error() with no message
     end
 
     @testset "selectdim — restrict a named axis by a label predicate (snag named-axis-label)" begin
@@ -909,7 +903,7 @@ end
         n_measurements = [3, 5, 3, 3]   # subject 2 differs -- ragged
         times = [sort(randn(n)) for n in n_measurements]
         vals  = [randn(n) for n in n_measurements]
-        ragged = TreeData(map(TreeData(:time), vals, times), :subject)
+        ragged = TreeData(map((v, t) -> TreeData(v, :time => t), vals, times), :subject)
 
         @test Tables.schema(ragged) isa Tables.Schema   # type-only -- physically cannot see instance raggedness
         @test Tables.schema(ragged).names == (:subject, :time, :value)
@@ -968,7 +962,7 @@ end
         # cannot be read off one representative, so it walks.
         dtimes = [sort(randn(3)) for _ in 1:4]
         dvals  = [randn(3) for _ in 1:4]
-        differing = TreeData(map(TreeData(:time), dvals, dtimes), :subject)
+        differing = TreeData(map((v, t) -> TreeData(v, :time => t), dvals, dtimes), :subject)
         @test Tables.schema(differing) isa Tables.Schema   # schema still succeeds -- type-only
         dcols = Tables.columns(differing)
         @test length(Tables.getcolumn(dcols, :value)) == 12

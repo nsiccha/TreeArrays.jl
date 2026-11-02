@@ -12,7 +12,7 @@ include("mapslices.jl")
 include("properties.jl")
 include("reducers.jl")
 include("kernel.jl")
-include("setdim.jl")
+include("sweeps.jl")
 include("selectdim.jl")
 include("tables.jl")
 include("treetable.jl")
@@ -23,8 +23,7 @@ export TreeDim, TreeData, TreeArray, TreeNamedTuple, TreeRaggedArray, TreeTuple
 export TreeActualArray
 export TreeTable
 export dims, outerdim, coords
-export mapslices, mean, sum, std, var, quantile, quantile!, hdi
+export mapslices, mean, sum, std, var, quantile, hdi
 export @kernel
-export setdim
 
 end # module TreeArrays

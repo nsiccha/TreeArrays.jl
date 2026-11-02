@@ -23,12 +23,11 @@ Random.seed!(1)
 times = [[0.5, 1.0, 2.0, 4.0], [0.5, 1.5, 4.0], [1.0, 2.0, 3.0, 4.0, 5.0]]
 values = [randn(length(t)) for t in times]
 
-rag = TreeData(map(TreeData(:time), values, times), :subject => ["s1", "s2", "s3"])
+rag = TreeData(map((v, t) -> TreeData(v, :time => t), values, times), :subject => ["s1", "s2", "s3"])
 ```
 
-This is where the currying footgun from [Getting started](@ref) becomes the
-feature: `TreeData(:time)` is a *builder*, so `map` applies it pairwise and each
-subject ends up carrying **its own** `:time` coordinates.
+The closure builds one leaf per subject, so each subject ends up carrying
+**its own** `:time` coordinates.
 
 Nothing was copied. If your series already live as columns of a shared matrix,
 build the leaves from `view`s and the ragged tree is pure structure over that one
