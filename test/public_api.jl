@@ -43,7 +43,7 @@ end
     recs = [(; a = 1.0, b = 2.0), (; a = 3.0, b = 4.0)]
     e = try; TreeData(recs, :draw); nothing; catch err; err; end
     @test e isa ErrorException
-    @test occursin("array of structs", e.msg)
+    @test occursin("array or tuple of structs", e.msg)
     @test occursin("TreeData(:field => (; a = …, b = …), dims...)", e.msg)
     @test_throws ErrorException TreeData(recs, TreeDim(:draw))
     @test_throws ErrorException TreeData(recs)
