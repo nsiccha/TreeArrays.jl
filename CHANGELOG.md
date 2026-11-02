@@ -13,6 +13,15 @@ API states the version as its floor, for example `[compat] TreeArrays =
 when it resolves, instead of failing or silently behaving differently at run
 time.
 
+## 0.2.1
+
+- `TreeActualArray` now exposes numeric scalar-backed leaves, including fully
+  reduced results, as zero-dimensional, read-only array views. `A[]` reads the
+  stored scalar without copying; `parent(A)` retains the tree and `dims(A)`
+  preserves fixed and reduced dimensions. `collect(A)` and `Array(A)` produce
+  independent zero-dimensional arrays. Scalar leaves claiming real axes fail
+  descriptively instead of silently dropping those axes.
+
 ## 0.2.0
 
 Three corners of the surface, listed as "being decided" in 0.1.2, are settled

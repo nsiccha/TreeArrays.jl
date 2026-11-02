@@ -214,6 +214,23 @@ A dense leaf `TreeData(arr3d, :draw, :chain, :param => names)` and that record
 give the **same** array, so `ess(A)`/`rhat(A)` work whichever way the draws are
 held. `parent(A)` recovers the tree, `dims(A)` its dimension metadata.
 
+A fully reduced numeric leaf is a **zero-dimensional array view** (TreeArrays
+0.2.1 and later). It works whether the scalar came from a reduction or was
+wrapped directly as `TreeData(1.0)`:
+
+```@example tab
+med = quantile(draws.mu, TreeDim(:median, 0.5); dims=(:draw, :chain))
+scalar = TreeActualArray(med)
+(size(scalar), scalar[], scalar[] === parent(med))
+```
+
+`dims(scalar)` retains fixed labels and reduced ghosts; neither adds a physical
+axis. Fully reduced record fields, such as
+`quantile(draws.mu, (q50=0.5,); dims=(:draw, :chain)).q50`, work the same way.
+Use `parent(med)` when you need the number itself. `collect(scalar)` and
+`Array(scalar)` make independent zero-dimensional arrays. A scalar backing
+cannot represent a real axis, so such inconsistent metadata is refused by name.
+
 An outer grid of numeric scalar-terminal trees also has a lazy numeric view.
 For example, extract one field from a NamedTuple quantile result and pass it
 directly to an array consumer:
