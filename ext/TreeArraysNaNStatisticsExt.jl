@@ -17,40 +17,40 @@ using Statistics: quantile!
 # All-NaN slice returns NaN at every quantile level, matching NaNStatistics'
 # own convention (nanquantile(all-NaN, q) === NaN, verified against
 # NaNStatistics.jl's `_nanquantile!` source).
-function NaNStatistics.nanquantile(X::TreeData, pdim::TreeDim; dims, threads::Bool=true)
-    _nanquantile(X, pdim, promote_type(float(_eltype(X)), Float64); dims, threads)
+function NaNStatistics.nanquantile(X::TreeData, pdim::TreeDim; dims, threads::Bool=true, align=nothing)
+    _nanquantile(X, pdim, promote_type(float(_eltype(X)), Float64); dims, threads, align)
 end
 
 # `T` is a real type parameter here (not a captured runtime variable) so the
 # all-NaN branch stays concretely inferred -- inlining it back into the
 # caller reintroduces per-slice allocation (verified).
-function _nanquantile(X::TreeData, pdim::TreeDim, ::Type{T}; dims, threads) where T
+function _nanquantile(X::TreeData, pdim::TreeDim, ::Type{T}; dims, threads, align) where T
     p = meta(pdim).values
-    TreeArrays.mapslices(_ScratchKernel(s -> TreeData(_nanquantile!(s, p, T), pdim), _eltype(X)), X; dims, threads)
+    TreeArrays.mapslices(_ScratchKernel(s -> TreeData(_nanquantile!(s, p, T), pdim), _eltype(X)), X; dims, threads, align)
 end
 
 # NamedTuple `p` -- same NaN-compaction, packed into a WIDE record leaf
 # (mirrors TreeArrays' own `Statistics.quantile(X, p::NamedTuple; dims)`).
-function NaNStatistics.nanquantile(X::TreeData, p::NamedTuple; dims, threads::Bool=true)
-    _nanquantile(X, p, promote_type(float(_eltype(X)), Float64); dims, threads)
+function NaNStatistics.nanquantile(X::TreeData, p::NamedTuple; dims, threads::Bool=true, align=nothing)
+    _nanquantile(X, p, promote_type(float(_eltype(X)), Float64); dims, threads, align)
 end
 
-function _nanquantile(X::TreeData, p::NamedTuple, ::Type{T}; dims, threads) where T
+function _nanquantile(X::TreeData, p::NamedTuple, ::Type{T}; dims, threads, align) where T
     k = _ScratchKernel(s -> TreeData(:quantile => NamedTuple{keys(p)}(_nanquantile!(s, values(p), T))), _eltype(X))
-    TreeArrays.mapslices(k, X; dims, threads)
+    TreeArrays.mapslices(k, X; dims, threads, align)
 end
 
 # name<->prob spec `:band => (median=0.5, ...)` (mirrors Statistics.quantile's Pair method,
 # decision e18kfn/A'): NaN-compacted, emitted as a Symbol-labeled band AXIS (keys=names) computed
 # from the probs (values) -- the reduce-to-a-named-axis path for `TreeTable(wide=:band)`.
-function NaNStatistics.nanquantile(X::TreeData, (nm, spec)::Pair{Symbol, <:NamedTuple}; dims, threads::Bool=true)
-    _nanquantile(X, nm, spec, promote_type(float(_eltype(X)), Float64); dims, threads)
+function NaNStatistics.nanquantile(X::TreeData, (nm, spec)::Pair{Symbol, <:NamedTuple}; dims, threads::Bool=true, align=nothing)
+    _nanquantile(X, nm, spec, promote_type(float(_eltype(X)), Float64); dims, threads, align)
 end
 
-function _nanquantile(X::TreeData, nm::Symbol, spec::NamedTuple, ::Type{T}; dims, threads) where T
+function _nanquantile(X::TreeData, nm::Symbol, spec::NamedTuple, ::Type{T}; dims, threads, align) where T
     pdim  = TreeDim(nm, keys(spec))
     probs = values(spec)
-    TreeArrays.mapslices(_ScratchKernel(s -> TreeData(_nanquantile!(s, probs, T), pdim), _eltype(X)), X; dims, threads)
+    TreeArrays.mapslices(_ScratchKernel(s -> TreeData(_nanquantile!(s, probs, T), pdim), _eltype(X)), X; dims, threads, align)
 end
 
 # The shared slice body of all three spellings: `s` is the kernel's own scratch, already filled

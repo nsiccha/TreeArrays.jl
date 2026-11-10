@@ -1,6 +1,6 @@
 # ===================== reducers =====================
 """
-    mean(X::TreeData; dims = nothing, threads = true)
+    mean(X::TreeData; dims = nothing, threads = true, align = nothing)
 
 Mean over the named `dims`, delegating to [`mapslices`](@ref) — so it composes
 with the whole reduction machinery, ragged trees included.
@@ -16,18 +16,23 @@ Like every built-in reducer, it spreads independent slices over Julia's
 threads when there is enough work (`threads = false` keeps it on the calling
 task); the result is identical either way. See *Threads* in
 [`mapslices`](@ref).
+
+On a ragged tree whose leaves label a kept axis differently (participants with
+different numbers of trials), reducing the outer axis refuses unless `align`
+says how to match the labels: `align = :union` or `align = :intersect`. Every
+built-in reducer takes it; see *`align`* in [`mapslices`](@ref).
 """
-Statistics.mean(X::TreeData; dims=nothing, threads::Bool=true) =
-    isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims, threads)
+Statistics.mean(X::TreeData; dims=nothing, threads::Bool=true, align=nothing) =
+    isnothing(dims) ? mean(parent(X)) : mapslices(mean, X; dims, threads, align)
 
 """
-    sum(X::TreeData; dims = nothing, threads = true)
+    sum(X::TreeData; dims = nothing, threads = true, align = nothing)
 
 Sum over the named `dims`, delegating to [`mapslices`](@ref). `dims = nothing`
 (the default) reduces the whole tree to a scalar. See [`mean`](@ref).
 """
-Base.sum(X::TreeData; dims=nothing, threads::Bool=true) =
-    isnothing(dims) ? sum(parent(X)) : mapslices(sum, X; dims, threads)
+Base.sum(X::TreeData; dims=nothing, threads::Bool=true, align=nothing) =
+    isnothing(dims) ? sum(parent(X)) : mapslices(sum, X; dims, threads, align)
 
 # std / var mirror mean/sum: delegate to mapslices, so they compose with the whole reduction
 # machinery -- a purely-inner reduce, a dense multi-axis pool, AND the ragged (:draw,:chain)
@@ -41,7 +46,7 @@ Base.sum(X::TreeData; dims=nothing, threads::Bool=true) =
 # reductions. The closure `v -> var(v; corrected)` still specializes `mapslices` on its concrete
 # type (§5) -- it forwards a Bool, it does not dispatch per element.
 """
-    var(X::TreeData; dims = nothing, corrected = true, threads = true)
+    var(X::TreeData; dims = nothing, corrected = true, threads = true, align = nothing)
 
 Variance over the named `dims`, delegating to [`mapslices`](@ref).
 
@@ -55,16 +60,16 @@ reductions.
 `mean =` is deliberately not forwarded: one precomputed mean cannot apply across
 the per-slice reductions. `threads` as in [`mean`](@ref).
 """
-Statistics.var(X::TreeData; corrected::Bool=true, dims=nothing, threads::Bool=true) =
-    isnothing(dims) ? var(parent(X); corrected) : mapslices(v -> var(v; corrected), X; dims, threads)
+Statistics.var(X::TreeData; corrected::Bool=true, dims=nothing, threads::Bool=true, align=nothing) =
+    isnothing(dims) ? var(parent(X); corrected) : mapslices(v -> var(v; corrected), X; dims, threads, align)
 
 """
-    std(X::TreeData; dims = nothing, corrected = true, threads = true)
+    std(X::TreeData; dims = nothing, corrected = true, threads = true, align = nothing)
 
 Standard deviation over the named `dims`. Same contract as [`var`](@ref).
 """
-Statistics.std(X::TreeData; corrected::Bool=true, dims=nothing, threads::Bool=true) =
-    isnothing(dims) ? std(parent(X); corrected) : mapslices(v -> std(v; corrected), X; dims, threads)
+Statistics.std(X::TreeData; corrected::Bool=true, dims=nothing, threads::Bool=true, align=nothing) =
+    isnothing(dims) ? std(parent(X); corrected) : mapslices(v -> std(v; corrected), X; dims, threads, align)
 
 # quantile delegates to mapslices; pdim bundles the output axis name + values,
 # kept EXACTLY as given (Tuple stays Tuple, Vector stays Vector, Number stays
@@ -74,15 +79,16 @@ Statistics.std(X::TreeData; corrected::Bool=true, dims=nothing, threads::Bool=tr
 # quantile leaf feeds a CHAINED quantile call. One sort buffer per task (`_ScratchKernel`,
 # threading.jl): one per call on the serial path.
 """
-    quantile(X::TreeData, pdim::TreeDim; dims, threads = true)
-    quantile(X::TreeData, p::NamedTuple; dims, threads = true)
-    quantile(X::TreeData, name => spec::NamedTuple; dims, threads = true)
+    quantile(X::TreeData, pdim::TreeDim; dims, threads = true, align = nothing)
+    quantile(X::TreeData, p::NamedTuple; dims, threads = true, align = nothing)
+    quantile(X::TreeData, name => spec::NamedTuple; dims, threads = true, align = nothing)
 
 Quantiles over the named `dims`, computing **every level in one sorted pass**
 (a reused sort buffer). Never loop `quantile` once per level. Independent slices
 run on Julia's threads when there is enough work, with identical results;
 `threads = false` keeps the reduction on the calling task (see *Threads* in
-[`mapslices`](@ref)).
+[`mapslices`](@ref)). `align = :union | :intersect` pools ragged leaves whose
+kept axis differs, by label (see *`align`* in [`mapslices`](@ref)).
 
 The second argument decides both the levels and the *shape* of the output:
 
@@ -120,9 +126,9 @@ The second argument decides both the levels and the *shape* of the output:
 
 See also [`mapslices`](@ref), [`TreeTable`](@ref), [`TreeDim`](@ref).
 """
-function Statistics.quantile(X::TreeData, pdim::TreeDim; dims, threads::Bool=true)
+function Statistics.quantile(X::TreeData, pdim::TreeDim; dims, threads::Bool=true, align=nothing)
     p = meta(pdim).values
-    mapslices(_ScratchKernel(s -> TreeData(quantile!(s, p), pdim), _eltype(X)), X; dims, threads)
+    mapslices(_ScratchKernel(s -> TreeData(quantile!(s, p), pdim), _eltype(X)), X; dims, threads, align)
 end
 
 # a NamedTuple `p` packs the SAME one-pass quantile! computation into a WIDE
@@ -131,9 +137,9 @@ end
 # wide-emit. `:quantile` is the record axis's own name -- cosmetic/`show`-only
 # post-wide-emit (the field-key column it would have produced in long mode is
 # exactly what the wide Tables melt drops).
-function Statistics.quantile(X::TreeData, p::NamedTuple; dims, threads::Bool=true)
+function Statistics.quantile(X::TreeData, p::NamedTuple; dims, threads::Bool=true, align=nothing)
     k = _ScratchKernel(s -> TreeData(:quantile => NamedTuple{keys(p)}(quantile!(s, values(p)))), _eltype(X))
-    mapslices(k, X; dims, threads)
+    mapslices(k, X; dims, threads, align)
 end
 
 # A name<->prob spec `:band => (median=0.5, q025=0.025, ...)` reduces to a band AXIS labeled by the
@@ -143,10 +149,10 @@ end
 # `:band` column: orientation stays a VIEW choice (decision e18kfn / option A'), unlike the
 # `p::NamedTuple` record method above which bakes WIDE at reduction time. Same one-pass
 # reused-scratch quantile! as the TreeDim form; the probs are consumed here, not retained on the axis.
-function Statistics.quantile(X::TreeData, (nm, spec)::Pair{Symbol, <:NamedTuple}; dims, threads::Bool=true)
+function Statistics.quantile(X::TreeData, (nm, spec)::Pair{Symbol, <:NamedTuple}; dims, threads::Bool=true, align=nothing)
     pdim  = TreeDim(nm, keys(spec))
     probs = values(spec)
-    mapslices(_ScratchKernel(s -> TreeData(quantile!(s, probs), pdim), _eltype(X)), X; dims, threads)
+    mapslices(_ScratchKernel(s -> TreeData(quantile!(s, probs), pdim), _eltype(X)), X; dims, threads, align)
 end
 
 # Highest-density intervals (the brms/bambi-style summary): the SHORTEST interval holding at
@@ -175,7 +181,7 @@ end
 
 """
     hdi(y::AbstractVector, mass = 0.9)
-    hdi(X::TreeData; dims, mass = 0.9, threads = true)
+    hdi(X::TreeData; dims, mass = 0.9, threads = true, align = nothing)
 
 The highest-density interval: the **shortest** interval holding at least `mass`
 of the draws. Endpoints are always draws (no interpolation); tied widths resolve
@@ -199,12 +205,12 @@ slice containing `NaN`, throws. Drop NaNs first (`filter(!isnan, y)`) or reduce
 a NaN-free tree.
 """
 hdi(y::AbstractVector, mass=0.9) = (_checkhdimass(mass); _hdi_sorted!(sort(y), mass))
-function hdi(X::TreeData; dims, mass=0.9, threads::Bool=true)
+function hdi(X::TreeData; dims, mass=0.9, threads::Bool=true, align=nothing)
     _checkhdimass(mass)
     k = _ScratchKernel(_eltype(X)) do s
         sort!(s)
         (; lower, upper) = _hdi_sorted!(s, mass)
         TreeData(:hdi => (; lower, upper))
     end
-    mapslices(k, X; dims, threads)
+    mapslices(k, X; dims, threads, align)
 end

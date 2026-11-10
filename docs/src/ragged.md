@@ -61,7 +61,10 @@ reductions are ordinary dense reductions.
 
 Reducing the **outer** axis is not forbidden either — it pushes the axis down to
 the leaves as a streaming gather (pure index arithmetic on a gathered slice) and
-recurses. Nothing is materialized on the way.
+recurses. Nothing is materialized on the way. It pools position `k` of every
+leaf, so the leaves must agree on every kept axis — same length **and** same
+labels. Leaves that do not are refused by name, unless you say how to match
+them ([`align`](@ref ragged-align) below).
 
 A coordinate-aware kernel works here too, and this is the case that motivates
 `coords = true` in the first place — the grid genuinely differs per subject, so
@@ -104,12 +107,65 @@ Three requirements, each of which errors by name rather than pooling wrongly:
 - **Every named outer axis must be reduced.** Pooling one outer axis while
   *keeping* another (a 2-D grid of ragged cells) is not implemented.
 - **The kept inner axes must be conformable across leaves** — here every chain
-  shares `:param`. A kept axis that is itself ragged is refused.
+  shares `:param`. A kept axis that is itself ragged is refused, unless `align`
+  says how to match it ([next section](@ref ragged-align)).
 - **Leaves must be array-backed.** Pooling across a record, tuple, or
-  doubly-ragged leaf is not implemented — reduce the inner dims first.
+  doubly-ragged leaf is not implemented — select one field first (`X.field`
+  maps over the leaves), or reduce the inner dims first.
 
 A purely *inner* multi-dim reduce (`dims = (:time, :channel)`, neither of them the
 outer axis) never touches the pooling path; it just reduces inside each leaf.
+
+## [When the kept axis differs: `align`](@id ragged-align)
+
+Participants in a behavioural experiment rarely all complete the same number of
+trials. Every participant then has its own `:trial` axis:
+
+```@example rag
+trials = [6, 6, 4, 5]
+participants = TreeData([TreeData(randn(200, 2, n), :draw, :chain, :trial => 1:n) for n in trials],
+                        :participant => 1:4)
+nothing # hide
+```
+
+A band per trial across participants pools `:draw`, `:chain` and `:participant`
+while **keeping** `:trial`, and `:trial` differs between the leaves. There is
+no single right answer to "the band at trial 6" here: only two of the four
+participants reached it. So the reduction refuses unless you say how to match
+the trials, with `align`:
+
+```@example rag
+band = quantile(participants, (lower = 0.025, median = 0.5, upper = 0.975);
+                dims = (:draw, :chain, :participant), align = :union)
+```
+
+- `align = :union` — every trial any participant has; at each, pool the
+  participants that have it. Later trials rest on fewer participants.
+- `align = :intersect` — only the trials every participant has (here 1–4).
+
+The same keyword works when only the outer axis is reduced, for example the
+posterior of the mean across participants, trial by trial:
+
+```@example rag
+mean_traj = mean(participants; dims = :participant, align = :union)
+quantile(mean_traj, (lower = 0.025, upper = 0.975); dims = (:draw, :chain))
+```
+
+How many participants went into each trial is one more reduction, counted on a
+tree that has one trajectory per participant:
+
+```@example rag
+per_participant = mean(participants; dims = (:draw, :chain))
+mapslices(length, per_participant; dims = :participant, align = :union)
+```
+
+Labels are matched by **value**, never by position. So subjects sampled at
+different times pool only at the times they share, an unlabelled axis that
+would need aligning throws (give it coordinates, `:trial => 1:n`), and so does
+a label repeated within one leaf. The aligned axis is sorted when every leaf's
+labels are ascending numbers; otherwise labels appear in the order first met.
+When the leaves already agree, `align` changes nothing. Every built-in reducer
+takes it, and so does `mapslices`.
 
 ## Derived quantities per chain, before the pool
 

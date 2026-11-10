@@ -44,14 +44,15 @@ A test (`test/public_api.jl`) holds the export list to exactly this surface.
 
 ### Reductions and selection
 
-- [`mapslices`](@ref): `mapslices(f, X; dims, coords = false, threads = false)`.
+- [`mapslices`](@ref): `mapslices(f, X; dims, coords = false, threads = false, align = nothing)`.
 - [`mean`](@ref), [`sum`](@ref), [`std`](@ref), [`var`](@ref):
-  `(X; dims = nothing, threads = true)`; `std` and `var` take `corrected = true`.
+  `(X; dims = nothing, threads = true, align = nothing)`; `std` and `var` take
+  `corrected = true`.
 - [`quantile`](@ref): `quantile(X, TreeDim(name, levels); dims)`,
   `quantile(X, p::NamedTuple; dims)`, `quantile(X, name => p::NamedTuple; dims)`,
-  each with `threads = true`. `nanquantile` has the same three forms through the
+  each with `threads = true, align = nothing`. `nanquantile` has the same three forms through the
   NaNStatistics extension.
-- [`hdi`](@ref): `hdi(y, mass = 0.9)` and `hdi(X; dims, mass = 0.9, threads = true)`.
+- [`hdi`](@ref): `hdi(y, mass = 0.9)` and `hdi(X; dims, mass = 0.9, threads = true, align = nothing)`.
 - [`@kernel`](@ref): `@kernel (:reduces => :into) function f(slice) ... end`,
   the `(slice, coords)` form, and the post-hoc form on an existing function.
 - [`selectdim`](@ref): `selectdim(X, name => selector)` and
