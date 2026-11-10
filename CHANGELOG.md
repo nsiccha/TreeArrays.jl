@@ -13,6 +13,28 @@ API states the version as its floor, for example `[compat] TreeArrays =
 when it resolves, instead of failing or silently behaving differently at run
 time.
 
+## 0.2.2
+
+- New keyword `align = nothing | :union | :intersect` on `mapslices` and every
+  built-in reducer (`mean`, `sum`, `var`, `std`, `quantile`, `hdi`,
+  `nanquantile`). It says how a reduction over a ragged tree's outer axis handles
+  a **kept** axis whose labels differ between the leaves, for example
+  participants with different numbers of trials. `:union` pools, at every label
+  any leaf carries, the leaves that carry it; `:intersect` keeps only the labels
+  every leaf carries. Labels are matched by value, never by position. The
+  default still refuses by name, and the message now names `align`.
+- Fix: reducing a ragged tree's outer axis **alone** (`dims = :subject`) checked
+  only that the leaves had the same size. Leaves with the same size but
+  different labels (subject 1 sampled at `t = 1.0`, subject 2 at `t = 1.5`) were
+  pooled position by position under the first leaf's labels, with no error. That
+  now refuses by name, unless `align` is given. The pooled reduction
+  (`dims = (:draw, :subject)`) already checked labels.
+- Fix: reducing a ragged tree's outer axis whose leaves are records with array
+  fields gathered the whole field arrays instead of their elements. `mean`, `sum`
+  and `std` happened to work on whole arrays; `quantile`, `hdi` and custom
+  kernels such as `maximum` threw. Such fields are now reduced position by
+  position.
+
 ## 0.2.1
 
 - `TreeActualArray` now exposes numeric scalar-backed leaves, including fully

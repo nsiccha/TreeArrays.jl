@@ -144,7 +144,7 @@ _refusecoords(::_NeedsCoords, want) = throw(ArgumentError(
 # Returns `nothing` when `want` doesn't hit a real axis here -> the caller decides what that
 # means (a true leaf -> sentinel/idempotent re-slice; an intermediate node -> recurse deeper
 # into each element).
-function _reduceouter(f, X, valwant::Val{want}, threads::Bool) where want
+function _reduceouter(f, X, valwant::Val{want}, threads::Bool, align) where want
     alldims = TreeArrays.dims(X)
     n_ax    = ndims(parent(X))
     @assert all(_isaxis, alldims[1:n_ax]) "_reduceouter assumes the first $n_ax dims of $(typeof(X)) are exactly the parent array's axes, positionally, in order; got a non-axis dim at position $(findfirst(!_isaxis, alldims[1:n_ax])) (dims = $(map(name, alldims)))"
@@ -153,8 +153,8 @@ function _reduceouter(f, X, valwant::Val{want}, threads::Bool) where want
     # AFTER `foundany`: a branch that reduces nothing here must not bind (and must not demand
     # coordinates from) an axis it isn't touching -- the ragged recursion re-enters per element.
     g = _bindcoords(f, alldims, Val(n_ax), valwant)
-    outs = isempty(keepaxes) ? _leafreduce(g, parent(X), threads) :
-        _tmap((gk, sl) -> _leafreduce(gk, sl, threads), g, _eachslice(parent(X), Val(keepaxes)), length(parent(X)), threads)
+    outs = isempty(keepaxes) ? _leafreduce(g, parent(X), threads, align) :
+        _tmap((gk, sl) -> _leafreduce(gk, sl, threads, align), g, _eachslice(parent(X), Val(keepaxes)), length(parent(X)), threads)
     _assemble(outs, keptdims, trailing)
 end
 
@@ -186,13 +186,37 @@ _leafmeta(proto::TreeTuple)      = (;dims = TreeArrays.dims(proto))
 # call. Say so, instead of a bare `BoundsError` from `first` (snag: empty/zero-leaf).
 _emptyreduce(sl) = error("TreeArrays: cannot reduce a length-0 axis whose elements are TreeData (got a $(typeof(sl)) of $(length(sl))) -- there is no leaf to push the reduction into. Reduce a dim of the LEAVES instead, and keep the empty axis (it melts to zero rows).")
 
-_leafreduce(f, sl::AbstractArray{<:Union{TreeNamedTuple,TreeTuple}}, threads::Bool) = begin
+_leafreduce(f, sl::AbstractArray{<:Union{TreeNamedTuple,TreeTuple}}, threads::Bool, align) = begin
     isempty(sl) && _emptyreduce(sl)
     proto = first(sl)
     ks = keys(parent(proto))
-    fields = map(k -> _leafreduce(f, map(el -> parent(el)[k], sl), threads), ks)
-    TreeData(_reassemble(parent(proto), fields), _leafmeta(proto))
+    fields = map(k -> _leafreduce(f, map(el -> _fieldleaf(el, k), sl), threads, align), ks)
+    TreeData(_reassemble(parent(proto), fields), _recordmeta(proto, fields, align))
 end
+# A record leaf's field is either a TreeData (it knows its own dims) or a RAW backing value. A raw
+# numeric ARRAY field shares the record's inner axes, so it is gathered as a child leaf over those
+# axes -- exactly as `_mapslices(::TreeNamedTuple)` wraps it (`_aschild`) -- and the gather below
+# then reduces it position by position. Gathering the raw arrays themselves handed the kernel a
+# Vector of whole arrays: `mean` averaged them elementwise by accident and every other kernel
+# failed (`quantile` threw `convert(Float64, ::Array)`). Raw scalars (a reduced record's fields)
+# stay raw: one scalar per leaf is already the slice the kernel wants.
+_fieldleaf(el, k) = parent(el)[k]
+_fieldleaf(el::TreeNamedTuple, k) = _wrapfield(parent(el)[k], el)
+_wrapfield(v, el) = v
+_wrapfield(v::AbstractArray{<:Number}, el) =
+    _aschild(v, first(_splitrecord(TreeArrays.dims(el), Val(name(outerdim(el))))))
+# The record's own dims are its prototype's -- unless `align=` re-labelled an inner axis in the
+# fields, in which case the record must carry the fields' aligned axis, not leaf 1's labels.
+_recordmeta(proto, fields, ::Nothing) = _leafmeta(proto)
+function _recordmeta(proto, fields, ::Symbol)
+    m = _leafmeta(proto)
+    i = findfirst(x -> x isa TreeData, fields)
+    i === nothing && return m
+    fd = TreeArrays.dims(fields[i])
+    merge(m, (; dims = map(d -> _alignedtwin(d, fd), m.dims)))
+end
+_alignedtwin(d, fd) = (j = findfirst(e -> name(e) === name(d) && _isaxis(e), fd);
+                       _isaxis(d) && j !== nothing ? fd[j] : d)
 # `sl` is indexed once per ELEMENT here, never once per element per inner position. The
 # distinction is invisible for an `Array` parent (`sl[j]` is a load) but decides the cost of a
 # LAZY parent -- `TreeRaggedArray`'s `P<:AbstractArray{<:TreeData}` admits an index-backed array
@@ -206,37 +230,125 @@ end
 # incremental accumulator; a slice kernel like `quantile` needs the full gathered slice per inner
 # position, so its peak is irreducible. Nothing is stacked or pivoted -- `ps` holds the parents'
 # own arrays, not a combined copy -- so the no-eager-restructuring invariant is intact.
-_leafreduce(f, sl::AbstractArray{<:TreeData}, threads::Bool) = begin
+_leafreduce(f, sl::AbstractArray{<:TreeData}, threads::Bool, align) = begin
     isempty(sl) && _emptyreduce(sl)   # BEFORE `collect`: there is no `proto` to read
     els = collect(sl)   # the one and only pass over `sl`
     proto = first(els)
     p = parent(proto)
-    p isa AbstractArray || return _leafreduce(f, map(parent, els), threads)  # scalar leaf: reduce directly, no positions
-    _assertconformable(els, size(p))   # `els`, never `sl`: re-walking a lazy outer axis is
-    ps = map(parent, els)              # exactly the cost `fcb3f9a` removed
+    p isa AbstractArray || return _leafreduce(f, map(parent, els), threads, align)  # scalar leaf: reduce directly, no positions
+    # `els`, never `sl`: re-walking a lazy outer axis is exactly the cost `fcb3f9a` removed.
+    # A non-conformable outer axis refuses (align=nothing: `_alignedgather(..., ::Nothing)` throws,
+    # so the default path's return type is untouched) or pools by label (align=:union/:intersect).
+    _conformable(els, proto) || return _alignedgather(f, els, proto, threads, align)
+    ps = map(parent, els)
     # every inner position is an independent gathered slice: threadable like `_reduceouter`'s map
-    vals = _tmap((fk, i) -> _leafreduce(fk, map(P -> P[i], ps), threads), f, CartesianIndices(p), length(p) * length(ps), threads)
+    vals = _tmap((fk, i) -> _leafreduce(fk, map(P -> P[i], ps), threads, align), f, CartesianIndices(p), length(p) * length(ps), threads)
     TreeData(_refuserecords(vals), meta(proto))
 end
-_leafreduce(f, sl::AbstractArray, threads::Bool) = f(sl)
+_leafreduce(f, sl::AbstractArray, threads::Bool, align) = f(sl)
 
-# The gather above indexes EVERY leaf with `CartesianIndices` of the FIRST leaf's parent. If
-# the leaves have different shapes -- a genuinely ragged nesting whose inner axis was never
-# collapsed -- that reads the wrong cells out of the longer leaves and drops their tail
-# entirely, returning a plausible-looking wrong answer with no error at all. Reducing a ragged
-# OUTER axis is only meaningful once the leaves are conformable (treearrays-use §8: collapse
-# the inner ragged axis FIRST, which is what makes the subsequent outer reduce dense). Say so.
-function _assertconformable(sl, sz)
-    for (j, el) in pairs(sl)
-        p = parent(el)
-        p isa AbstractArray && size(p) == sz && continue
-        got = p isa AbstractArray ? string(size(p)) : "a scalar leaf"
-        throw(DimensionMismatch(
-            "cannot reduce the outer axis of a ragged tree whose leaves are not conformable: " *
-            "leaf 1 has size " * string(sz) * " but leaf " * string(j) * " has " * got * ". " *
-            "Collapse the ragged inner axis first (e.g. `mapslices(f, X; dims=:time)`), then " *
-            "reduce the outer axis."))
+# The gather above indexes EVERY leaf with `CartesianIndices` of the FIRST leaf's parent and
+# labels the result with the FIRST leaf's axes. So it is only meaningful when every leaf has the
+# same SIZE (else it reads the wrong cells out of the longer leaves and drops their tails) AND the
+# same LABELS on every axis (else position k pools different labels -- subject 1's t = 1.0 with
+# subject 2's t = 1.5 -- under leaf 1's label: a plausible-looking wrong answer with no error).
+# The size check is the original `_assertconformable`; the label check closes the second hole,
+# with the same agreement rule the pooled straddle already uses (`_poolcoordsagree`).
+function _conformable(els, proto)
+    p1 = parent(proto)
+    d1 = TreeArrays.dims(proto)
+    for el in els
+        q = parent(el)
+        q isa AbstractArray && size(q) == size(p1) || return false
+        dq = TreeArrays.dims(el)
+        for a in 1:ndims(p1)
+            _poolcoordsagree(meta(dq[a]).values, meta(d1[a]).values) || return false
+        end
     end
+    true
+end
+
+const _ALIGNHINT = "Pass `align = :union` (pool, at every label any leaf carries, the leaves that carry " *
+    "it) or `align = :intersect` (keep only the labels every leaf carries) to pool by label"
+
+# align=nothing: say which leaf breaks conformability and how, and name the two ways out.
+function _alignedgather(f, els, proto, threads::Bool, ::Nothing)
+    p1 = parent(proto)
+    d1 = TreeArrays.dims(proto)
+    for (j, el) in enumerate(els)
+        q = parent(el)
+        if !(q isa AbstractArray && size(q) == size(p1))
+            got = q isa AbstractArray ? string(size(q)) : "a scalar leaf"
+            throw(DimensionMismatch(
+                "cannot reduce the outer axis of a ragged tree whose leaves are not conformable: " *
+                "leaf 1 has size " * string(size(p1)) * " but leaf " * string(j) * " has " * got * ". " *
+                "Collapse the ragged inner axis first (e.g. `mapslices(f, X; dims=:time)`), then " *
+                "reduce the outer axis. " * _ALIGNHINT * "."))
+        end
+        dq = TreeArrays.dims(el)
+        for a in 1:ndims(p1)
+            _poolcoordsagree(meta(dq[a]).values, meta(d1[a]).values) && continue
+            throw(DimensionMismatch(
+                "cannot reduce the outer axis of a ragged tree whose leaves are not conformable: " *
+                "leaf " * string(j) * " labels its `:" * string(name(d1[a])) * "` axis differently from " *
+                "leaf 1, so pooling position by position would mix different `:" * string(name(d1[a])) *
+                "` values under leaf 1's labels. " * _ALIGNHINT * ", or collapse `:" *
+                string(name(d1[a])) * "` first."))
+        end
+    end
+    error("TreeArrays internal: _alignedgather reached with conformable leaves")
+end
+
+# align=:union / :intersect: pool, per output label (combination), the leaves that carry it.
+function _alignedgather(f, els, proto, threads::Bool, align::Symbol)
+    p1  = parent(proto)
+    nd  = ndims(p1)
+    ref = map(d -> name(d) => _dimkind(d), TreeArrays.dims(proto))
+    for (j, el) in enumerate(els)
+        q = parent(el)
+        q isa AbstractArray && ndims(q) == nd || throw(ArgumentError(
+            "cannot align the leaves of a ragged tree (align=:" * string(align) * "): leaf " * string(j) *
+            " is " * (q isa AbstractArray ? "rank-" * string(ndims(q)) : "not array-backed") *
+            " where leaf 1 is a rank-" * string(nd) * " array. Aligning needs every leaf at the same rank."))
+        sig = map(d -> name(d) => _dimkind(d), TreeArrays.dims(el))
+        sig == ref || throw(ArgumentError(
+            "cannot align the leaves of a ragged tree (align=:" * string(align) * "): leaf " * string(j) *
+            " carries dims " * string(map(first, sig)) * " where leaf 1 carries " * string(map(first, ref)) *
+            ". Aligning needs every leaf to carry the same dim structure."))
+    end
+    plan = ntuple(a -> _alignaxis(map(el -> TreeArrays.dims(el)[a], els),
+                                  map(el -> size(parent(el), a), els), align), nd)
+    maps = map(x -> x[2], plan)
+    ps   = map(parent, els)
+    T    = mapreduce(eltype, promote_type, ps)
+    inds = CartesianIndices(map(x -> x[3], plan))
+    multi = ndims(els) > 1   # several reduced outer axes: a subset of leaves is no longer a grid
+    vals = _tmap(f, inds, length(inds) * length(ps), threads) do fk, I
+        js = Int[]
+        vs = T[]
+        for j in eachindex(ps)
+            loc = _localidx(maps, j, I)
+            loc === nothing && continue
+            push!(js, j)
+            push!(vs, ps[j][loc])
+        end
+        isempty(js) && _noleafat(map(first, plan), I, align)
+        _leafreduce(_coordsubset(fk, js, multi), vs, threads, align)
+    end
+    d1 = TreeArrays.dims(proto)
+    TreeData(_refuserecords(vals), merge(meta(proto), (; dims = (map(first, plan)..., d1[nd+1:end]...))))
+end
+
+# A `coords=true` kernel reducing the outer axis was bound to that axis's labels (`_bindcoords`).
+# Under `align=` only some leaves contribute at an output position, so the kernel must see THEIR
+# labels, in the same order as the values it receives -- never the full axis.
+_coordsubset(f, js, multi::Bool) = f
+function _coordsubset(g::_WithCoords, js, multi::Bool)
+    multi && throw(ArgumentError(
+        "cannot hand a kernel axis coordinates (`coords=true`) while aligning a ragged tree reduced " *
+        "over several outer axes at once: the leaves that carry a label no longer form a grid. " *
+        "Reduce one outer axis at a time."))
+    _WithCoords(g.f, g.coords[js])
 end
 
 # ===================== `dims=` is foundALL, not foundany (decision 1iy1r57) =====================
@@ -324,7 +436,7 @@ end
 end
 
 """
-    mapslices(f, X::TreeData; dims, coords = false, threads = false)
+    mapslices(f, X::TreeData; dims, coords = false, threads = false, align = nothing)
 
 Reduce the named `dims` of a tree with `f`, thread every remaining index
 recursively, and return a [`TreeData`](@ref).
@@ -405,6 +517,36 @@ TreeArrays' own reducers — [`quantile`](@ref), `nanquantile`, [`hdi`](@ref),
 so they default to `threads = true`; pass `threads = false` to keep one on the
 calling task. Each task gets its own copy of their sort buffer.
 
+# `align` — pool ragged leaves whose kept axis differs
+
+Reducing a ragged tree's outer axis — alone (`dims = :participant`) or pooled
+together with inner dims (`dims = (:draw, :chain, :participant)`) — keeps the
+leaves' other axes and pools position `k` of every leaf together. That needs
+every leaf to mean the same thing at `k`: each kept axis must have the same
+length **and the same labels** in every leaf. When it does not — participants
+with different numbers of trials, subjects sampled at different times — the
+reduction refuses by name unless `align` says how to match the labels:
+
+  - `align = :union` — every label any leaf carries; at each, pool the leaves
+    that carry it. How many leaves are pooled can change along the axis.
+  - `align = :intersect` — only the labels every leaf carries.
+
+```julia
+X = TreeData([TreeData(randn(1000, 4, n), :draw, :chain, :trial => 1:n) for n in (30, 25, 28)],
+             :participant => 1:3)
+quantile(X, (lower = 0.025, upper = 0.975); dims = (:draw, :chain, :participant), align = :union)
+mean(X; dims = :participant, align = :intersect)          # draw × chain × trial 1:25
+```
+
+Labels are matched by **value**, never by position, so an unlabelled axis that
+would need aligning, and a label repeated within one leaf, throw. The aligned
+axis is the sorted union when every leaf's labels are ascending numbers, and
+otherwise lists the labels in the order first met, leaf by leaf. When the leaves
+already agree, `align` changes nothing. A `coords = true` kernel reducing the
+outer axis sees only the labels of the leaves pooled at that position. To count
+them, reduce each leaf first and count across the outer axis:
+`mapslices(length, mean(X; dims = (:draw, :chain)); dims = :participant, align = :union)`.
+
 # Rules
 
   - Every name in `dims` must exist somewhere in the tree. A name that resolves
@@ -420,13 +562,14 @@ calling task. Each task gets its own copy of their sort buffer.
 
 See also [`quantile`](@ref), [`@kernel`](@ref), [`selectdim`](@ref).
 """
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims, coords::Bool=false, threads::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims, coords::Bool=false, threads::Bool=false, align=nothing)
     valwant = Val(_dimnames(dims))
+    _checkalign(align)
     _assertdimsexist(X, valwant)
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads, align)
 end
-function _mapslices(f, X::TreeArray, valwant::Val{want}, threads::Bool) where want
-    r = _reduceouter(f, X, valwant, threads)
+function _mapslices(f, X::TreeArray, valwant::Val{want}, threads::Bool, align) where want
+    r = _reduceouter(f, X, valwant, threads, align)
     isnothing(r) || return r
     alldims = TreeArrays.dims(X)
     # The name exists SOMEWHERE (the public entry proved it) but not on this branch. There is no
@@ -471,31 +614,33 @@ end
 # `_firstsample` (find the first non-`missing` field) is GONE with 1iy1r57: a field that lacks
 # the dim now throws in `_mapslices(::TreeArray)` rather than yielding `missing`, so no field of
 # `newfields` can be `missing` and every field is a valid sample.
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeNamedTuple; dims, coords::Bool=false, threads::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeNamedTuple; dims, coords::Bool=false, threads::Bool=false, align=nothing)
     valwant = Val(_dimnames(dims))
+    _checkalign(align)
     _assertdimsexist(X, valwant)
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads, align)
 end
-function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}, threads::Bool) where want
+function _mapslices(f, X::TreeNamedTuple, valwant::Val{want}, threads::Bool, align) where want
     rec  = outerdim(X)
     inner, ghosts = _splitrecord(TreeArrays.dims(X), Val(name(rec)))   # rec enumerates the fields, not an inner axis
-    newfields = map(v -> _mapslices(f, _aschild(v, inner), valwant, threads), parent(X))   # `_mapslices`: children never re-assert
+    newfields = map(v -> _mapslices(f, _aschild(v, inner), valwant, threads, align), parent(X))   # `_mapslices`: children never re-assert
     sample = first(newfields)
     have   = map(name, TreeArrays.dims(sample))
     extra  = _exclude(ghosts, Val(have))
     TreeData(newfields, (;dims = (TreeArrays.dims(sample)..., extra...), outer_dim = rec))
 end
 
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims, coords::Bool=false, threads::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeRaggedArray; dims, coords::Bool=false, threads::Bool=false, align=nothing)
     valwant = Val(_dimnames(dims))
+    _checkalign(align)
     _assertdimsexist(X, valwant)   # a typo, before any structural check can mistake it for a shape
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads, align)
 end
-function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}, threads::Bool) where want
-    _isstraddle(X, valwant) && return _pooledstraddle(f, X, valwant, threads)   # outer axis + named leaf-inner dims: pool
-    r = _reduceouter(f, X, valwant, threads)
+function _mapslices(f, X::TreeRaggedArray, valwant::Val{want}, threads::Bool, align) where want
+    _isstraddle(X, valwant) && return _pooledstraddle(f, X, valwant, threads, align)   # outer axis + named leaf-inner dims: pool
+    r = _reduceouter(f, X, valwant, threads, align)
     isnothing(r) || return r
-    TreeData(map(el -> _mapslices(f, el, valwant, threads), parent(X)), meta(X))   # `_mapslices`: children never re-assert
+    TreeData(map(el -> _mapslices(f, el, valwant, threads, align), parent(X)), meta(X))   # `_mapslices`: children never re-assert
 end
 
 # A TreeTuple is the POSITIONAL twin of TreeRaggedArray: a `map(f, ::TreeDim)` container (sweeps.jl)
@@ -508,15 +653,16 @@ end
 # a Vector (which references the children, never copies their backing) delegates to it rather than
 # duplicating `_reduceouter` / `_pooledstraddle` for a Tuple parent. A scalar-tuple LEAF has only
 # its outer axis, so that same delegation reduces it as a dense array. (snag nanquantile-tree.)
-Base.@constprop :aggressive function Base.mapslices(f, X::TreeTuple; dims, coords::Bool=false, threads::Bool=false)
+Base.@constprop :aggressive function Base.mapslices(f, X::TreeTuple; dims, coords::Bool=false, threads::Bool=false, align=nothing)
     valwant = Val(_dimnames(dims))
+    _checkalign(align)
     _assertdimsexist(X, valwant)
-    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads)
+    _mapslices(_wantcoords(f, Val(coords)), X, valwant, threads, align)
 end
-function _mapslices(f, X::TreeTuple, valwant::Val{want}, threads::Bool) where want
+function _mapslices(f, X::TreeTuple, valwant::Val{want}, threads::Bool, align) where want
     any(nm -> nm in map(name, TreeArrays.dims(X)), want) &&
-        return _mapslices(f, TreeData(collect(parent(X)), meta(X)), valwant, threads)   # outer/straddle: reuse the ragged path
-    TreeData(map(el -> _mapslices(f, el, valwant, threads), parent(X)), meta(X))   # inner-only: recurse per position, keep the Tuple
+        return _mapslices(f, TreeData(collect(parent(X)), meta(X)), valwant, threads, align)   # outer/straddle: reuse the ragged path
+    TreeData(map(el -> _mapslices(f, el, valwant, threads, align), parent(X)), meta(X))   # inner-only: recurse per position, keep the Tuple
 end
 
 # A `dims=` that names BOTH this ragged node's outer axis AND a dim living inside its leaves is a
@@ -545,7 +691,7 @@ end
 # means) -- and keeps the loud refusals for everything else: a KEPT outer axis, record/tuple/
 # doubly-ragged leaves, divergent leaf dim structure, and KEPT inner axes that differ in length or
 # coordinates (the never-silently-wrong discipline, decisions 16fwcnx / 1iy1r57).
-function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}, threads::Bool) where want
+function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}, threads::Bool, align) where want
     _refusecoords(f, want)          # a pooled bag has no single aligned coordinate vector
     alldims = TreeArrays.dims(X)
     n_outer = ndims(parent(X))
@@ -561,22 +707,27 @@ function _pooledstraddle(f, X::TreeRaggedArray, ::Val{want}, threads::Bool) wher
     p isa AbstractArray || throw(ArgumentError(
         "cannot pool dims " * string(want) * " across a ragged boundary: its leaves are " * string(typeof(proto)) *
         ", not array-backed. Pooling across a record / tuple / doubly-ragged leaf is not implemented -- " *
-        "reduce the inner dim(s) first, then the outer axis."))
+        "select one field first (`X.field` maps over the leaves), or reduce the inner dim(s) first, then " *
+        "the outer axis."))
     keepaxes, keptdims, trailing, _ = _splitdims(TreeArrays.dims(proto), Val(ndims(p)), Val(want))
-    _assertpoolable(els, proto, keepaxes, keptdims, want)  # same structure; kept axes match in length + coords
+    # same structure; kept axes match in length + coords -- or, under `align=`, may differ (realigned below)
+    needalign = _assertpoolable(els, proto, keepaxes, keptdims, want, align)
     ps     = map(parent, els)                             # the leaves' own backing arrays -- never stacked
     ghosts = (trailing..., map(sliced, outer)..., alldims[n_outer+1:end]...)   # reduced inner + outer, sliced
     T      = mapreduce(eltype, promote_type, ps)         # the pooled bag's eltype (what `vcat` would give)
     redaxes = Tuple(i for i in 1:ndims(p) if !(i in keepaxes))
     baglen = sum(P -> _redlen(P, redaxes), ps)           # Σ over leaves; exact at every kept index
     bag    = Vector{T}(undef, baglen)                     # ONE scratch bag per task, refilled IN FULL per kept index
+    # `align !== nothing` first: for the default `align = nothing` it folds to `false` at compile time,
+    # so the aligned path never widens the default path's return type.
+    align !== nothing && needalign && return _alignedstraddle(f, els, ps, keepaxes, keptdims, ghosts, bag, threads, align)
     if isempty(keepaxes)                                  # every inner axis reduced too: one fully-pooled leaf
-        _assemble(_leafreduce(f, _fillbag!(bag, map(vec, ps)), threads), keptdims, ghosts)
+        _assemble(_leafreduce(f, _fillbag!(bag, map(vec, ps)), threads, align), keptdims, ghosts)
     else                                                  # keep the un-named inner axes; pool per kept index
         sls  = map(P -> _eachslice(P, Val(keepaxes)), ps)
         inds = CartesianIndices(first(sls))
         outs = _tmap(_PoolKernel(f, bag), inds, baglen * length(inds), threads) do pk, i
-            _leafreduce(pk.f, _fillbag!(pk.bag, (vec(sl[i]) for sl in sls)), threads)
+            _leafreduce(pk.f, _fillbag!(pk.bag, (vec(sl[i]) for sl in sls)), threads, align)
         end
         _assemble(outs, keptdims, ghosts)
     end
@@ -616,8 +767,9 @@ end
 # NOT cross-checked: decision 4b3vcd's beta case assumes siblings agree on fixed values (the Tables
 # adapter documents + test-pins the same boundary) -- a per-sibling-varying value belongs in an
 # axis coordinate, not a fixed dim.
-function _assertpoolable(els, proto, keepaxes, keptdims, want)
+function _assertpoolable(els, proto, keepaxes, keptdims, want, align)
     p1  = parent(proto)
+    needalign = false
     ref = map(d -> name(d) => _dimkind(d), TreeArrays.dims(proto))
     for j in 2:length(els)
         el = els[j]
@@ -639,18 +791,121 @@ function _assertpoolable(els, proto, keepaxes, keptdims, want)
             string(ndims(p1)) * ". Pooling needs every leaf at the same rank."))
         for (ax, kd) in zip(keepaxes, keptdims)
             n1, nj = size(p1, ax), size(q, ax)
+            agree = n1 == nj && _poolcoordsagree(meta(TreeArrays.dims(el)[ax]).values, meta(kd).values)
+            agree && continue
+            align === nothing || (needalign = true; continue)   # realigned by label in `_alignedstraddle`
             n1 == nj || throw(ArgumentError(
                 "cannot pool dims " * string(want) * " across a ragged boundary: the KEPT inner axis " *
                 "`:$(name(kd))` is not conformable across leaves -- lengths differ (leaf 1: $n1, leaf " *
                 "$j: $nj). Only REDUCED axes may differ in length across pooled leaves: name " *
-                "`:$(name(kd))` in `dims=` too, or split the tree."))
-            _poolcoordsagree(meta(TreeArrays.dims(el)[ax]).values, meta(kd).values) || throw(ArgumentError(
+                "`:$(name(kd))` in `dims=` too, " * _ALIGNHINT * ", or split the tree."))
+            throw(ArgumentError(
                 "cannot pool dims " * string(want) * " across a ragged boundary: the KEPT inner axis " *
                 "`:$(name(kd))` is not conformable across leaves -- leaf $j carries different " *
                 "coordinates than leaf 1 (an unlabelled axis and a labelled one also differ). " *
-                "Pooling needs every kept axis to mean the same positions in every leaf."))
+                "Pooling needs every kept axis to mean the same positions in every leaf: " *
+                _ALIGNHINT * "."))
         end
     end
+    needalign
+end
+
+# ===================== `align=` -- pooling leaves whose KEPT axis differs (decision 1ibupji) =====================
+# A reduction that pools a ragged outer axis (participants) while KEEPING an inner axis (time) needs
+# every leaf to mean the same thing at kept position k. When the leaves' kept axis differs (each
+# participant has its own number of trials), there is no single right answer to "the band at t" --
+# the participants present change along t -- so the default refuses by name and the caller says how
+# to handle it (user, on 1ibupji: "we need a kwarg that specifies how to handle this"):
+#   :union      every label any leaf carries; at each, pool the leaves that carry it
+#   :intersect  only the labels every leaf carries
+# Labels are matched by VALUE (`isequal`), never by position, so an unlabelled axis that would need
+# aligning refuses. Output order: the sorted union when every leaf's labels are ascending numbers
+# (trial indices, times), else the order first met, leaf by leaf. Cost: one hash pass over the
+# labels plus a sort -- n log n in the label count -- then the same streaming pool as before.
+_checkalign(::Nothing) = nothing
+_checkalign(a::Symbol) = a === :union || a === :intersect ? nothing : _badalign(a)
+_checkalign(a) = _badalign(a)
+_badalign(a) = throw(ArgumentError("align=" * repr(a) * " is not an alignment policy: " * _ALIGNHINT *
+    ", or leave `align` unset to refuse leaves whose kept axes differ."))
+
+# One kept axis across the leaves -> (output dim, per-leaf position maps or `nothing`, output length).
+# `nothing` = every leaf already agrees (same length + labels): the identity, leaf 1's dim kept as is.
+function _alignaxis(ds, ns, align::Symbol)
+    d1 = first(ds)
+    nm = name(d1)
+    all(==(first(ns)), ns) && all(d -> _poolcoordsagree(meta(d).values, meta(d1).values), ds) &&
+        return (d1, nothing, first(ns))
+    for (j, d) in enumerate(ds)
+        meta(d).values === missing && throw(ArgumentError(
+            "cannot align the `:" * string(nm) * "` axis across leaves (align=:" * string(align) * "): leaf " *
+            string(j) * "'s `:" * string(nm) * "` is unlabelled, and `align` matches positions by their LABELS, " *
+            "never by position. Give the axis coordinates, e.g. `:" * string(nm) * " => 1:n`."))
+    end
+    labels, maps = _alignlabels(map(d -> collect(meta(d).values), ds), align, nm)
+    (TreeDim(nm, labels), maps, length(labels))
+end
+
+function _alignlabels(ls::AbstractVector, align::Symbol, nm::Symbol)
+    for (j, l) in enumerate(ls)
+        allunique(l) || throw(ArgumentError(
+            "cannot align the `:" * string(nm) * "` axis across leaves (align=:" * string(align) * "): leaf " *
+            string(j) * " repeats a `:" * string(nm) * "` label, so a label does not name one position. " *
+            "Make the labels unique."))
+    end
+    every = reduce(vcat, ls)
+    order = all(l -> eltype(l) <: Real && issorted(l), ls) ? sort!(unique(every)) : unique(every)
+    out = align === :union ? order : _intersectlabels(order, ls)
+    isempty(out) && throw(ArgumentError(
+        "cannot align the `:" * string(nm) * "` axis across leaves with align=:intersect: the leaves share " *
+        "no `:" * string(nm) * "` label. Use `align = :union`, or split the tree."))
+    maps = map(ls) do l
+        pos = Dict(zip(l, eachindex(l)))
+        Int[get(pos, x, 0) for x in out]
+    end
+    out, maps
+end
+_intersectlabels(order, ls) = (sets = map(Set, ls); filter(x -> all(s -> x in s, sets), order))
+
+# Leaf j's position for output position I (one entry per kept axis), or `nothing` if leaf j lacks
+# one of the labels. An identity axis (`nothing` map) passes its index straight through.
+_localpos(::Nothing, j, i) = i
+_localpos(m::Vector{Vector{Int}}, j, i) = m[j][i]
+function _localidx(maps::Tuple, j, I::CartesianIndex)
+    t = map((m, i) -> _localpos(m, j, i), maps, Tuple(I))
+    any(iszero, t) ? nothing : CartesianIndex(t)
+end
+
+# Reachable only when SEVERAL kept axes are aligned under :union: each axis's union is fine, but a
+# combination of labels may be carried by no leaf at all. There is no slice to reduce there.
+_noleafat(dims, I, align) = throw(ArgumentError(
+    "cannot align with align=:" * string(align) * ": no leaf carries the label combination " *
+    string(map((d, i) -> name(d) => meta(d).values[i], dims, Tuple(I))) * " of the aligned axes " *
+    string(map(name, dims)) * ". Use `align = :intersect`, or align one axis at a time."))
+
+# The pooled straddle with realigned kept axes: per output label (combination), refill the bag from
+# the leaves that carry it -- the same streaming pool, just over a per-label subset of leaves.
+function _alignedstraddle(f, els, ps, keepaxes, keptdims, ghosts, bag, threads::Bool, align::Symbol)
+    plan = map(keepaxes) do ax
+        _alignaxis(map(el -> TreeArrays.dims(el)[ax], els), map(P -> size(P, ax), ps), align)
+    end
+    maps = map(x -> x[2], plan)
+    sls  = map(P -> _eachslice(P, Val(keepaxes)), ps)
+    inds = CartesianIndices(map(x -> x[3], plan))
+    outs = _tmap(_PoolKernel(f, bag), inds, length(bag) * length(inds), threads) do pk, I
+        n = 0
+        any_ = false
+        for j in eachindex(sls)
+            loc = _localidx(maps, j, I)
+            loc === nothing && continue
+            any_ = true
+            v = vec(sls[j][loc])
+            copyto!(pk.bag, n + 1, v)
+            n += length(v)
+        end
+        any_ || _noleafat(map(first, plan), I, align)
+        _leafreduce(pk.f, view(pk.bag, 1:n), threads, align)
+    end
+    _assemble(outs, map(first, plan), ghosts)
 end
 
 # Kept-axis coordinates agree under the codebase's `_sigmatch` notion (the `===` fast path plus an
