@@ -71,7 +71,9 @@ time.
 
 Three corners of the surface, listed as "being decided" in 0.1.2, are settled
 (user decision: the TreeArrays agent's recommendations, 2026-11-02). All three
-are **Breaking** for a caller that used the old behaviour; no dependant did.
+are **Breaking** for a caller that used the old behaviour. One dependant did:
+Bruno's `lib/BrunoQTViews` ran a `mapslices` kernel returning a plain
+`NamedTuple` (fourth item below); it was changed to return `TreeData(:interval => nt)`.
 
 - **Breaking:** `setdim` is removed. It was an exported stub that errored on
   every call since `bfc1de6`. A lazy re-label / fix-a-dim operation can be
