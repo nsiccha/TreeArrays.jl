@@ -22,6 +22,12 @@ A test (`test/public_api.jl`) holds the export list to exactly this surface.
 - [`TreeData`](@ref): `TreeData(backing, dims...; kwarg_dims...)`,
   `TreeData(name => NamedTuple, dims...)` (a record with a named record axis),
   `TreeData(X::TreeData, dims...)` (append dims).
+- `TreeData(A::AbstractDimArray; axes = nothing, kwarg_dims...)` (DimensionalData
+  extension): A's dims become named axes with their lookups as labels (`:iter`
+  becomes `:draw`). Number cells stay a zero-copy leaf. One NamedTuple or array per
+  cell (a model's return values, `returned(model, chain)`) is converted once into
+  records, dense leaves and ragged nodes; `axes` names the inner axes, mirroring
+  the value's structure (`(pe = (:participant, :trial),)`).
 - The four dispatch aliases [`TreeArray`](@ref), [`TreeNamedTuple`](@ref),
   [`TreeTuple`](@ref), [`TreeRaggedArray`](@ref). They are for dispatch only;
   always construct through `TreeData`. Dispatching on `TreeData{P}`'s first
@@ -40,6 +46,13 @@ A test (`test/public_api.jl`) holds the export list to exactly this surface.
   `size`, `length`, `ndims`, `axes`, `eltype`, `getindex`, `iterate`.
   `collect(X)` and `Array(X)` copy the backing out. At the outer level of a
   ragged tree the same methods answer about the outer axis (count, sub-trees).
+- `size(X, name)` and `axes(X, name)` on every tree shape: by dim name. A name
+  inside a ragged tree answers when every child agrees; reduced and fixed dims
+  have no length.
+- Broadcasting (`f.(X)`, `X .- Y`) returns a tree with the same dims. Trees combine
+  when their axes match by name, order and labels; a reduced or fixed dim
+  stretches along the other tree's axis; records go field by field, ragged trees
+  leaf by leaf. A plain array refuses by name.
 - `show` for text, `text/html` and `text/markdown`, all bounded previews.
 
 ### Reductions and selection

@@ -71,6 +71,10 @@ also keeps the labels — or `parent(X)` / `collect(X)`. See
 If your data is rectangular and you want it to behave like an array everywhere,
 that is a genuine reason to prefer DimensionalData.
 
+The two also meet directly: `TreeData(A)` on any DimensionalData array keeps
+its dims by name, with their lookups as labels (zero-copy for numbers), through
+a weak-dependency extension.
+
 ### Side by side
 
 | | DimensionalData.jl | TreeArrays.jl |
@@ -194,6 +198,25 @@ Three things make the pairing more than cosmetic:
 - **`TreeActualArray`** promotes a record axis to a real array dimension, so a
   record-of-per-parameter-matrices feeds `ess`/`rhat` with no copy and no parallel
   plain-array builder.
+
+### Model return values
+
+Quantities a model *returns* (states, predictions, anything computed from the
+parameters) are not chain keys: `returned(model, chain)` gives one value per
+draw, as a `(iter × chain)` `DimMatrix`. Hand it to `TreeData` as is:
+
+```julia
+states = TreeData(returned(model, chain);
+                  axes = (prediction_error = (:participant, :trial),))
+```
+
+The DimensionalData extension converts it **once**: the iteration and chain dims
+become `:draw` and `:chain` (the same names `TreeData(chain)` uses, so both
+reduce with `dims = (:draw, :chain)`). A number per draw becomes a leaf, a
+NamedTuple a record, an array of equal size a dense leaf over its own axes, and
+an array of arrays (participants with different numbers of trials) a ragged
+node. `axes` names the inner axes, mirroring the value's structure; unnamed ones
+are `:elem`, `:elem_1`, …
 
 ### Where this lives
 

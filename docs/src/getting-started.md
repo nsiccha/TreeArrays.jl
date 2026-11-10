@@ -114,6 +114,28 @@ knows what it is. `:subject` and `:time` are untouched, labels included.
 mean(X; dims = nothing)
 ```
 
+## Arithmetic keeps the labels
+
+Broadcasting over a tree gives back a tree with the same dims:
+
+```@example gs
+centred = X .- mean(X; dims = :draw)   # the mean's reduced `:draw` stretches along X's
+TreeArrays.dims(centred)
+```
+
+Scalars combine with any tree. Two trees combine when they carry the same axes,
+by name and in the same order, with the same labels. An axis that one of them
+has reduced (like the mean's `:draw` above) or fixed stretches along the
+other's. Anything else refuses by name, and so does a plain array, whose axes
+have no names to match: wrap it as a tree, or pass it whole with `Ref(x)`.
+Records broadcast field by field, ragged trees leaf by leaf.
+
+Sizes read by name, too:
+
+```@example gs
+size(X, :draw), size(X, :time)
+```
+
 ## Names are checked — a typo throws
 
 ```@example gs
