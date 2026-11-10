@@ -13,6 +13,29 @@ API states the version as its floor, for example `[compat] TreeArrays =
 when it resolves, instead of failing or silently behaving differently at run
 time.
 
+## 0.2.3
+
+- New: `TreeData(A::AbstractDimArray; axes = nothing, fixed_dims...)` through a
+  DimensionalData weak-dependency extension. A's dims become named axes with
+  their lookups as labels; the iteration dim `:iter` becomes `:draw`. Number
+  cells stay a zero-copy leaf. One NamedTuple or array per cell, such as a model's
+  return values from `returned(model, chain)`, is converted once into records,
+  dense leaves and ragged nodes (arrays of arrays, e.g. participants with
+  different numbers of trials). `axes` names the inner axes, mirroring the
+  value's structure. A plain array of NamedTuples is still refused; the message
+  now points to this route.
+- New: `size(X, name)` and `axes(X, name)` read an axis length by dim name, on
+  every tree shape.
+- Changed: broadcasting over a tree (`exp.(X)`, `X .- 1`,
+  `X .- mean(X; dims = :draw)`) now returns a tree with the same dims instead of
+  a plain `Array` that dropped every label. Trees combine when their axes match
+  by name, order and labels; a reduced or fixed dim stretches along the other
+  tree's axis; records go field by field, ragged trees leaf by leaf. A plain
+  array combined with a tree, and mismatched axes, refuse by name. Code that
+  needs the plain array writes `parent(X) .- 1`. The old result was undocumented
+  (a side effect of the forwarded array interface), and a scan of every known
+  dependant found none relying on it.
+
 ## 0.2.2
 
 - New keyword `align = nothing | :union | :intersect` on `mapslices` and every

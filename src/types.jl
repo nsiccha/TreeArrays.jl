@@ -137,7 +137,10 @@ TreeData(x::_StructsBacking, dims::TreeDim...) = error(
     "TreeArrays: a `$(typeof(x))` backing (an array or tuple of structs) is not a supported leaf: " *
     "records are stored struct-of-arrays. Build the record form " *
     "`TreeData(:field => (; a = …, b = …), dims...)`, or wrap each element in its own record " *
-    "leaf: `TreeData(map(nt -> TreeData(:field => nt), x), dims...)`."
+    "leaf: `TreeData(map(nt -> TreeData(:field => nt), x), dims...)`. To convert one value per draw " *
+    "(a model's return values), give the array its dim names and let TreeArrays transpose it once: " *
+    "`TreeData(returned(model, chain))` as is, or `TreeData(DimArray(x, (:draw, :chain)); axes = …)` " *
+    "(DimensionalData extension)."
 )
 # a TreeNamedTuple keeps its record axis in the type as a SEPARATE `outer_dim` (which axis
 # enumerates the fields is a property of the container, not of a dim) *and* lists it in
