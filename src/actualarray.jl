@@ -224,6 +224,9 @@ function _actualarray(tree::TreeRaggedArray)
 end
 
 # ===================== ragged alignment views (todo 1l53kom) =====================
+# Positional alignment has three policies. Labelled axes also require a coordinate
+# policy; sibling structure and missing values are checked before building the view.
+#
 # A one-level ragged tree whose leaves differ ONLY along one named inner axis presents as a
 # lazy, zero-copy `AbstractArray`: the outer sibling axis is inserted immediately AFTER the
 # aligned inner axis, so `:chain -> (:draw x :param)` becomes `:draw x :chain x :param` --
