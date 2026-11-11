@@ -29,6 +29,16 @@ jobs:
         with:
           version: '1'
       - uses: julia-actions/cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install npm dependencies
+        # make.jl uses the split build (build_vitepress=false + explicit
+        # DocumenterVitepress.build_docs), which shells out to
+        # `npm run env -- vitepress build …` without running `npm install`
+        # itself, so vitepress must be installed before the Julia build
+        # (ci skill §6g).
+        run: cd docs && npm install
       - name: Install dependencies
         run: julia --project=docs docs/instantiate.jl
       - name: Build and deploy
