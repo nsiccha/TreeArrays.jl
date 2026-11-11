@@ -1,6 +1,9 @@
 using Documenter, DocumenterVitepress
 
 using TreeArrays
+using AlgebraOfVega: vega_vendor_dir
+
+run(`python3 $(joinpath(@__DIR__, "lint.py"))`)
 
 makedocs(;
     modules  = [TreeArrays],
@@ -11,20 +14,31 @@ makedocs(;
         repo      = "github.com/nsiccha/TreeArrays.jl",
         devurl    = "dev",
         devbranch = "main",
+        build_vitepress = false,
     ),
     pages = [
-        "Home"                => "index.md",
-        "Getting started"     => "getting-started.md",
-        "Reductions"          => "reductions.md",
-        "Streaming & caches"  => "streaming.md",
-        "Ragged data"         => "ragged.md",
-        "Tables & plotting"   => "tables.md",
-        "Comparisons"         => "comparisons.md",
-        "API"                 => "api.md",
+        "Start" => ["TreeArrays" => "index.md"],
+        "Guides" => [
+            "Named axes and records" => "getting-started.md",
+            "Reductions" => "reductions.md",
+            "Ragged data" => "ragged.md",
+            "Streaming and caches" => "streaming.md",
+            "Interoperability" => "tables.md",
+        ],
+        "Examples" => ["Concentration trajectories" => "trajectories.md"],
+        "Reference" => ["API" => "api.md"],
     ],
-    checkdocs = :none,
-    warnonly  = true,
+    checkdocs = :exports,
+    warnonly  = false,
 )
+
+# Serve AlgebraOfVega's supported linked runtime from build-only assets.
+assets = joinpath(@__DIR__, "build", ".documenter", "public", "assets", "aov")
+mkpath(dirname(assets))
+cp(vega_vendor_dir(), assets; force=true)
+cp(joinpath(@__DIR__, "build", ".documenter", "trajectory-figure.html"),
+   joinpath(dirname(assets), "trajectory-figure.html"); force=true)
+DocumenterVitepress.build_docs(joinpath(@__DIR__, "build"))
 
 # Root redirect: /TreeArrays.jl/ -> /TreeArrays.jl/dev/
 let redirect = joinpath(@__DIR__, "build", "index.html")

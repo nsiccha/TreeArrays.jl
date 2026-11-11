@@ -436,131 +436,27 @@ end
 end
 
 """
-    mapslices(f, X::TreeData; dims, coords = false, threads = false, align = nothing)
+    mapslices(f, X::TreeData; dims, coords=false, threads=false, align=nothing)
 
-Reduce the named `dims` of a tree with `f`, thread every remaining index
-recursively, and return a [`TreeData`](@ref).
+Apply `f` to each slice along the named dimensions and return a [`TreeData`](@ref).
+`dims` is a symbol or a collection of symbols. The function returns a scalar
+(to collapse the dimensions) or a tree (to introduce an output axis or record).
+Wrap a named-tuple result with `TreeData(name => result)`. Reduced dimensions
+remain in metadata but no longer contribute array axes.
 
-`dims` is a `Symbol` or a collection of them. `f` receives the slice along the
-reduced axis and returns either a **scalar** (which collapses the axis) or a
-**`TreeData`** (which introduces a new record or output axis). Nothing is
-stacked, pivoted or `vcat`ed: the result stays a tree of arrays, and a reduced
-axis is kept as an aggregated *ghost* dim so the provenance of the reduction
-survives it.
+For one labelled dimension, `coords=true` passes its coordinate vector as a
+second argument to `f`. An unlabelled dimension cannot supply coordinates.
 
-```julia
-X   = TreeData(randn(1000, 179, 100), :draw, :subject, :time => range(0, 1, 100))
-qoi = mapslices(maximum, X; dims = :time)         # (draw × subject), still a TreeData
-```
+Inner reductions visit each ragged leaf independently. An outer reduction
+requires compatible kept axes. `align=:union` matches every coordinate present
+in any leaf, using only available contributors; `align=:intersect` retains
+coordinates present in all leaves. Neither interpolates. Pooling outer and
+inner dimensions together requires array-backed leaves and reduction of all
+outer axes; select a record field before pooling.
 
-Returning a `TreeData` from `f` gives the reduction an output axis:
-
-```julia
-mapslices(X; dims = :time) do y
-    TreeData(:stat => (; trough = minimum(y), peak = maximum(y)))
-end
-```
-
-# `coords = true` — let the kernel see the axis it reduces
-
-By default `f` sees the data slice only. `coords = true` additionally hands it
-the **coordinates** of the reduced axis — what `trapz(t, y)` (AUC) and
-`t[argmax(y)]` (tmax) need:
-
-```julia
-mapslices(X; dims = :time, coords = true) do y, t
-    TreeData(:stat => (; cmax = maximum(y), tmax = t[argmax(y)], auc = trapz(t, y)))
-end
-```
-
-The binding happens **per node**, so on a ragged tree every sub-tree's kernel
-call sees *its own* grid — which is exactly why closing over one shared
-coordinate vector was never an answer there. One reduced axis hands `f` the bare
-coordinate vector; several hand it one vector per axis in slice-dim order.
-Reducing a ragged tree's outer axis hands the kernel that axis's labels.
-
-Two shapes throw rather than answer with a plausible value: an **unlabelled**
-axis has no coordinates to give, and a **pooled straddle** (reducing a ragged
-outer axis together with a leaf-inner one) concatenates every leaf's slice into
-one bag that no single axis's coordinates line up with.
-
-[`@kernel`](@ref) infers this opt-in from the kernel's arity; `mapslices` does
-not, deliberately — at this boundary a `hasmethod(f, (slice, coords))` probe is
-true for `maximum` (because `maximum(f, itr)` exists) and would silently treat
-your data slice as a predicate.
-
-# `threads = true` — reduce independent slices on several tasks
-
-Every slice is reduced on its own, so `mapslices` can spread the slices over
-Julia's threads. It does so only when asked: TreeArrays cannot see whether
-*your* kernel is safe to run on two tasks at once, and a kernel that writes to a
-buffer it closes over would race and return plausible-looking wrong numbers.
-
-```julia
-mapslices(X; dims = :draw, threads = true) do y   # reads its slice, shares no state
-    TreeData(:stat => (; lo = minimum(y), hi = maximum(y)))
-end
-```
-
-The result is the serial result, cell for cell: the same kernel computes each
-cell from the same slice and writes it to its own position, nothing is combined
-across slices, and a kernel that throws throws the exception the serial loop
-would have. Work is split into at most `2 * Threads.nthreads()` tasks, and only
-when there is enough of it (tens of thousands of elements per task), so with one
-thread or a small input the reduction stays on the calling task. Dense
-reductions, the gather over a ragged outer axis, and the pooled straddle all
-thread; descending into the children of a ragged node does not (each child
-threads its own slices).
-
-TreeArrays' own reducers — [`quantile`](@ref), `nanquantile`, [`hdi`](@ref),
-[`mean`](@ref), [`sum`](@ref), [`var`](@ref), [`std`](@ref) — know their kernels,
-so they default to `threads = true`; pass `threads = false` to keep one on the
-calling task. Each task gets its own copy of their sort buffer.
-
-# `align` — pool ragged leaves whose kept axis differs
-
-Reducing a ragged tree's outer axis — alone (`dims = :participant`) or pooled
-together with inner dims (`dims = (:draw, :chain, :participant)`) — keeps the
-leaves' other axes and pools position `k` of every leaf together. That needs
-every leaf to mean the same thing at `k`: each kept axis must have the same
-length **and the same labels** in every leaf. When it does not — participants
-with different numbers of trials, subjects sampled at different times — the
-reduction refuses by name unless `align` says how to match the labels:
-
-  - `align = :union` — every label any leaf carries; at each, pool the leaves
-    that carry it. How many leaves are pooled can change along the axis.
-  - `align = :intersect` — only the labels every leaf carries.
-
-```julia
-X = TreeData([TreeData(randn(1000, 4, n), :draw, :chain, :trial => 1:n) for n in (30, 25, 28)],
-             :participant => 1:3)
-quantile(X, (lower = 0.025, upper = 0.975); dims = (:draw, :chain, :participant), align = :union)
-mean(X; dims = :participant, align = :intersect)          # draw × chain × trial 1:25
-```
-
-Labels are matched by **value**, never by position, so an unlabelled axis that
-would need aligning, and a label repeated within one leaf, throw. The aligned
-axis is the sorted union when every leaf's labels are ascending numbers, and
-otherwise lists the labels in the order first met, leaf by leaf. When the leaves
-already agree, `align` changes nothing. A `coords = true` kernel reducing the
-outer axis sees only the labels of the leaves pooled at that position. To count
-them, reduce each leaf first and count across the outer axis:
-`mapslices(length, mean(X; dims = (:draw, :chain)); dims = :participant, align = :union)`.
-
-# Rules
-
-  - Every name in `dims` must exist somewhere in the tree. A name that resolves
-    nowhere **throws**: `dims` is *foundALL*, not found-any. The check is made
-    from the type, so a correct call costs nothing at runtime; on a jagged tree
-    it falls back to an instance walk rather than let a typo through.
-  - A dim present on some branches and absent on others throws at the branch that
-    lacks it.
-  - Pass the kernel as a **concrete function value**. `mapslices` specializes on
-    `typeof(f)`, so a named function or a `do` block monomorphizes the inner
-    loop; a kernel that branches on a runtime value inside the slice loop does
-    not. Select the concrete kernel once, outside.
-
-See also [`quantile`](@ref), [`@kernel`](@ref), [`selectdim`](@ref).
+`threads=true` permits concurrent evaluation of independent slices. Kernels
+must be thread-safe and must not mutate input slices. Threaded reducers may
+retain scratch buffers per task. A missing dimension raises an error.
 """
 Base.@constprop :aggressive function Base.mapslices(f, X::TreeArray; dims, coords::Bool=false, threads::Bool=false, align=nothing)
     valwant = Val(_dimnames(dims))
@@ -921,7 +817,7 @@ _poolcoordsagree_content(a, b) = false
 # When ALL of a node's axes were reduced (`keepaxes` empty), `outs` is a SINGLE child TreeData,
 # not an array. Wrapping it in a fresh TreeData would build a `TreeData{<:TreeData}` node with no
 # use -- an artifact a chained reduction (reduce :subject THEN :draw) then chokes on (`_eltype`
-# and `mapslices` have no method for it; Bruno 2026-07-06). Instead MERGE the reduced-as-ghost
+# and `mapslices` have no method for it). Instead MERGE the reduced-as-ghost
 # dims straight into the child via the appending constructor (`TreeData(::TreeData, dims...)`,
 # types.jl), so the ghosts trail the child's own axes and no wrapper level is created. `keptdims`
 # is empty in this branch by construction (a single child <=> `keepaxes` empty), so only

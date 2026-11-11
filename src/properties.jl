@@ -20,28 +20,12 @@ _recname(X::TreeNamedTuple) = haskey(meta(X), :outer_dim) ? name(outerdim(X)) : 
 _innerdims(X::TreeNamedTuple) = _splitrecord(TreeArrays.dims(X), Val(_recname(X)))[1]
 
 """
-    X.fieldname
+    X.field
 
-Read one field of a [`TreeNamedTuple`](@ref) record — `post.beta` — zero-copy.
-
-A record's fields *are* its record axis, so `.` is the natural reader for them.
-The descent is exactly what a reduction over the record does: a field that is
-already a [`TreeData`](@ref) is returned **as is** (it knows its own dims), and a
-raw field is wrapped with its container's inner axes, so `:draw`/`:chain` survive
-either way and nothing densifies. Ghost dims stay on the container.
-
-`propertynames(X)` lists the fields; an unknown name errors and names the record
-axis and the fields it does have.
-
-On a [`TreeRaggedArray`](@ref) of records — e.g. per-subject records ragged over
-`:subject` — `.` maps over the leaves: `X.beta` reads `beta` from *every* leaf
-and re-wraps the children under the container's own outer dims. The fresh outer
-vector is `O(leaves)` pointers; the children are zero-copy (each is its leaf's
-own `.beta`). Like `dims=`, access is *foundALL*: a leaf that is not a record,
-or a record missing the field, throws and names the leaf — fields are never
-silently skipped. A doubly-nested ragged container recurses leaf by leaf.
-`propertynames(X)` lists the *prototype* (first) leaf's fields; an empty or
-non-record ragged container has no accessible fields, so it answers `()`.
+Read a record field without copying it. A field already wrapped in
+[`TreeData`](@ref) is returned as stored; a raw field is wrapped with its
+container's inner axes. Property access on ragged records visits the leaves.
+`propertynames(X)` lists available fields. An unknown field raises an error.
 """
 Base.@constprop :aggressive function Base.getproperty(X::TreeNamedTuple, s::Symbol)
     P = parent(X)

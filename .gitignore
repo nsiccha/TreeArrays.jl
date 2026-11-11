@@ -1,6 +1,4 @@
 Manifest.toml
-!web/Manifest.toml
-!web/app/Manifest.toml
 .vscode/
 *.cov
 .DS_Store

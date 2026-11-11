@@ -1,10 +1,7 @@
 # ===================== selectdim: restrict a named axis to a subset =====================
 # The SELECTION dual of the `dims=` reductions (mapslices/mean/sum/quantile): those COLLAPSE a
 # named axis; this RESTRICTS one to the coordinates a selector keeps, leaving every other axis
-# intact. It is the TreeArrays spelling of Bruno draws_core's `subdf(pattern::Regex)`
-# (`df_names[map(contains(pattern), df_names)]`, draws_core.jl:322) -- an axis-filter over a
-# ~600k-label `:param` axis, the most-used non-reduction op in the DataFrames->TA migration
-# (snag `named-axis-label`).
+# intact. Label predicates and positional selectors share the same view-backed path.
 #
 # NO DATA COPY (the snag's hard requirement): the backing array is sliced with a `view`, so a
 # subset of a `(draw x chain x 600k)` matrix never materializes -- only the axis's own (tiny)
@@ -69,36 +66,16 @@ _subsetcoords(vals, coordvec, idx)        = coordvec[idx]
     selectdim(X::TreeData, name => selector)
     selectdim(X::TreeData, name::Symbol, selector)
 
-Restrict a named axis to the coordinates `selector` keeps, leaving every other
-axis intact — the **selection dual** of the `dims =` reductions, which collapse an
-axis instead.
+Select an array axis on the current node using a view of its backing. A regular
+expression keeps matching coordinate strings; a predicate keeps coordinates
+for which it returns true. A boolean vector selects by mask, and an integer
+vector selects positions, possibly reordered or repeated. Positional selectors
+also work on unlabelled axes. A bare string selector is ambiguous and rejected.
 
-**No data is copied.** The backing array is sliced with a `view`, so a subset of a
-`(draw × chain × 600_000)` matrix never materializes; only the axis's own (tiny)
-coordinate labels are subset.
-
-```julia
-selectdim(X, :param => r"^unit_params_")      # Regex: keep labels it `contains`-matches
-selectdim(X, :param => startswith("beta"))    # a `label -> Bool` predicate
-selectdim(X, :param => boolmask)              # an explicit Bool mask (length == axis)
-selectdim(X, :param => [8, 1, 2])             # integer indices — subset and/or reorder
-selectdim(X, :param, sel)                     # 3-arg form, mirroring Base.selectdim(A, d, i)
-```
-
-The filtered axis carries exactly the matched labels, keep-as-provided (a `Tuple`
-stays a `Tuple`; a filtered range necessarily becomes a `Vector`). The result is
-a [`TreeData`](@ref), so it composes with the reductions:
-`mean(selectdim(X, :param => r"…"); dims = :draw)`.
-
-**Positional** selectors (a Bool mask, integer indices) also restrict an
-*unlabelled* axis — it stays unlabelled and merely gets shorter. A Regex or
-predicate on one errors: there are no labels to match.
-
-Like `dims =`, this is *foundALL* and never silently wrong. Each of these throws
-by name: a typo'd axis name; a bare `String` selector (ambiguous between exact
-and substring — use `==("x")`, `contains("x")` or a Regex); a predicate that does
-not return `Bool`; a wrong-length mask; and selecting an inner or record axis
-(only the outer array axes are selectable, a ragged tree's outer axis included).
+The selected labels are retained. This applies to dense leaves and ragged
+outer axes, not record axes or dimensions inside ragged children. Select a
+record field or descend to the child first. Missing, fixed, and reduced axes
+raise errors.
 """
 Base.selectdim(X::TreeArray, (nm, sel)::Pair{Symbol}) = _selectdim(X, nm, sel)
 Base.selectdim(X::TreeArray, nm::Symbol, sel)         = _selectdim(X, nm, sel)

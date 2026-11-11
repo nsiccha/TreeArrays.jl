@@ -1,179 +1,72 @@
-```@meta
-CurrentModule = TreeArrays
+# Named axes and records
+
+Construct a tree, select coordinates by name, and transform its values while preserving their labels.
+
+## Axes
+
+Positional dimensions follow the backing array's axis order. A pair supplies coordinates; a bare symbol supplies only a name.
+
+```@example axes
+using TreeArrays, Tables
+values = [1.0 2.0 3.0; 4.0 5.0 6.0]
+X = TreeData(values, :draw => [101, 102], :time => [0.0, 0.5, 1.0])
+(; shape=size(X), time=coords(X, :time), same_backing=parent(X) === values)
 ```
 
-# Getting started
+`parent(X)` is the original backing object. Use `coords(X, name)` for coordinates and `TreeArrays.dims(X)` for the dimensions declared on this node. An inner dimension of a ragged tree belongs to its child; it is not included in the parent's `dims` tuple.
 
-## Installation
+Keyword arguments add fixed metadata rather than array axes. A reduced dimension also remains in the metadata, but no longer varies. Neither a fixed nor a reduced dimension has a coordinate vector for `coords` to return.
 
-TreeArrays is not registered. Add it from GitHub:
-
-```julia
-using Pkg
-Pkg.add(url = "https://github.com/nsiccha/TreeArrays.jl")
+```@example axes
+labelled = TreeData(values, :draw, :time => [0.0, 0.5, 1.0]; dose=10)
+TreeArrays.dims(mean(labelled; dims=:draw))
 ```
 
-Its hard dependencies are `Statistics`, `Tables`, and the `Serialization`
-standard library. `NaNStatistics` is a
-weak dependency that lights up [`nanquantile`](@ref nan-safe-quantiles) when you
-load it.
+## Selection
 
-`DynamicObjects` is optional: loading it enables [direct mmap caching of
-named results](streaming.md), including ragged trees and streamed statistics.
+`selectdim` keeps the labels selected by a predicate, regular expression, boolean mask, or vector of positions. Its backing is a view. Regular expressions and predicates require coordinates; positional selectors also work on unlabelled axes.
 
-## The mental model
-
-A [`TreeData`](@ref) is a **`parent`** (the backing storage) plus **`dims`** (the
-named axes describing it). That is the whole type. What `parent` *is* decides
-which of four shapes you have — and these are dispatch-only aliases, so you
-always construct with `TreeData(...)`:
-
-| Alias | `parent` is… | Meaning |
-|---|---|---|
-| [`TreeArray`](@ref) | an `AbstractArray` | a dense numeric leaf |
-| [`TreeNamedTuple`](@ref) | a `NamedTuple` | a **record** — named fields form an axis |
-| [`TreeTuple`](@ref) | a `Tuple` | a positional record |
-| [`TreeRaggedArray`](@ref) | an `AbstractArray{<:TreeData}` | a **ragged** nesting of sub-trees |
-
-A `TreeData` is deliberately **not** an `AbstractArray` subtype. Only the
-array-backed leaf forwards `size`/`getindex`/`iterate` to its parent. See
-[Feeding a numeric-array API](@ref actual-array) for how to cross that boundary
-when a function insists on an array.
-
-## Naming your axes
-
-```@example gs
-using TreeArrays, Random
-Random.seed!(1)
-
-X = TreeData(randn(500, 3, 5), :draw, :subject, :time => [0.0, 1.0, 2.0, 4.0, 8.0])
-TreeArrays.dims(X)
+```@example axes
+early = selectdim(X, :time => t -> t <= 0.5)
+(; time=coords(early, :time), values=Array(early))
 ```
 
-The positional arguments after the backing array name its axes, in order. Three
-things are happening there:
+Selection acts on an array axis on the current node. To select an inner axis of a ragged tree, select within its leaves. For a record, read the required field with property access.
 
-- `:draw` and `:subject` are **unlabelled axes** — real dimensions with no
-  coordinates attached. Their `values` is `missing`.
-- `:time => [...]` is a **labelled axis**: the coordinates travel with the data.
-- Keyword arguments become **fixed coordinates** — a single position, not an
-  axis:
+## Records
 
-```@example gs
-D = TreeData(randn(500, 3), :draw, :subject; dose = 20, arm = :treatment)
-TreeArrays.dims(D)
+A record stores fields that may themselves be arrays or trees. The pair form names its record axis. Fields already wrapped in `TreeData` retain their own dimensions; raw fields inherit the record's inner axes.
+
+```@example axes
+parameters = TreeData(:parameter => (initial=[10.0, 12.0], rate=[0.2, 0.3]),
+                      :draw => [101, 102])
+(; fields=propertynames(parameters), rates=parent(parameters.rate),
+   record_axis=coords(outerdim(parameters)))
 ```
 
-`dose = 20` is stored **once**, as a label. This is the constant-column smear
-(`df[!, :dose] .= 20`) that TreeArrays exists to retire — it costs O(1), not
-O(rows).
+Use `TreeData` for construction. The aliases `TreeArray`, `TreeNamedTuple`, `TreeTuple`, and `TreeRaggedArray` identify backing layouts for dispatch; they are not separate constructors. A plain array of named tuples is not accepted as a record. Store fields as arrays, as above, or wrap each record in its own tree.
 
-!!! warning "`TreeData(:name)` with no backing array throws"
-    A `TreeData` always starts from its backing. `TreeData(:time)` alone throws
-    and says so (before 0.2.0 it returned a builder closure: a constructor call
-    that silently gave back a non-tree). To build one tree per item, as
-    [Ragged data](@ref) does, map an explicit closure:
-    `map((v, t) -> TreeData(v, :time => t), values, times)`.
+## Broadcasting
 
-## Reading the labels back
+Broadcasting preserves dimensions and operates field by field on records. When two trees are combined, their varying axes must match by name, order, and coordinates. A dimension already reduced on one side can expand along the matching axis on the other.
 
-[`coords`](@ref) is the supported way to get an axis's coordinates:
-
-```@example gs
-coords(X, :time)
+```@example axes
+centered = X .- mean(X; dims=:draw)
+(; time=coords(centered, :time), values=Array(centered))
 ```
 
-Labels come back **exactly as provided** — a `Tuple` stays a `Tuple`, a `Vector`
-stays a `Vector`, a range stays a range. The same convention holds for
-`quantile`'s levels and `selectdim`'s.
+A plain array cannot supply dimension names for a tree-to-tree broadcast. Wrap it with the intended axes before combining it with a tree.
 
-!!! danger "Do not reach for `collect(dim)`"
-    A `TreeDim` has `iterate`/`length`, so `collect` *runs* and looks like the
-    answer. It isn't: the eltype is `Any`, and for the two dim kinds that have
-    **no** coordinates it invents one — `Any[missing]` for an unlabelled axis,
-    `Any[nothing]` for a reduced ghost. `coords` errors by name for both, and
-    the message names the spelling that would have worked.
+## Scenario grids
 
-## Your first reduction
+Mapping over a `TreeDim` creates a named sweep. Mapping over a product of dimensions passes the coordinate tuple to the function. A cell may return a scalar or a `TreeData`; wrap named-tuple results as records.
 
-Every reduction names the axes it collapses and leaves the rest alone:
-
-```@example gs
-using Statistics
-m = mean(X; dims = :draw)
-TreeArrays.dims(m)
-```
-
-The `:draw` axis is not dropped — it is kept as an **aggregated ghost**
-(`values === nothing`), so provenance survives the reduction and the result still
-knows what it is. `:subject` and `:time` are untouched, labels included.
-
-`dims = nothing` (the default) reduces the whole tree to a scalar:
-
-```@example gs
-mean(X; dims = nothing)
-```
-
-## Arithmetic keeps the labels
-
-Broadcasting over a tree gives back a tree with the same dims:
-
-```@example gs
-centred = X .- mean(X; dims = :draw)   # the mean's reduced `:draw` stretches along X's
-TreeArrays.dims(centred)
-```
-
-Scalars combine with any tree. Two trees combine when they carry the same axes,
-by name and in the same order, with the same labels. An axis that one of them
-has reduced (like the mean's `:draw` above) or fixed stretches along the
-other's. Anything else refuses by name, and so does a plain array, whose axes
-have no names to match: wrap it as a tree, or pass it whole with `Ref(x)`.
-Records broadcast field by field, ragged trees leaf by leaf.
-
-Sizes read by name, too:
-
-```@example gs
-size(X, :draw), size(X, :time)
-```
-
-## Names are checked — a typo throws
-
-```@example gs
-try
-    mean(X; dims = :drwa)
-catch err
-    println(err)
+```@example axes
+sweep = map(Iterators.product(TreeDim(:dose, [10, 20]),
+                             TreeDim(:rate, [0.2, 0.4]))) do (dose, rate)
+    dose / rate
 end
+Tables.rowtable(sweep)
 ```
 
-`dims =` is **foundALL**: every name must resolve somewhere in the tree. This is
-checked from the *type*, so a correct call costs nothing at runtime; only on a
-jagged tree does it fall back to an instance walk rather than let a typo through.
-
-The rule behind this shows up everywhere in TreeArrays: **never silently return a
-plausible-looking value**. An earlier design returned `missing` for a dim that
-resolved nowhere, and it was retired precisely because a typo was then
-indistinguishable from a legitimately absent axis.
-
-## Small anatomy of the result
-
-The whole tree renders itself, dims table included:
-
-```@example gs
-Y = TreeData(reshape(1.0:12.0, 4, 3), :draw, :time => [0.0, 1.0, 2.0])
-```
-
-```@example gs
-mean(Y; dims = :draw)
-```
-
-Display is always **bounded** and every elision is marked — `string(td)` is a
-preview, never a serialization. If you want the data, use
-[`Tables.columns`](@ref tables) or `parent(td)`.
-
-## Where to go next
-
-- [Reductions](@ref) — `mapslices`, `quantile`, `coords = true`, `@kernel`, chaining.
-- [Ragged data](@ref) — per-subject series of differing length.
-- [Tables & plotting](@ref tables) — melt long, pivot wide, feed a plotting layer.
-- [Comparisons](@ref) — how this relates to DimensionalData.jl and FlexiChains.jl.
+The [concentration example](trajectories.md) uses named arrays inside a subject tree and keeps those labels through reductions and plotting.

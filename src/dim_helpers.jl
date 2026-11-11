@@ -38,38 +38,13 @@ _dimnames(dims) = Tuple(dims)
     coords(d::TreeDim)
     coords(X::TreeData, name::Symbol)
 
-The coordinates an axis is labelled with, **exactly as they were provided** — a
-`Tuple` stays a `Tuple`, a `Vector` stays a `Vector`, a range stays a range.
+Return a labelled axis's coordinates in their original container type. The
+named form searches this node, not its descendants. For an axis within a ragged
+tree, read the appropriate child first.
 
-```julia
-coords(X, :time)                      # by name, on this node — the ergonomic form
-coords(TreeArrays.dims(X)[1])         # or straight off a TreeDim
-```
-
-Four shapes have no coordinates to return and **error by name** rather than
-answer with a plausible-looking value — an unlabelled axis (`TreeDim(:time)`), an
-aggregated ghost (the dim was reduced away), a fixed single position
-(`dose = 20`; pass `:dose => (20,)` for a real length-1 axis), and a name that
-resolves nowhere. Like `dims =`, the two-argument form is *foundALL*: a name that
-matches no dim on this node is a typo, not an empty answer. A dim living inside
-the leaves of a ragged tree is on the child — reach it as
-`coords(parent(X)[i], :time)`.
-
-!!! warning "Do not use `collect` for this"
-    `collect(d)` runs (a `TreeDim` has `iterate`/`length`) and looks like the
-    answer, but it yields an `Any`-eltype vector and silently returns
-    `Any[missing]` for an unlabelled axis and `Any[nothing]` for a reduced ghost
-    — a length-1 coordinate vector for the two kinds that have none.
-
-!!! note "The name must be a literal"
-    `coords(X, :time)` is type-stable via `Base.@constprop :aggressive`, so the
-    name has to be a literal in the code, not a runtime variable — the same rule
-    as `dims =`. `@inferred` cannot see const-prop through its own call: test a
-    small wrapper function, not the bare call. The one-argument form is stable
-    unconditionally.
-
-Inside a kernel, ask for the reduced axis's coordinates with
-`mapslices(f, X; dims, coords = true)` instead — see [`mapslices`](@ref).
+An unlabelled, fixed, reduced, or absent dimension raises an error. `collect(d)`
+is dimension iteration, not coordinate access. Within a slice kernel, request
+coordinates with `mapslices(...; coords=true)`.
 """
 coords(d::TreeDim) = _coordvals(name(d), meta(d).values)
 _coordvals(::Symbol, values::Union{Tuple,AbstractArray,AbstractRange}) = values
