@@ -14,8 +14,9 @@ The navigation has four groups, in this order. Each page has one purpose:
 | Reference | `api.md` | Look up public types, operations, and their restrictions. |
 
 Runnable Julia blocks execute during `julia --project=docs docs/make.jl`.
-On a fresh checkout, use Julia 1.12 or newer and run
-`julia --project=docs docs/instantiate.jl` first. It reads the pinned public
+On a fresh checkout, use Julia 1.12 or newer, run `npm install` inside
+`docs/` (the VitePress build is explicit and does not install it), and run
+`julia --project=docs docs/instantiate.jl`. It reads the pinned public
 package sources in `docs/Project.toml`; no generated Manifest is committed.
 Python 3 is required for the local lint. Managed fleet builds use the canonical
 `kb-docs-build` helper, which also supports the host's Julia 1.10 environment.
