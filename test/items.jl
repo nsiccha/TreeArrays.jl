@@ -110,9 +110,9 @@ end
     # The product-`map` override is N-generic, but was only ever exercised at arity 2
     # (treearrays-use §7, the QT twin) and at arity 4 by `_tt_stats_percentiles` -- whose
     # `f` IGNORES its coordinates, so only the SHAPE was covered, never the value mapping.
-    # Bruno sweeps 6 / 8 / 10 (`db_profile_plot`). Decision 1qex8lj: pin it.
+    # Cover high-dimensional sweeps as well as the one-axis case.
     @testset "map over Iterators.product of TreeDims is arity-generic (1qex8lj)" begin
-        # heterogeneous label types, mirroring Bruno's db_profile_plot
+        # Heterogeneous label types across the sweep dimensions.
         alldims = [
             TreeDim(:fit, (:a, :b)),           TreeDim(:health, ("hi", "lo")),
             TreeDim(:source, 1:2),             TreeDim(:outcome, (:x, :y)),
@@ -133,7 +133,7 @@ end
                 Iterators.product((TreeArrays.meta(d).values for d in ds)...)]
         end
 
-        # Bruno's real shape: every cell is a reduced TreeData leaf, nothing densified
+        # Every cell is a reduced TreeData leaf, without dense assembly.
         sweep = map(Iterators.product(alldims...)) do lvals
             quantile(TreeData(randn(8, 4), :draw, :time), TreeDim(:q, (0.1, 0.5, 0.9)); dims=:draw)
         end
@@ -826,7 +826,7 @@ end
         @test a_big <= a_small * 4   # not proportional to the 100x row-count growth -- well below what a real per-row leak would show
 
         # access: bulk enumeration over a column is O(1) allocation, not O(N) --
-        # this is the Bruno enumeration hot path (rowtable-style iteration).
+        # Exercise rowtable-style enumeration.
         median_small = _tt_median_draws(; n_cols=50)
         median_big = _tt_median_draws(; n_cols=5000)
         cols_small = Tables.columns(median_small)
@@ -1216,7 +1216,7 @@ end
         @test length(Tables.getcolumn(cw3, :lo)) == 10
     end
 
-    # A REDUCED record melts (todo 1m5087w, reporter Bruno:long-df-scrub): reductions adopt
+    # A reduced record melts: reductions adopt
     # the sample field's dims onto the record container, so the container parrots the fields'
     # live axes -- those duplicate the fields' own axes, contribute no columns, and are
     # VERIFIED against the representative field (never ignored). This also fixed the nested
@@ -1498,7 +1498,7 @@ end
     # make the key STRUCTURE. Group the items into a rectangular grid of ragged cells --
     # each cell a zero-copy `view` into the backing array -- then reduce the pooled axes
     # away. Cells may hold different item counts; after the reduction the tree is regular,
-    # so it melts. This is what Bruno's `aggregate_ribbon` groupby becomes.
+    # so it melts as a record of interval columns.
     @testset "groupby on a per-item key = a grid of ragged cells (17y9dpd)" begin
         P = reshape(1.0:42.0, 6, 7)                      # (draw x subject)
         dose  = [10, 10, 20, 20, 20, 10, 20]             # per-SUBJECT attributes, not axes
@@ -1885,7 +1885,7 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test builds[] == 4                                   # == n_boot, NOT 1 + 25*4
         @test parent(r) == fill(Float64(sum(1:4)), 25)        # and the values are right
 
-        # the count must not track the INNER length -- that is the regression that bit Bruno.
+        # The count must not track the inner length.
         for n_inner in (25, 50, 100)
             Xn = TreeData(_LazyLeaves(4, i -> (builds[] += 1; TreeData(fill(Float64(i), n_inner), :row))), :boot)
             builds[] = 0
@@ -1898,7 +1898,7 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         @test parent(mapslices(sum, Xe; dims=:boot)) == parent(r)
     end
 
-    # Bruno asked whether `quantile`/`nanquantile`'s `dims=` takes a COLLECTION, to pool
+    # `quantile`/`nanquantile` accepts a collection of dimensions to pool
     # draws AND subjects in one pass (the `combine(groupby(df, [:dose, :study]), :qoi =>
     # quantile)` shape). It always has -- `_dimnames(dims) = Tuple(dims)` -- but NOTHING
     # pinned it, which is exactly why the capability's status was unknowable from outside.
@@ -1994,7 +1994,7 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
     end
 
     # Pooled reduce that STRADDLES a ragged nesting boundary (snag pooled-reduce-ov-a4734df9,
-    # reporter Bruno:treearrays): `dims=(:draw,:chain)` on a `(chain -> (draw,param))` ragged tree
+    # pooling): `dims=(:draw,:chain)` on a `(chain -> (draw,param))` ragged tree
     # pools ALL draws x chains per param -- the shape a pooled posterior CI needs from per-chain
     # @mmap'd matrices held as a lazy collection (never hcat'd into a dense block). The anchor: it
     # must equal, byte-for-byte, the DENSE `TreeData(A, :draw,:chain,:param)` reduce (which the
@@ -2019,7 +2019,7 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
         # mean/sum + both wide spellings pool identically; reducing EVERY axis -> one leaf
         @test all(parent(mean(ragged; dims=(:draw, :chain)))[j] ≈ mean(vec(A[:, :, j])) for j in 1:nparam)
         @test all(parent(sum(ragged;  dims=(:draw, :chain)))[j] ≈ sum(vec(A[:, :, j]))  for j in 1:nparam)
-        # std/var pool the SAME bag (snag std-var-pooled-r, reporter Bruno:treearrays): byte-identical
+        # std/var pool the same bag: byte-identical
         # to the DENSE reduce AND to base-Julia over the flattened (draw x chain) block. `corrected`
         # defaults to `true` => SAMPLE variance (÷(n-1)), matching `std(some_vector)`; `false` => ÷n.
         for (r_ragged, base) in ((std(ragged; dims=(:draw,:chain)), std), (var(ragged; dims=(:draw,:chain)), var))
@@ -2046,7 +2046,7 @@ Base.getindex(L::_LazyLeaves, i::Int) = L.f(i)
     end
 
     # Pooled straddle over a NON-CONFORMABLE reduced inner axis (todo 1ynv0r4, reporter
-    # Bruno:long-df-scrub): `source -> (draw x subject)` with UNEQUAL subject counts, reducing
+    # ragged subjects): `source -> (draw x subject)` with unequal subject counts, reducing
     # (:source, :subject) and keeping the conformable :draw. v1 threw `DimensionMismatch` before
     # recognizing the differing axis was itself being reduced; v2 pools it -- only the KEPT axes
     # must match in length AND coordinates. Each pooled result is pinned against base-Julia over

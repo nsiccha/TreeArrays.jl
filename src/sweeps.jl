@@ -22,47 +22,21 @@ _sweepvalues(n::Symbol, ::Missing) = error(
 _sweepvalues(::Symbol, values) = values
 
 """
-    map(f, d::TreeDim)
-    map(f, Iterators.product(dims::TreeDim...))
+    map(f, dimension::TreeDim)
+    map(f, Iterators.product(dimensions::TreeDim...))
 
-Build a **scenario sweep**: a [`TreeData`](@ref) whose axes are the swept dims,
-in order, and whose every cell is whatever `f` returns: a scalar or a
-[`TreeData`](@ref). A plain `NamedTuple` cell is refused by name (it would make
-the sweep an array of structs); return `TreeData(:stat => nt)` instead.
-
-`f` receives the **coordinate tuple** (the labels, not data), in dim order — so
-destructure it:
-
-```julia
-ds = (TreeDim(:fit, (:a, :b)), TreeDim(:dose, (20, 200)), TreeDim(:health, ("hi", "lo")))
-
-sweep = map(Iterators.product(ds...)) do (fit, dose, health)
-    quantile(draws_for(fit, dose, health), TreeDim(:band, (0.1, 0.5, 0.9)); dims = :draw)
-end
-# sweep isa TreeData; size(parent(sweep)) == (2, 2, 2); dims are (:fit, :dose, :health)
-```
-
-Arity-generic — there is no two-dim limit, and label types may be heterogeneous.
-A returned `TreeData` stays a leaf; nothing is densified, and the sweep composes
-with the reductions like any other tree.
-
-A **scalar** dim is a fixed position, not an axis: it contributes zero array axes
-and lands as a trailing fixed dim. To sweep one value as a real length-1 axis,
-pass a 1-tuple — `TreeDim(:schedule, ("s",))`. An **unlabelled** dim has no
-coordinates to sweep and errors by name.
-
-!!! note "Splat a `Tuple`, not a generator"
-    Splatting a *runtime-length* container of dims is inference-opaque, as any
-    runtime-length splat is in Julia. It still works; to also infer, splat a
-    `Tuple` (`Tuple(ds)`) or cross a `Tuple`-typed function barrier.
-`stack` is accepted as a spelling of `map` here and does the same thing.
+Construct a named scenario grid. A single dimension passes each coordinate to
+`f`; a product passes a coordinate tuple in dimension order. Each cell returns
+a scalar or a [`TreeData`](@ref). Wrap named tuples as named records. `stack`
+accepts the same dimension-sweep forms. Sweep dimensions must have iterable
+coordinate collections, rather than unlabelled, fixed, or reduced metadata.
 """
 Base.map(f, iter::TreeDim) = TreeData(map(f, _sweepvalues(iter)), iter)
 Base.stack(f, iter::TreeDim) = map(f, iter)#
 Base.stack(f, iter::Base.Iterators.ProductIterator{<:Tuple{<:TreeDim, Vararg{TreeDim}}}) = map(f, iter)
 # N-generic: `Iterators.product` is arity-generic and the dims are forwarded to
 # `TreeData` positionally, so the result's dims line up with the parent array's
-# axes in order. Verified at arities 1/3/6/8/10 (decision 1qex8lj) -- Bruno's
+# axes in order. Verified at arities 1/3/6/8/10; large
 # `db_profile_plot` sweeps 10.
 Base.map(f, iter::Base.Iterators.ProductIterator{<:Tuple{<:TreeDim, Vararg{TreeDim}}}) = TreeData(
     map(f, Iterators.product(map(_sweepvalues, iter.iterators)...)), iter.iterators...

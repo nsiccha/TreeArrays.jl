@@ -1,79 +1,41 @@
-// .vitepress/theme/index.ts
-import { h } from 'vue'
 import DefaultTheme from 'vitepress/theme'
-import type { Theme as ThemeConfig } from 'vitepress'
-import 'virtual:mathjax-styles.css';
-
-import { 
-  NolebaseEnhancedReadabilitiesMenu, 
-  NolebaseEnhancedReadabilitiesScreenMenu, 
-} from '@nolebase/vitepress-plugin-enhanced-readabilities/client'
-
-import VersionPicker from "@/VersionPicker.vue"
-import AuthorBadge from '@/AuthorBadge.vue'
-import Authors from '@/Authors.vue'
-import SidebarDrawerToggle from '@/SidebarDrawerToggle.vue'
+import type { Theme } from 'vitepress'
+import 'virtual:mathjax-styles.css'
+import './style.css'
+import './docstrings.css'
+import './overrides.css'
 // __DV_PLUGIN_COMPONENT_IMPORTS__
 
-import { enhanceAppWithTabs } from 'vitepress-plugin-tabs/client'
-
-import '@nolebase/vitepress-plugin-enhanced-readabilities/client/style.css'
-import './style.css' // You could setup your own, or else a default will be copied.
-import './docstrings.css' // You could setup your own, or else a default will be copied.
-import './overrides.css' // You could setup your own, or else a default will be copied.
-import Banner from '@/Banner.vue'
-
-// `v-exec-scripts` runs the <script> tags inside a `v-html`'d block: innerHTML never executes
-// scripts, so we re-create each one. `src` scripts are awaited so order holds (bundle before
-// its callers). Used on interactive text/html output (WGLMakie/Bonito, Plotly) which the writer
-// wraps in <ClientOnly> + this directive.
+// DocumenterVitepress writes interactive HTML through v-html. Activate scripts
+// after insertion, waiting for dependencies before the plot's inline script.
 async function activateScripts(container: Element): Promise<void> {
+  const figure = container.querySelector<HTMLElement>('[data-figure-src]')
+  if (figure) {
+    const response = await fetch(figure.dataset.figureSrc!)
+    if (!response.ok) throw new Error(`Figure request failed: ${response.status}`)
+    figure.innerHTML = await response.text()
+  }
   for (const old of Array.from(container.querySelectorAll('script'))) {
     const fresh = document.createElement('script')
     for (const attr of Array.from(old.attributes)) fresh.setAttribute(attr.name, attr.value)
     fresh.textContent = old.textContent
-    const hasSrc = old.hasAttribute('src')
-    const ran = hasSrc
-      ? new Promise<void>((resolve) => {
+    const ran = old.hasAttribute('src')
+      ? new Promise<void>((resolve, reject) => {
           fresh.addEventListener('load', () => resolve(), { once: true })
-          fresh.addEventListener('error', () => resolve(), { once: true })
+          fresh.addEventListener('error', () => reject(new Error(`Could not load ${fresh.src}`)), { once: true })
         })
       : Promise.resolve()
-    old.replaceWith(fresh) // inserting is what runs it; inline scripts run synchronously
+    old.replaceWith(fresh)
     await ran
   }
 }
 
-export const Theme: ThemeConfig = {
+export default {
   extends: DefaultTheme,
-  Layout() {
-    return h(DefaultTheme.Layout, null, {
-      'layout-bottom': () => h(Banner),
-      'nav-bar-content-after': () => [
-        h(NolebaseEnhancedReadabilitiesMenu), // Enhanced Readabilities menu
-      ],
-      // A enhanced readabilities menu for narrower screens (usually smaller than iPad Mini)
-      'nav-screen-content-after': () => h(NolebaseEnhancedReadabilitiesScreenMenu),
-      // Sidebar drawer toggle button (to the left of search bar)
-      'nav-bar-content-before': () => h(SidebarDrawerToggle),
-    })
-  },
-  enhanceApp({ app, router, siteData }) {
-    enhanceAppWithTabs(app);
-    app.component('VersionPicker', VersionPicker);
-    app.component('AuthorBadge', AuthorBadge)
-    app.component('Authors', Authors)
-
-    // Execute the scripts inside interactive `text/html` outputs (WGLMakie/Bonito, Plotly, …)
-    // once their `<ClientOnly>` wrapper has mounted on the client. `mounted` fires on the
-    // initial client render and again whenever the page component is remounted by a
-    // client-side navigation, so figures initialise instead of staying blank.
+  enhanceApp({ app }) {
     app.directive('exec-scripts', {
-      mounted(el: HTMLElement) {
-        activateScripts(el)
-      },
+      mounted(el: HTMLElement) { void activateScripts(el) },
     })
     // __DV_PLUGIN_COMPONENT_REGISTRATIONS__
-  }
-}
-export default Theme
+  },
+} satisfies Theme

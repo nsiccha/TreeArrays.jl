@@ -22,73 +22,26 @@
 
 """
     TreeActualArray(X::TreeData)
+    TreeActualArray(X::TreeRaggedArray; dims, align)
 
-A lazy, **zero-copy** `AbstractArray{T,N}` view of a rectangular tree — the way
-to feed a [`TreeData`](@ref) to a numeric N-D-array API (`ess`, `rhat`, anything
-typed on `AbstractArray`) without copying and without losing the dim labels.
+A read-only numeric `AbstractArray` view that retains its tree and reads through
+the existing backing. Dense leaves, homogeneous records, scalar terminals, and
+grids of homogeneous numeric scalar leaves are supported. Record axes follow
+the inner physical axes. Fixed and reduced dimensions remain in `dims(A)` but
+do not add array axes. `parent(A)` returns the tree; `Array(A)` copies values.
 
-A `TreeData` is deliberately not an `AbstractArray`, and `parent(X)` is one only
-when the leaf *happens* to be array-backed. `TreeActualArray` is the explicit,
-one-way view that crosses the boundary: `getindex` walks the tree, nothing is
-materialized, and a [`TreeNamedTuple`](@ref)'s **record axis is promoted to a
-real array dimension**.
+Keep shape, coordinates, and terminal types unchanged while a view exists.
+A view of a reduced result aliases that result, not the reducer's original
+input. Tuple records, mixed element types, and nested arrays of sub-trees are
+unsupported by the plain constructor.
 
-```julia
-A = TreeActualArray(X)   # <: AbstractArray, zero-copy, labels kept, any backing
-ess(A); rhat(A)
-```
-
-Both draw representations therefore arrive at the *same* array — a dense leaf
-`TreeData(arr3d, :draw, :chain, :param => names)` and a record
-`TreeData(:param => per_param_matrices, :draw, :chain)`. The axes are `X`'s real
-axes in `dims` order, with the record axis trailing — exactly the
-`(draw, chain, param)` shape `ess`/`rhat` want.
-
-A numeric scalar-backed leaf, including a fully reduced result, presents as a
-zero-dimensional array: `size(A) == ()` and `A[] === parent(X)`. Fixed and reduced
-dimensions remain in `dims(A)` without adding physical axes. `parent(X)` reads
-the number directly when an array interface is not needed.
-
-An N-D outer array of **numeric scalar-terminal** trees also presents as a
-numeric array, in the outer array's axis order. This includes a field extracted
-from a NamedTuple quantile reduction:
-
-```julia
-using NaNStatistics
-X = TreeData(reshape(1.0:24.0, 3, 2, 4), :subject, :time => (0.0, 1.0), :draw)
-p05 = nanquantile(X, (p05=0.05, p50=0.5); dims=:subject).p05
-A = TreeActualArray(p05)           # numeric 2 × 4 view, no dense assembly
-A[1, 2]                           # 7.1
-coords(dims(A)[1])                 # (0.0, 1.0)
-```
-
-Every scalar-grid leaf must hold the same concrete `Number` type and have no
-real inner axes; fixed dimensions and reduced ghosts are allowed. Empty grids
-must retain a concrete scalar-terminal `TreeData` element type. Outer physical
-axes and coordinates are preserved. `parent(A)` recovers the tree and
-[`dims`](@ref)`(A)` its dimension metadata, including fixed/ghost dimensions;
-those dimensions do not add physical array axes.
-
-The view is read-only and retains its tree for its lifetime. Reads alias the
-existing backing; replacing a scalar-grid cell with a compatible scalar tree
-is visible through the view. Keep shapes, axes, coordinates and terminal types
-unchanged while a view exists. Use `collect(A)` or `Array(A)` for an independent,
-mutable numeric array. Construction validates the leaves without packing their
-values; a view of a reduced field aliases that field, not the reducer's input.
-Dense copies preserve shape and value order and use one-based axes.
-
-Other outer arrays of sub-trees are refused even when rectangular — unequal
-leaves name the outer axis plus the differing inner axis and lengths — unless
-explicit ragged alignment is requested with `dims=` and `align=`. Mixed
-scalar/array, nonnumeric, nested-grid and heterogeneous scalar types are
-unsupported. A zero-dimensional **array-backed** leaf is not a scalar terminal:
-it works as a dense leaf on its own, but a grid of such leaves still takes the
-array-subtree refusal path. `Tuple`-record shapes remain unsupported.
-
-Two lower-level ways across the same boundary: `parent(X)` is the backing
-verbatim and zero-copy, but a scalar grid's backing contains trees rather than
-numbers and a record's backing is a NamedTuple. `collect(X)` / `Array(X)` copy
-array-backed storage; `collect(A)` / `Array(A)` materialize the numeric view.
+For a one-level vector of array-backed ragged leaves, name both `dims` and
+`align`. `:truncate_min` selects leading positions up to the shortest length;
+`:thin_min` selects evenly spread positions; `:error_equal` requires equal
+lengths. Coordinates at the selected positions must agree across leaves.
+Other leaf axes must match in length and coordinates. The outer sibling axis
+is inserted immediately after the aligned inner axis. These policies select
+positions without interpolation.
 """
 struct TreeActualArray{T,N,X<:TreeData} <: AbstractArray{T,N}
     tree::X
@@ -271,10 +224,8 @@ function _actualarray(tree::TreeRaggedArray)
 end
 
 # ===================== ragged alignment views (todo 1l53kom) =====================
-# Spliced upstream from Bruno's `web-pkpd/src/treearrays_compat.jl` bridge (nearly verbatim --
-# same struct shape, same `dims=`/`align=` keywords, same three policies), plus the two pieces
-# the bridge deferred to upstream: a coordinate policy for a LABELLED ragged axis, and
-# missing-safe / structure-loud sibling checks.
+# Positional alignment has three policies. Labelled axes also require a coordinate
+# policy; sibling structure and missing values are checked before building the view.
 #
 # A one-level ragged tree whose leaves differ ONLY along one named inner axis presents as a
 # lazy, zero-copy `AbstractArray`: the outer sibling axis is inserted immediately AFTER the
@@ -283,41 +234,7 @@ end
 # `:subject -> :draw` becomes `:draw x :subject`. Values are read through their existing
 # leaves (only per-leaf INDEX vectors are stored, never a dense cube); `dims(A)` keeps the
 # labels, with the aligned axis carrying the coordinates actually read (see below).
-"""
-    TreeActualArray(X::TreeRaggedArray; dims, align)
 
-A lazy, zero-copy `AbstractArray` view of a one-level ragged tree whose leaves
-differ only along the inner axis `dims`, aligned under the named policy. The
-caller must name **both** — there is no implicit ragged-to-rectangular
-conversion, and a half-named call throws for the missing keyword. A bare
-`TreeActualArray(X)` on array-backed sub-trees keeps refusing; homogeneous
-numeric scalar-terminal grids instead expose their outer axes without alignment.
-
-```julia
-A = TreeActualArray(chains; dims = :draw, align = :truncate_min)
-ess(A); rhat(A)   # any `AbstractArray`-typed consumer, no overloads needed
-```
-
-Policies:
-
-  - `:truncate_min` — head truncation: every leaf contributes its first `target`
-    positions, where `target` is the minimum sibling length.
-  - `:thin_min` — equidistant thinning: every leaf contributes `target` evenly
-    spread positions (`round.(Int, range(1, n; length = target))`).
-  - `:error_equal` — refuse unless every sibling already has the same length.
-
-The aligned axis keeps its coordinates under one uniform rule: the READ
-positions' coordinates must agree across leaves (compared content-wise, so a
-`Tuple` beside a `Vector` still aligns), and the view carries the prototype's.
-Truncation reads positions `1:target` (heads must agree — a chain continued
-from iteration 101 is not the same iterations 1–60); thinning reads evenly
-spread positions per leaf (which agree only when the leaves share a grid, so a
-labelled unevenly-sized thin refuses rather than label positions that mean
-different things per leaf). Unlabelled axes align vacuously. Non-aligned leaf
-axes must match in length and coordinates, every leaf must be array-backed at
-the same rank with the same dim structure and eltype, and the outer container
-must be a one-dimensional `Vector` of siblings — anything else throws by name.
-"""
 struct _AlignedRaggedTreeActualArray{T,N,X,I,D} <: AbstractArray{T,N}
     tree::X
     aligned_indices::I
