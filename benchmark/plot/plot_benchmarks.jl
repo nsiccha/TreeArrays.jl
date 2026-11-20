@@ -18,9 +18,10 @@
 #
 # Run:  julia --project=benchmark/plot benchmark/plot/plot_benchmarks.jl
 
-using AlgebraOfVega                      # data, mapping, visual, lineribbon, to_vegalite
-using AlgebraOfGraphics: draw            # AoG render entry point
-using CairoMakie                         # Band, Lines + headless Cairo backend
+using AlgebraOfVega                      # data, mapping, visual, Band, Lines, lineribbon, to_vegalite
+using AlgebraOfGraphics: draw            # AoG render entry point (draws AoV specs via AoV's Makie ext)
+import CairoMakie                        # headless Cairo backend; imported, not `using`: it also
+                                         # exports Band/Lines, which would clash with AoV's
 using TreeArrays                         # TreeData, mean, quantile (bare = TA idiom)
 using Chairmarks, Printf
 import Statistics
