@@ -1,5 +1,5 @@
-# The public surface is what docs/src/api.md lists under "Public API (frozen for 1.0)":
-# the export list below plus the Base / Statistics / Tables methods documented there.
+# The public surface is the export list below plus the Base / Statistics / Tables
+# methods whose docstrings docs/src/api.md (the generated API reference) collects.
 # A name added to or dropped from `export` changes what every dependant sees, so it
 # changes this list in the same landing, with a CHANGELOG entry (test/changelog.jl).
 @testitem "public API surface: the export list is exactly the documented one" begin
